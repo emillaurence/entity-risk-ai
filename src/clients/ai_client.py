@@ -18,6 +18,7 @@ class AIClient(ABC):
         user_prompt: str,
         model: str | None = None,
         max_tokens: int = 1000,
+        cache_system: bool = False,
     ) -> str:
         """
         Generate a plain-text response.

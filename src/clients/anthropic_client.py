@@ -47,12 +47,14 @@ class AnthropicClient(AIClient):
         user_prompt: str,
         model: str | None = None,
         max_tokens: int = 1000,
+        cache_system: bool = False,
     ) -> str:
         response = self._call(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=model or self._default_model,
             max_tokens=max_tokens,
+            cache_system=cache_system,
         )
         return response.content[0].text
 
@@ -82,6 +84,7 @@ class AnthropicClient(AIClient):
         user_prompt: str,
         model: str,
         max_tokens: int,
+        cache_system: bool = False,
     ) -> anthropic.types.Message:
         """
         Call the Anthropic Messages API and update ``last_usage``.
@@ -91,21 +94,36 @@ class AnthropicClient(AIClient):
         Token counts (input, output, total) are stored in ``self.last_usage``
         after every successful call.
 
+        When ``cache_system=True``, the system prompt is passed as a content
+        block with ``cache_control: {type: ephemeral}``.  Requires the prompt
+        to be ≥1024 tokens (Sonnet) or ≥2048 tokens (Haiku) for caching to
+        activate; shorter prompts are accepted but not cached.
+
         Raises:
             RuntimeError: On authentication failure, rate limit, API error,
                           or connection error.
         """
+        system_arg: str | list = (
+            [{"type": "text", "text": system_prompt,
+              "cache_control": {"type": "ephemeral"}}]
+            if cache_system
+            else system_prompt
+        )
         try:
             response = self._client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
-                system=system_prompt,
+                system=system_arg,
                 messages=[{"role": "user", "content": user_prompt}],
             )
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_written = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             self.last_usage = {
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
                 "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_written,
             }
             return response
         except anthropic.AuthenticationError as e:

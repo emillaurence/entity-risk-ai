@@ -2,7 +2,7 @@
 GraphAgent — specialist agent for graph exploration and entity context retrieval.
 
 Responsibilities:
-  - call the correct GraphTools method for each supported task
+  - call the correct graph MCP tool for each supported task via MCPToolClient
   - log every tool call via BaseAgent helpers (→ Neo4j trace)
   - optionally enrich the result with an AI-generated natural-language summary
 
@@ -10,6 +10,7 @@ Does NOT contain:
   - Cypher or direct Neo4j usage
   - risk-scoring logic (→ RiskAgent)
   - trace retrieval (→ TraceAgent)
+  - direct references to GraphTools — all tool access goes through MCP
 
 Supported tasks
 ---------------
@@ -26,8 +27,8 @@ from typing import Any
 
 from src.agents.base import BaseAgent
 from src.clients.ai_client import AIClient
+from src.clients.mcp_tool_client import MCPToolClient
 from src.domain.models import AgentResult, InvestigationTrace
-from src.tools.graph_tools import GraphTools
 from src.tracing.trace_service import TraceService
 
 
@@ -55,10 +56,10 @@ _SYSTEM_PROMPT = (
 
 class GraphAgent(BaseAgent):
     """
-    Investigation agent that explores the Neo4j business graph.
+    Investigation agent that explores the Neo4j business graph via MCP.
 
     Args:
-        tools:         GraphTools instance for deterministic data access.
+        mcp_client:    MCPToolClient — all tool calls go through this.
         trace_service: Shared TraceService for structured event logging.
         ai_client:     Optional AI client. When present, each result is
                        enriched with a one-sentence natural-language summary
@@ -67,12 +68,12 @@ class GraphAgent(BaseAgent):
 
     def __init__(
         self,
-        tools: GraphTools,
+        mcp_client: MCPToolClient,
         trace_service: TraceService,
         ai_client: AIClient | None = None,
     ) -> None:
         super().__init__("graph-agent", trace_service, ai_client)
-        self._tools = tools
+        self._mcp = mcp_client
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -149,6 +150,7 @@ class GraphAgent(BaseAgent):
             ai_text = self.generate_ai_summary(
                 system_prompt=_SYSTEM_PROMPT,
                 user_prompt=result.summary,
+                max_tokens=80,
             )
             if ai_text:
                 summary = ai_text
@@ -183,24 +185,39 @@ class GraphAgent(BaseAgent):
         context: dict[str, Any],
     ):
         """
-        Call the correct GraphTools method and return (ToolResult, entity_refs).
+        Call the correct MCP tool and return (ToolResult, entity_refs).
         entity_refs is None for entity_lookup because the company may not yet
         exist as a node (the search is by partial name, not exact match).
         """
         company_ref = [{"label": "Company", "name": company_name}]
 
         if task == "entity_lookup":
-            return self._tools.entity_lookup(company_name), None
+            return self._mcp.call_tool("entity_lookup", {"name": company_name}), None
 
         if task == "company_profile":
-            return self._tools.company_profile(company_name), company_ref
+            return (
+                self._mcp.call_tool("company_profile", {"company_name": company_name}),
+                company_ref,
+            )
 
         if task == "expand_ownership":
             max_depth = int(context.get("max_depth", 5))
-            return self._tools.expand_ownership(company_name, max_depth=max_depth), company_ref
+            return (
+                self._mcp.call_tool(
+                    "expand_ownership",
+                    {"company_name": company_name, "max_depth": max_depth},
+                ),
+                company_ref,
+            )
 
         if task == "shared_address_check":
-            return self._tools.shared_address_check(company_name), company_ref
+            return (
+                self._mcp.call_tool("shared_address_check", {"company_name": company_name}),
+                company_ref,
+            )
 
         # sic_context
-        return self._tools.sic_context(company_name), company_ref
+        return (
+            self._mcp.call_tool("sic_context", {"company_name": company_name}),
+            company_ref,
+        )

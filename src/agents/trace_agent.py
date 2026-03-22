@@ -2,7 +2,7 @@
 TraceAgent — specialist agent for retrieving and explaining investigation traces.
 
 Responsibilities:
-  - retrieve stored traces from Neo4j via TraceTools
+  - retrieve stored traces from Neo4j via trace MCP tools through MCPToolClient
   - find traces linked to a specific business entity
   - produce audit-friendly summaries (AI-enriched or template-based fallback)
 
@@ -10,6 +10,7 @@ Does NOT contain:
   - Cypher or direct Neo4j usage
   - risk-scoring logic (→ RiskAgent)
   - graph exploration (→ GraphAgent)
+  - direct references to TraceTools — all tool access goes through MCP
 
 Recursion constraint
 --------------------
@@ -36,8 +37,8 @@ from typing import Any
 
 from src.agents.base import BaseAgent
 from src.clients.ai_client import AIClient
+from src.clients.mcp_tool_client import MCPToolClient
 from src.domain.models import AgentResult, EventType, InvestigationTrace
-from src.tools.trace_tools import TraceTools
 from src.tracing.trace_service import TraceService
 
 
@@ -59,10 +60,10 @@ _SYSTEM_PROMPT = (
 
 class TraceAgent(BaseAgent):
     """
-    Investigation agent for retrieving and explaining Neo4j-backed traces.
+    Investigation agent for retrieving and explaining Neo4j-backed traces via MCP.
 
     Args:
-        tools:         TraceTools instance for deterministic trace retrieval.
+        mcp_client:    MCPToolClient — all tool calls go through this.
         trace_service: Shared TraceService for logging the agent's own activity.
         ai_client:     Optional AI client. When present, summaries are AI-generated.
                        Haiku is used by default; pass ``model=<id>`` in context
@@ -71,12 +72,12 @@ class TraceAgent(BaseAgent):
 
     def __init__(
         self,
-        tools: TraceTools,
+        mcp_client: MCPToolClient,
         trace_service: TraceService,
         ai_client: AIClient | None = None,
     ) -> None:
         super().__init__("trace-agent", trace_service, ai_client)
-        self._tools = tools
+        self._mcp = mcp_client
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -143,7 +144,7 @@ class TraceAgent(BaseAgent):
                 "Pass a different trace_id to avoid self-referential retrieval.",
             )
 
-        result = self._tools.retrieve_trace(trace_id)
+        result = self._mcp.call_tool("retrieve_trace", {"trace_id": trace_id})
         self.log_tool_event(
             trace,
             tool_name=result.tool_name,
@@ -186,7 +187,9 @@ class TraceAgent(BaseAgent):
                 trace, "context must include a non-empty 'entity_name'."
             )
 
-        result = self._tools.find_traces_by_entity(entity_name)
+        result = self._mcp.call_tool(
+            "find_traces_by_entity", {"entity_name": entity_name}
+        )
         self.log_tool_event(
             trace,
             tool_name=result.tool_name,
@@ -250,6 +253,7 @@ class TraceAgent(BaseAgent):
                 system_prompt=_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 model=model,
+                max_tokens=250,
             )
         else:
             ai_text = None
@@ -313,7 +317,9 @@ class TraceAgent(BaseAgent):
             )
 
         # Step 1 — retrieve.
-        retrieve_result = self._tools.retrieve_trace(trace_id)
+        retrieve_result = self._mcp.call_tool(
+            "retrieve_trace", {"trace_id": trace_id}
+        )
         self.log_tool_event(
             trace,
             tool_name=retrieve_result.tool_name,

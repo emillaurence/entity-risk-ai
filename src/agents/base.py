@@ -173,6 +173,8 @@ class BaseAgent(ABC):
         system_prompt: str,
         user_prompt: str,
         model: str | None = None,
+        max_tokens: int = 1000,
+        cache_system: bool = False,
     ) -> str | None:
         """
         Return an AI-generated text summary, or None if no client is set.
@@ -185,6 +187,10 @@ class BaseAgent(ABC):
             system_prompt: Instructions that set the model's behaviour.
             user_prompt:   The content the model should respond to.
             model:         Override the client's default model.
+            max_tokens:    Upper bound on response length (default 1000).
+            cache_system:  When True, mark the system prompt for Anthropic
+                           prompt caching.  Requires ≥1024 tokens (Sonnet)
+                           or ≥2048 tokens (Haiku) to activate caching.
 
         Returns:
             A text string, or None if ai_client is absent or the call fails.
@@ -198,6 +204,8 @@ class BaseAgent(ABC):
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 model=model,
+                max_tokens=max_tokens,
+                cache_system=cache_system,
             )
             self._last_ai_usage = getattr(self._ai_client, "last_usage", None)
             return text

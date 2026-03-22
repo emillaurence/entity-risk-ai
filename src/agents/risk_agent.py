@@ -2,7 +2,7 @@
 RiskAgent — specialist agent for interpreting graph-derived risk signals.
 
 Responsibilities:
-  - call RiskTools for deterministic risk heuristics
+  - call risk MCP tools via MCPToolClient for deterministic risk heuristics
   - log every tool call via BaseAgent helpers (→ Neo4j trace)
   - for summarize_risk_for_company: gather all 4 risk signals and use
     AIClient to produce a concise natural-language risk assessment
@@ -11,6 +11,7 @@ Does NOT contain:
   - Cypher or direct Neo4j usage
   - graph exploration logic (→ GraphAgent)
   - trace retrieval (→ TraceAgent)
+  - direct references to RiskTools — all tool access goes through MCP
 
 Supported tasks
 ---------------
@@ -27,8 +28,8 @@ from typing import Any
 
 from src.agents.base import BaseAgent
 from src.clients.ai_client import AIClient
+from src.clients.mcp_tool_client import MCPToolClient
 from src.domain.models import AgentResult, InvestigationTrace
-from src.tools.risk_tools import RiskTools
 from src.tracing.trace_service import TraceService
 
 
@@ -47,22 +48,151 @@ _DIRECT_TOOL_TASKS = frozenset({
     "industry_context_check",
 })
 
-_SYSTEM_PROMPT = (
-    "You are a financial crime compliance analyst. "
-    "Given structured risk signals for a company, write a concise risk assessment "
-    "(2-4 sentences) for a compliance analyst deciding whether to escalate. "
-    "Reference the specific signals: ownership chain, control types, address "
-    "co-location, and industry. State the overall risk level (LOW / MEDIUM / HIGH). "
-    "Do not use bullet points or markdown."
-)
+_SYSTEM_PROMPT = """You are a financial crime compliance analyst. \
+Given structured risk signals for a company, write a concise risk assessment \
+(2-4 sentences) for a compliance analyst deciding whether to escalate. \
+Reference the specific signals: ownership chain, control types, address \
+co-location, and industry. State the overall risk level (LOW / MEDIUM / HIGH). \
+Do not use bullet points or markdown.
+
+── SCORING REFERENCE ────────────────────────────────────────────────────────
+
+Use the heuristics below to verify and contextualise the risk levels supplied
+in the signals. Do not recalculate them — they are already computed. Use this
+reference to ground your language and ensure your narrative is consistent with
+the underlying logic.
+
+OWNERSHIP COMPLEXITY
+Inputs: max_depth (longest ownership chain in hops), unique_owners (distinct
+owner nodes), corporate_only (True when no individual beneficial owners appear
+anywhere in the chain).
+
+Scoring:
+  max_depth >= 4 hops      → +2 points
+  max_depth 2 or 3 hops    → +1 point
+  max_depth <= 1 hop        → +0 points (may also return UNKNOWN if no data)
+  unique_owners >= 5        → +2 points
+  unique_owners 2, 3, or 4 → +1 point
+  unique_owners <= 1        → +0 points
+  corporate_only = True     → +2 points (no natural-person UBO identified)
+
+Risk level: score >= 4 → HIGH | score 2 or 3 → MEDIUM | score < 2 → LOW
+Special case: if max_depth == 0 (no ownership data found) → UNKNOWN
+
+Compliance interpretation:
+  HIGH ownership complexity may indicate layered corporate structures used to
+  obscure beneficial ownership — a common typology in money-laundering schemes
+  and sanctions evasion. A corporate-only chain with no natural-person UBO is
+  particularly significant: it may mean the ultimate beneficial owner has not
+  been disclosed, which is a requirement under UK PSC rules.
+
+CONTROL SIGNALS
+Inputs: elevated (set of non-standard control types detected), mixed (True
+when both share-based and non-share-based controls appear), has_data (False
+when no ownership/control records exist).
+
+Elevated control types that trigger HIGH risk:
+  right-to-appoint-and-remove-directors
+  right-to-appoint-and-remove-majority-of-directors
+  significant-influence-or-control
+  significant-influence-or-control-as-a-member-of-a-firm
+  right-to-appoint-and-remove-members
+
+Standard (non-elevated) control types:
+  ownership-of-shares-25-to-50-percent
+  ownership-of-shares-50-to-75-percent
+  ownership-of-shares-75-to-100-percent
+  voting-rights-25-to-50-percent
+  voting-rights-50-to-75-percent
+  voting-rights-75-to-100-percent
+
+Risk level:
+  elevated set is non-empty → HIGH (regardless of share ownership)
+  mixed controls present     → MEDIUM (elevated absent but non-share types found)
+  share/voting only          → LOW
+  has_data = False           → UNKNOWN
+
+Compliance interpretation:
+  Elevated controls (especially significant-influence-or-control and
+  right-to-appoint) are the hallmarks of shadow director arrangements and
+  undisclosed controllers — common in corporate abuse typologies. Mixed
+  controls warrant scrutiny because they may signal that formal share
+  ownership is being supplemented with informal influence mechanisms.
+
+ADDRESS RISK
+Inputs: total (number of companies registered at the same address),
+dissolution_rate (proportion of co-located companies that are dissolved),
+threshold (default = 5, the minimum count before flagging).
+
+Scoring:
+  total >= threshold * 10   → +2 points  (mass co-location)
+  total >= threshold         → +1 point
+  total == 0                 → score stays 0, return LOW immediately
+  dissolution_rate >= 0.50   → +2 points  (majority dissolved)
+  dissolution_rate >= 0.25   → +1 point
+
+Risk level: score >= 3 → HIGH | score >= 1 → MEDIUM | score == 0 → LOW
+
+Compliance interpretation:
+  Mass co-location at a single registered address (often a formation agent or
+  virtual office) combined with a high dissolution rate is a well-documented
+  shell-company indicator. The Companies House UBO data regularly shows
+  hundreds of companies sharing a single address; when most of those companies
+  are dissolved, it suggests systematic exploitation of registered address
+  services for short-lived entities.
+
+INDUSTRY CONTEXT
+Inputs: is_holding (True when any of the company's SIC codes appears in the
+high-scrutiny set), dissolution_rate (proportion of SIC-peer companies that
+are dissolved), peer_total (total number of companies sharing the same SIC
+code(s)).
+
+High-scrutiny SIC codes:
+  64205 — Activities of financial services holding companies
+  70100 — Activities of head offices (non-financial holding companies)
+  74990 — Non-trading company
+  99999 — Dormant company
+
+Risk level:
+  is_holding AND dissolution_rate >= 0.40 → HIGH
+  is_holding AND dissolution_rate < 0.40  → MEDIUM
+  peer_total > 0 AND dissolution_rate >= 0.50 → MEDIUM
+  otherwise → LOW
+
+Compliance interpretation:
+  Holding companies and dormant entities in the Companies House register are
+  frequently used as intermediate layers in ownership chains. A holding company
+  with a high peer dissolution rate indicates that similar entities in the same
+  SIC group are being regularly struck off, which is consistent with
+  disposable-vehicle typologies used in fraud and tax evasion schemes.
+
+COMBINING SIGNALS
+When synthesising the four risk dimensions into a single narrative:
+
+  - If any single dimension is HIGH: the overall assessment should note that
+    the profile warrants escalation consideration, even if other dimensions
+    are LOW. Explain which dimension drives the concern.
+
+  - If two or more dimensions are MEDIUM and none is HIGH: flag for enhanced
+    due diligence. Cumulative MEDIUM signals are materially more concerning
+    than a single MEDIUM in isolation.
+
+  - If all four dimensions are LOW: the profile is consistent with a standard
+    trading company. Note any caveats (e.g. UNKNOWN dimensions where data was
+    absent).
+
+  - Always name the overall risk level explicitly as the final word in the
+    assessment (LOW / MEDIUM / HIGH).
+
+────────────────────────────────────────────────────────────────────────────"""
 
 
 class RiskAgent(BaseAgent):
     """
-    Investigation agent that interprets risk signals from the Neo4j business graph.
+    Investigation agent that interprets risk signals from the Neo4j business graph via MCP.
 
     Args:
-        tools:         RiskTools instance for deterministic risk heuristics.
+        mcp_client:    MCPToolClient — all tool calls go through this.
         trace_service: Shared TraceService for structured event logging.
         ai_client:     Optional AI client. Required for summarize_risk_for_company.
                        Haiku is used by default; pass ``model=<id>`` in context
@@ -71,12 +201,12 @@ class RiskAgent(BaseAgent):
 
     def __init__(
         self,
-        tools: RiskTools,
+        mcp_client: MCPToolClient,
         trace_service: TraceService,
         ai_client: AIClient | None = None,
     ) -> None:
         super().__init__("risk-agent", trace_service, ai_client)
-        self._tools = tools
+        self._mcp = mcp_client
 
     # ------------------------------------------------------------------
     # Abstract interface
@@ -236,17 +366,32 @@ class RiskAgent(BaseAgent):
                 f"Company: {company_name}\n\n"
                 + "\n".join(f"- {s}" for s in tool_summaries)
             )
+            # Pass model=settings.model_sonnet in context to enable prompt
+            # caching (Sonnet threshold is 1024 tokens; _SYSTEM_PROMPT exceeds
+            # that). Haiku requires 2048 tokens so caching won't activate on
+            # the default model, but the call still works correctly.
             model = context.get("model")  # None → client default (Haiku)
             ai_text = self.generate_ai_summary(
                 system_prompt=_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 model=model,
+                max_tokens=200,
+                cache_system=True,
             )
             if ai_text:
                 final_summary = ai_text
                 usage = self._last_ai_usage
+                cache_info = ""
+                if usage:
+                    cache_read = usage.get("cache_read_input_tokens", 0)
+                    cache_write = usage.get("cache_creation_input_tokens", 0)
+                    cache_info = (
+                        f" cache_read={cache_read} cache_written={cache_write}"
+                        if (cache_read or cache_write)
+                        else ""
+                    )
                 token_info = (
-                    f" | tokens in={usage['input_tokens']} out={usage['output_tokens']}"
+                    f" | tokens in={usage['input_tokens']} out={usage['output_tokens']}{cache_info}"
                     if usage
                     else ""
                 )
@@ -277,16 +422,24 @@ class RiskAgent(BaseAgent):
         company_name: str,
         context: dict[str, Any],
     ):
-        """Call the matching RiskTools method and return its ToolResult."""
+        """Call the matching MCP risk tool and return its ToolResult."""
         max_depth = int(context.get("max_depth", 5))
 
         if task == "ownership_complexity_check":
-            return self._tools.ownership_complexity_check(
-                company_name, max_depth=max_depth
+            return self._mcp.call_tool(
+                "ownership_complexity_check",
+                {"company_name": company_name, "max_depth": max_depth},
             )
         if task == "control_signal_check":
-            return self._tools.control_signal_check(company_name, max_depth=max_depth)
+            return self._mcp.call_tool(
+                "control_signal_check",
+                {"company_name": company_name, "max_depth": max_depth},
+            )
         if task == "address_risk_check":
-            return self._tools.address_risk_check(company_name)
+            return self._mcp.call_tool(
+                "address_risk_check", {"company_name": company_name}
+            )
         # industry_context_check
-        return self._tools.industry_context_check(company_name)
+        return self._mcp.call_tool(
+            "industry_context_check", {"company_name": company_name}
+        )

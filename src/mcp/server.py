@@ -307,6 +307,24 @@ def list_recent_traces(limit: int = 20) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Lifecycle helpers
+# ---------------------------------------------------------------------------
+
+
+def close() -> None:
+    """
+    Close the Neo4j connection opened by the lazy tool initialiser.
+
+    Call this when the server is no longer needed (e.g. at notebook teardown
+    or when MCPToolClient.close() is called).  Safe to call multiple times.
+    """
+    global _graph_tools, _risk_tools, _trace_tools, _shared_tools, _repo
+    if _repo is not None:
+        _repo.close()
+    _repo = _graph_tools = _risk_tools = _trace_tools = _shared_tools = None
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
