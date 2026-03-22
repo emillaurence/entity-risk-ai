@@ -254,6 +254,127 @@ class TraceRepository:
         )
 
     # ------------------------------------------------------------------
+    # Delete operations
+    # ------------------------------------------------------------------
+
+    def delete_trace(self, trace_id: str) -> dict:
+        """
+        Delete a single trace and all its TraceEvent nodes by trace_id.
+
+        Only InvestigationTrace, TraceEvent, HAS_EVENT, NEXT_EVENT, and ABOUT
+        relationships are removed. Business graph nodes (Company, Individual,
+        LegalEntity, Address, SIC) are never touched.
+
+        Returns:
+            {"found": bool, "traces_deleted": int, "events_deleted": int}
+        """
+        count_rows = self._repo.run_query(
+            """
+            MATCH (t:InvestigationTrace {trace_id: $trace_id})
+            OPTIONAL MATCH (t)-[:HAS_EVENT]->(e:TraceEvent)
+            RETURN count(DISTINCT t) AS trace_count, count(DISTINCT e) AS event_count
+            """,
+            {"trace_id": trace_id},
+        )
+        counts = count_rows[0] if count_rows else {}
+        if not counts.get("trace_count"):
+            return {"found": False, "traces_deleted": 0, "events_deleted": 0}
+
+        self._repo.run_query(
+            """
+            MATCH (t:InvestigationTrace {trace_id: $trace_id})
+            OPTIONAL MATCH (t)-[:HAS_EVENT]->(e:TraceEvent)
+            DETACH DELETE e, t
+            """,
+            {"trace_id": trace_id},
+        )
+        return {
+            "found": True,
+            "traces_deleted": counts["trace_count"],
+            "events_deleted": counts["event_count"],
+        }
+
+    def delete_traces_by_entity(self, entity_name: str) -> dict:
+        """
+        Delete all traces linked to a given entity name.
+
+        Matches traces where:
+        - the trace ``query`` field equals ``entity_name``, OR
+        - any TraceEvent in the trace has an :ABOUT relationship to a node
+          whose ``name`` property equals ``entity_name``.
+
+        Only trace subgraph nodes and relationships are deleted.
+
+        Returns:
+            {"found": bool, "traces_deleted": int, "events_deleted": int}
+        """
+        rows = self._repo.run_query(
+            """
+            MATCH (t:InvestigationTrace)
+            WHERE t.query = $entity_name
+               OR (t)-[:HAS_EVENT]->(:TraceEvent)-[:ABOUT]->({name: $entity_name})
+            OPTIONAL MATCH (t)-[:HAS_EVENT]->(e:TraceEvent)
+            RETURN t.trace_id AS trace_id, count(DISTINCT e) AS event_count
+            """,
+            {"entity_name": entity_name},
+        )
+        if not rows:
+            return {"found": False, "traces_deleted": 0, "events_deleted": 0}
+
+        trace_ids = [r["trace_id"] for r in rows]
+        total_events = sum(r["event_count"] for r in rows)
+
+        self._repo.run_query(
+            """
+            UNWIND $trace_ids AS tid
+            MATCH (t:InvestigationTrace {trace_id: tid})
+            OPTIONAL MATCH (t)-[:HAS_EVENT]->(e:TraceEvent)
+            DETACH DELETE e, t
+            """,
+            {"trace_ids": trace_ids},
+        )
+        return {
+            "found": True,
+            "traces_deleted": len(trace_ids),
+            "events_deleted": total_events,
+        }
+
+    def delete_all_traces(self) -> dict:
+        """
+        Delete ALL InvestigationTrace and TraceEvent nodes from the database.
+
+        This is a full wipe of the trace subgraph. Business graph nodes are
+        never touched. Use with care — this cannot be undone.
+
+        Returns:
+            {"traces_deleted": int, "events_deleted": int}
+        """
+        count_rows = self._repo.run_query(
+            """
+            MATCH (t:InvestigationTrace)
+            OPTIONAL MATCH (t)-[:HAS_EVENT]->(e:TraceEvent)
+            RETURN count(DISTINCT t) AS trace_count, count(DISTINCT e) AS event_count
+            """,
+            {},
+        )
+        counts = count_rows[0] if count_rows else {}
+        if not counts.get("trace_count"):
+            return {"traces_deleted": 0, "events_deleted": 0}
+
+        self._repo.run_query(
+            """
+            MATCH (t:InvestigationTrace)
+            OPTIONAL MATCH (t)-[:HAS_EVENT]->(e:TraceEvent)
+            DETACH DELETE e, t
+            """,
+            {},
+        )
+        return {
+            "traces_deleted": counts["trace_count"],
+            "events_deleted": counts["event_count"],
+        }
+
+    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 

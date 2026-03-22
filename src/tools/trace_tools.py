@@ -9,6 +9,17 @@ from src.storage.trace_repository import TraceRepository
 
 
 class TraceTools:
+    """
+    Deterministic tools for retrieving Neo4j-backed investigation traces.
+
+    Each method wraps a TraceRepository call and returns a ToolResult so
+    callers (typically TraceAgent) receive a consistent, timed, logged response.
+    No Cypher is written here — all persistence is delegated to the repository.
+
+    Args:
+        repo: An open TraceRepository instance.
+    """
+
     def __init__(self, repo: TraceRepository) -> None:
         self._repo = repo
 

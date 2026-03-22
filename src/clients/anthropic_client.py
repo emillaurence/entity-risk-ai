@@ -83,6 +83,18 @@ class AnthropicClient(AIClient):
         model: str,
         max_tokens: int,
     ) -> anthropic.types.Message:
+        """
+        Call the Anthropic Messages API and update ``last_usage``.
+
+        Wraps all Anthropic SDK exceptions in RuntimeError so callers
+        receive a consistent error type regardless of the underlying cause.
+        Token counts (input, output, total) are stored in ``self.last_usage``
+        after every successful call.
+
+        Raises:
+            RuntimeError: On authentication failure, rate limit, API error,
+                          or connection error.
+        """
         try:
             response = self._client.messages.create(
                 model=model,
@@ -107,6 +119,16 @@ class AnthropicClient(AIClient):
 
     @staticmethod
     def _parse_json(raw: str) -> dict:
+        """
+        Parse a model response as JSON, tolerating preamble text.
+
+        Fast path: tries ``json.loads`` on the full response.
+        Slow path: extracts the first ``{...}`` or ``[...]`` block via regex,
+        which handles models that prefix the JSON with explanation text.
+
+        Raises:
+            ValueError: If no valid JSON block can be extracted.
+        """
         # Fast path: the entire response is valid JSON.
         try:
             return json.loads(raw)
