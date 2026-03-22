@@ -20,7 +20,15 @@ without a Neo4j connection until a tool is actually invoked.
 from __future__ import annotations
 
 import dataclasses
+import sys
+from pathlib import Path
 from typing import Any
+
+# Ensure the project root is on sys.path when the file is loaded directly
+# (e.g. via `mcp dev` / `mcp run`), not just when run as a package module.
+_project_root = Path(__file__).resolve().parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 from mcp.server.fastmcp import FastMCP
 
