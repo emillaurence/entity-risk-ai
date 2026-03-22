@@ -1,0 +1,18 @@
+# Environment
+.env
+
+# Claude
+CLAUDE.md
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# Jupyter
+.jupyter/
+
+# OS
+.DS_Store
