@@ -251,12 +251,12 @@ class RiskTools:
             elif total == 0:
                 summary = (
                     f"'{company_name}' is the only company at its address "
-                    f"({address.get('postal_code', '?')}). Address risk: LOW."
+                    f"({address.get('post_code', '?')}). Address risk: LOW."
                 )
             else:
                 summary = (
                     f"'{company_name}' shares address "
-                    f"({address.get('postal_code', '?')}) "
+                    f"({address.get('post_code', '?')}) "
                     f"with {total} other companies "
                     f"({active} active, {dissolved} dissolved — "
                     f"{dissolution_rate:.0%} dissolution rate). "

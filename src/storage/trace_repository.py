@@ -21,10 +21,10 @@ from src.storage.neo4j_repository import Neo4jRepository
 # Primary identifier property per label used for entity resolution.
 _ENTITY_ID_PROP: dict[str, str] = {
     "Company": "name",
-    "Person": "name",
+    "Individual": "person_id",
     "LegalEntity": "name",
-    "Address": "postal_code",
-    "SIC": "code",
+    "Address": "post_code",
+    "SIC": "sic_code",
 }
 
 

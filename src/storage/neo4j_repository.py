@@ -176,7 +176,9 @@ class Neo4jRepository:
             ORDER BY length(path)
             WITH owner, collect(path)[0] AS shortest_path
             RETURN
-                owner.name                                          AS owner_name,
+                coalesce(owner.name,
+                    trim(coalesce(owner.forename, '') + ' ' + coalesce(owner.surname, ''))
+                )                                                   AS owner_name,
                 labels(owner)                                       AS owner_labels,
                 length(shortest_path)                               AS chain_depth,
                 relationships(shortest_path)[0].ownership_pct_min   AS ownership_pct_min,
@@ -195,9 +197,9 @@ class Neo4jRepository:
             RETURN
                 a.address_line_1    AS address_line_1,
                 a.address_line_2    AS address_line_2,
-                a.locality          AS locality,
-                a.region            AS region,
-                a.postal_code       AS postal_code,
+                a.post_town         AS post_town,
+                a.county            AS county,
+                a.post_code         AS post_code,
                 a.country           AS country
         """
         rows = self.run_query(query, {"name": company_name})
@@ -218,7 +220,7 @@ class Neo4jRepository:
                 other.name              AS company_name,
                 other.company_number    AS company_number,
                 other.status            AS status,
-                a.postal_code           AS postal_code,
+                a.post_code             AS post_code,
                 a.address_line_1        AS address_line_1
             ORDER BY other.name
             LIMIT $limit
@@ -232,9 +234,9 @@ class Neo4jRepository:
         query = """
             MATCH (c:Company {name: $name})-[:HAS_SIC]->(s:SIC)
             RETURN
-                s.code          AS sic_code,
+                s.sic_code      AS sic_code,
                 s.description   AS sic_description
-            ORDER BY s.code
+            ORDER BY s.sic_code
         """
         return self.run_query(query, {"name": company_name})
 
@@ -249,7 +251,7 @@ class Neo4jRepository:
             MATCH (c:Company {name: $name})-[:HAS_SIC]->(s:SIC)
                   <-[:HAS_SIC]-(other:Company)
             WHERE other.name <> $name
-            WITH other, collect(s.code) AS shared_sic_codes,
+            WITH other, collect(s.sic_code) AS shared_sic_codes,
                         collect(s.description) AS shared_sic_descriptions
             RETURN
                 other.name              AS company_name,

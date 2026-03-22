@@ -78,10 +78,12 @@ class GraphTools:
             }
 
             sic_summary = (
-                ", ".join(s["sic_code"] for s in sics) if sics else "none"
+                ", ".join(
+                    f"{s['sic_code']} ({s['sic_description']})" for s in sics
+                ) if sics else "none"
             )
             owner_summary = (
-                ", ".join(o["owner_name"] for o in owners) if owners else "none recorded"
+                ", ".join(o["owner_name"] or "?" for o in owners) if owners else "none recorded"
             )
             summary = (
                 f"{company_name} (#{company['company_number']}, {company['status']}). "
@@ -178,13 +180,13 @@ class GraphTools:
             elif not co_located:
                 summary = (
                     f"'{company_name}' is the only company at its registered address "
-                    f"({address.get('postal_code', 'unknown postcode')})."
+                    f"({address.get('post_code', 'unknown postcode')})."
                 )
             else:
                 risk = _address_risk_label(len(co_located))
                 summary = (
                     f"'{company_name}' shares its address "
-                    f"({address.get('postal_code', 'unknown postcode')}) "
+                    f"({address.get('post_code', 'unknown postcode')}) "
                     f"with {len(co_located)} other companies "
                     f"({active_count} active). "
                     f"Address co-location risk: {risk}."

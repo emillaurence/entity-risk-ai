@@ -34,6 +34,8 @@ class AnthropicClient(AIClient):
         self._settings = settings or get_anthropic_settings()
         self._client = anthropic.Anthropic(api_key=self._settings.api_key)
         self._default_model = self._settings.model_haiku
+        # Populated after every _call() so callers can inspect token usage.
+        self.last_usage: dict[str, int] | None = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -82,12 +84,18 @@ class AnthropicClient(AIClient):
         max_tokens: int,
     ) -> anthropic.types.Message:
         try:
-            return self._client.messages.create(
+            response = self._client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
+            self.last_usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
+            }
+            return response
         except anthropic.AuthenticationError as e:
             raise RuntimeError(f"Anthropic authentication failed: {e}") from e
         except anthropic.RateLimitError as e:
