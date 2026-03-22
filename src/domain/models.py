@@ -127,6 +127,8 @@ class ToolResult:
     data: Any = None
     error: str | None = None
     duration_ms: float = 0.0
+    input: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
 
 
 @dataclass
@@ -159,10 +161,18 @@ class InvestigationTrace:
 
     Attributes:
         request_id:  Links this trace to an InvestigationRequest.
+        entity_name: The entity that was investigated (for search/listing).
+        created_at:  UTC timestamp when the trace was created.
         events:      Ordered list of TraceEvents.
     """
 
     request_id: str
+    entity_name: str = ""
+    user_id: str = ""
+    mode: str = "interactive"
+    final_summary: str = ""
+    ended_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     events: list[TraceEvent] = field(default_factory=list)
 
     def add(self, event: TraceEvent) -> None:
