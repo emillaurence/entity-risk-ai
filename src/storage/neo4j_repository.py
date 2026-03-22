@@ -99,14 +99,20 @@ class Neo4jRepository:
         special = r'+-&|!(){}[]^"~*?:\/'
         return "".join(f"\\{ch}" if ch in special else ch for ch in term)
 
-    def find_company_by_name(self, name: str, limit: int = 10) -> list[dict]:
+    def find_company_by_name(
+        self, name: str, limit: int = 10, min_score: float = 1.0
+    ) -> list[dict]:
         query = (
             "CALL db.index.fulltext.queryNodes('company_name_ft', $name) "
             "YIELD node AS c, score "
+            "WHERE score > $min_score "
             + self._COMPANY_RETURN
             + ", score ORDER BY score DESC LIMIT $limit"
         )
-        return self.run_query(query, {"name": self._escape_fulltext(name), "limit": limit})
+        return self.run_query(
+            query,
+            {"name": self._escape_fulltext(name), "limit": limit, "min_score": min_score},
+        )
 
     def get_company_by_exact_name(self, name: str) -> dict | None:
         query = (

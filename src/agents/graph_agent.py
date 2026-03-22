@@ -94,7 +94,7 @@ class GraphAgent(BaseAgent):
                      ``expand_ownership`` also accepts ``max_depth: int`` (default 5).
             trace:   The active InvestigationTrace to log events into.
         """
-        company_name = context.get("company_name", "")
+        company_name = context.get("company_name") or context.get("name", "")
 
         if task not in _SUPPORTED_TASKS:
             return AgentResult(

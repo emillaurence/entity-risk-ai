@@ -29,7 +29,7 @@ from typing import Any
 from src.agents.base import BaseAgent
 from src.clients.ai_client import AIClient
 from src.clients.mcp_tool_client import MCPToolClient
-from src.domain.models import AgentResult, InvestigationTrace
+from src.domain.models import AgentResult, EventType, InvestigationTrace, TraceEvent
 from src.tracing.trace_service import TraceService
 
 
@@ -327,7 +327,7 @@ class RiskAgent(BaseAgent):
         company_ref = [{"label": "Company", "name": company_name}]
         findings: dict[str, Any] = {}
         tool_summaries: list[str] = []
-        all_success = True
+        failed_tasks: list[str] = []
 
         for task in sorted(_DIRECT_TOOL_TASKS):  # stable alphabetical order
             result = self._call_tool(task, company_name, context)
@@ -340,7 +340,7 @@ class RiskAgent(BaseAgent):
                 decision=(
                     "risk signal collected for synthesis"
                     if result.success
-                    else "step failed — partial summary only"
+                    else "tool unavailable — partial assessment"
                 ),
                 entity_refs=company_ref,
             )
@@ -350,7 +350,21 @@ class RiskAgent(BaseAgent):
             else:
                 findings[task] = None
                 if not result.success:
-                    all_success = False
+                    failed_tasks.append(task)
+                    self._trace_service.add_event(
+                        trace,
+                        TraceEvent(
+                            event_type=EventType.STEP_FAILED,
+                            message=(
+                                f"Tool '{task}' unavailable for '{company_name}': "
+                                f"{result.error or 'no error detail'}"
+                            ),
+                            payload={"tool": task, "error": result.error},
+                        ),
+                    )
+
+        if failed_tasks:
+            findings["unavailable_tools"] = failed_tasks
 
         # ---- deterministic summary (always present) ------------------
         deterministic_summary = (
@@ -406,7 +420,7 @@ class RiskAgent(BaseAgent):
         return AgentResult(
             request_id=trace.request_id,
             entity_name=company_name,
-            success=all_success,
+            success=len(tool_summaries) >= 1,
             summary=final_summary,
             findings=findings,
             trace=trace,
