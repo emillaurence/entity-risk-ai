@@ -53,6 +53,12 @@ from src.tracing.trace_service import TraceService
 
 _log = logging.getLogger(__name__)
 
+_AGENT_DISPLAY: dict[str, str] = {
+    "graph-agent":  "Graph Agent",
+    "risk-agent":   "Risk Agent",
+    "trace-agent":  "Trace Agent",
+}
+
 _FAILURE_SYSTEM_PROMPT = (
     "You are a UK financial crime compliance assistant. "
     "A structured investigation could not be completed. "
@@ -241,7 +247,7 @@ class Orchestrator:
     # Public interface
     # ------------------------------------------------------------------
 
-    def run(self, query: str, user_id: str = "system") -> OrchestratorResult:
+    def run(self, query: str, user_id: str = "system", on_progress: Any = None) -> OrchestratorResult:
         """
         Execute a full investigation from a natural-language query.
 
@@ -256,11 +262,16 @@ class Orchestrator:
         warnings: list[str] = []
         errors: list[str] = []
 
+        # Short ID for log correlation across all events in this run.
+        _run_id = str(uuid.uuid4())
+        _short  = _run_id[:8]
+        _log.info("[%s] Investigation started: %r", _short, query[:120])
+
         # ── 1. Plan ────────────────────────────────────────────────────
         try:
             plan = self._planner.plan(query)
         except Exception as exc:
-            _log.error("Planner failed for query %r: %s", query, exc)
+            _log.error("[%s] Planner failed: %s", _short, exc)
             return OrchestratorResult(
                 mode="investigate",
                 query=query,
@@ -274,15 +285,26 @@ class Orchestrator:
                 errors=[f"Planner failed: {exc}"],
             )
 
+        _log.info(
+            "[%s] Routing: mode=%s entities=%s steps=%d",
+            _short, plan.mode,
+            [e.name for e in plan.entities],
+            len(plan.plan),
+        )
+        if on_progress:
+            on_progress("plan_ready", plan.to_dict())
+
         # ── 2. Create and persist trace ────────────────────────────────
         entity_name = plan.entities[0].name if plan.entities else query
         trace = InvestigationTrace(
-            request_id=str(uuid.uuid4()),
+            request_id=_run_id,
             entity_name=entity_name,
             user_id=user_id,
             mode=plan.mode,
         )
         self._trace_repo.save_trace(trace)
+        if on_progress:
+            on_progress("trace_created", {"trace_id": trace.request_id})
 
         self._trace_service.add_event(
             trace,
@@ -329,7 +351,15 @@ class Orchestrator:
                 res = self._mcp.call_tool("resolve_entity", {"name": entity.name})
                 if res.success and (res.data or {}).get("canonical_name"):
                     resolved[entity.name] = {**res.data, "resolved": True}
-                    canonical = res.data["canonical_name"]
+                    canonical    = res.data["canonical_name"]
+                    company_no   = res.data.get("company_number", "")
+                    exact_match  = res.data.get("exact_match", True)
+                    _log.info(
+                        "[%s] Entity resolved: '%s' → '%s' (number=%s exact=%s)",
+                        _short, entity.name, canonical, company_no, exact_match,
+                    )
+                    if on_progress:
+                        on_progress("entity_resolved", {entity.name: resolved[entity.name]})
                     self._trace_service.add_event(
                         trace,
                         TraceEvent(
@@ -340,7 +370,13 @@ class Orchestrator:
                         entity_refs=[{"label": "Company", "name": canonical}],
                     )
                 else:
+                    _log.warning(
+                        "[%s] Entity not resolved: '%s' — %s",
+                        _short, entity.name, res.error,
+                    )
                     resolved[entity.name] = None
+                    if on_progress:
+                        on_progress("entity_resolved", {entity.name: None})
                     msg = f"Entity '{entity.name}' could not be resolved in the graph."
                     errors.append(msg)
                     self._trace_service.add_event(
@@ -394,14 +430,25 @@ class Orchestrator:
                 ))
                 continue
 
-            _log.debug(
-                "Executing %s.%s (step %s)", step.agent, step.task, step.step_id
+            agent_label = _AGENT_DISPLAY.get(step.agent, step.agent)
+            _log.info(
+                "[%s] Step %s start: %s → %s",
+                _short, step.step_id, agent_label, step.task,
             )
+            if on_progress:
+                on_progress("step_starting", {
+                    "step_id": step.step_id,
+                    "agent":   step.agent,
+                    "task":    step.task,
+                    "index":   len(step_results),
+                    "n_total": len(plan.plan),
+                })
             try:
                 result: AgentResult = agent.run(step.task, context, trace)
             except Exception as exc:
                 _log.error(
-                    "Agent %s raised on task %s: %s", step.agent, step.task, exc
+                    "[%s] Step %s error: %s → %s | %s",
+                    _short, step.step_id, agent_label, step.task, exc,
                 )
                 result = AgentResult(
                     request_id=trace.request_id,
@@ -420,6 +467,15 @@ class Orchestrator:
                 tools_executed=result.tools_used,
                 error=result.error,
             ))
+            if on_progress:
+                on_progress("step_complete", step_results[-1].to_dict())
+
+            _log.info(
+                "[%s] Step %s complete: %s → %s | status=%s tools=%s",
+                _short, step.step_id, agent_label, step.task,
+                "success" if result.success else "failed",
+                result.tools_used or [],
+            )
 
             # ── Stop on failure ─────────────────────────────────────────
             if not result.success:
@@ -435,6 +491,8 @@ class Orchestrator:
                             f"Halted — step '{step.step_id}' ({step.task}) failed."
                         ),
                     ))
+                    if on_progress:
+                        on_progress("step_complete", step_results[-1].to_dict())
                 if remaining:
                     warnings.append(
                         f"Execution halted after '{step.step_id}' ({step.task}) failed. "
@@ -481,6 +539,12 @@ class Orchestrator:
             warnings.append(f"Trace finalisation failed: {exc}")
 
         overall_success = any(sr.success for sr in step_results)
+        n_done    = sum(1 for sr in step_results if sr.success)
+        n_skipped = sum(1 for sr in step_results if sr.skipped)
+        _log.info(
+            "[%s] Investigation complete: success=%s mode=%s steps=%d/%d skipped=%d",
+            _short, overall_success, plan.mode, n_done, len(step_results), n_skipped,
+        )
 
         # Extract the target trace_id if a retrieve step succeeded.
         retrieved_trace_id = ""

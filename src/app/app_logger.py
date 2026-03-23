@@ -1,49 +1,60 @@
 """
-src.app.app_logger — Lightweight file logger for the Streamlit app.
+src.app.app_logger — Application-level logger and event helper.
 
-Usage
------
-    from src.app.app_logger import get_app_logger
+Calling get_app_logger() initialises file logging for the whole process using
+the standard format defined in src.agents.logging_setup.  All backend loggers
+(src.*, agent.*) propagate to root and therefore write to the same file.
+
+Log file: <repo-root>/logs/app.log
+
+Format:
+    2026-03-23 14:42:27 [INFO] entity_risk_app: investigation_completed ...
+
+Usage:
+    from src.app.app_logger import get_app_logger, log_event
 
     log = get_app_logger()
-    log.info("Investigation submitted: %.80s", question)
+    log.info("Something happened")
 
-Log file location: ``<repo-root>/logs/app.log``
-
-The directory is created automatically on first use.  The file is opened in
-append mode so successive app restarts accumulate a running history.  Rotate
-manually or add a TimedRotatingFileHandler if volume grows.
+    log_event("investigation_completed", success=True, trace_id="abc", steps=6)
+    # → 2026-03-23 14:42:27 [INFO] entity_risk_app: investigation_completed success=True trace_id='abc' steps=6
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
-# Resolve relative to this file: src/app/app_logger.py → repo root
+from src.agents.logging_setup import configure_logging
+
 _REPO_ROOT = Path(__file__).parent.parent.parent
-_LOG_DIR = _REPO_ROOT / "logs"
-_LOG_FILE = _LOG_DIR / "app.log"
+_LOG_FILE  = str(_REPO_ROOT / "logs" / "app.log")
 
-_FMT = "%(asctime)s  %(levelname)-8s  %(message)s"
-_DATEFMT = "%Y-%m-%d %H:%M:%S"
+_log = logging.getLogger("entity_risk_app")
 
 
 def get_app_logger() -> logging.Logger:
-    """Return (or lazily create) the singleton app logger.
+    """Initialise file logging (idempotent) and return the app logger.
 
-    The file handler is added only once even if ``get_app_logger`` is called
-    multiple times across Streamlit reruns.
+    Safe to call on every Streamlit rerun — configure_logging() ensures
+    handlers are added only once.
     """
-    logger = logging.getLogger("entity_risk_app")
+    configure_logging(log_file=_LOG_FILE)
+    return _log
 
-    if not logger.handlers:
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(_LOG_FILE, mode="a", encoding="utf-8")
-        handler.setFormatter(logging.Formatter(_FMT, datefmt=_DATEFMT))
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-        # Prevent propagation to root logger (avoids double-printing in Jupyter)
-        logger.propagate = False
 
-    return logger
+def log_event(event: str, **kwargs: Any) -> None:
+    """Log a named application event as a structured one-liner.
+
+    Keyword arguments are appended as ``key=repr(value)`` pairs.
+    None values are omitted.
+
+    Example::
+
+        log_event("investigation_completed", success=True, steps=6, duration_ms=4521)
+        # → 2026-03-23 14:42:27 [INFO] entity_risk_app: investigation_completed success=True steps=6 duration_ms=4521
+    """
+    parts = [f"{k}={v!r}" for k, v in kwargs.items() if v is not None]
+    msg = event + (" " + " ".join(parts) if parts else "")
+    _log.info(msg)

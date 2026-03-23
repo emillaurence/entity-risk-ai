@@ -1,11 +1,16 @@
+import logging
+
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
+
+_log = logging.getLogger(__name__)
 
 
 class Neo4jRepository:
     def __init__(self, uri: str, username: str, password: str, database: str) -> None:
         self._database = database
         self._driver = GraphDatabase.driver(uri, auth=(username, password))
+        _log.info("Neo4j driver initialised: uri=%s database=%s", uri, database)
 
     def close(self) -> None:
         self._driver.close()
@@ -18,10 +23,13 @@ class Neo4jRepository:
     def test_connection(self) -> bool:
         try:
             self._driver.verify_connectivity()
+            _log.info("Neo4j connection verified")
             return True
         except ServiceUnavailable as e:
+            _log.error("Neo4j unreachable: %s", e)
             raise ConnectionError(f"Neo4j is unreachable: {e}") from e
         except Neo4jError as e:
+            _log.error("Neo4j connection failed: %s", e)
             raise ConnectionError(f"Neo4j connection failed: {e}") from e
 
     # --- Schema inspection ---

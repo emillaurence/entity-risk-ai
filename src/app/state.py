@@ -16,6 +16,7 @@ execution_status    Dict with running/message/step describing live progress.
 
 from __future__ import annotations
 
+import queue as _queue
 from typing import TYPE_CHECKING, Any
 
 import streamlit as st
@@ -27,18 +28,42 @@ if TYPE_CHECKING:
 # Private key constants
 # ---------------------------------------------------------------------------
 
-_KEY_QUESTION = "question"
-_KEY_RESULT = "orchestrator_result"
-_KEY_TRACE_ID = "trace_id"
+_KEY_QUESTION        = "question"
+_KEY_RESULT          = "orchestrator_result"
+_KEY_TRACE_ID        = "trace_id"
 _KEY_REPLAY_TRACE_ID = "replay_trace_id"
-_KEY_STATUS = "execution_status"
+_KEY_STATUS          = "execution_status"
+_KEY_STEPS_REVEALED  = "steps_revealed"
+
+# Live / progressive rendering state
+_KEY_LIVE_PHASE    = "live_phase"         # "idle"|"planning"|"resolving"|"executing"|"done"
+_KEY_LIVE_PLAN     = "live_plan"          # dict | None
+_KEY_LIVE_ENTITIES = "live_entities"      # dict[str, dict | None]
+_KEY_LIVE_STEPS    = "live_steps"         # list[dict] — completed steps (as dicts)
+_KEY_LIVE_CURRENT  = "live_current_step"  # dict | None — step currently running
+_KEY_LIVE_TRACE_ID = "live_trace_id"      # str | None
+
+# Replay / audit state
+_KEY_REPLAY_DATA   = "replay_data"    # dict from trace_repo.load_trace() | None
+_KEY_REPLAY_STATUS = "replay_status"  # "idle" | "loading" | "loaded" | "error"
+_KEY_REPLAY_ERROR  = "replay_error"   # str | None
 
 _DEFAULTS: dict[str, Any] = {
-    _KEY_QUESTION: "",
-    _KEY_RESULT: None,
-    _KEY_TRACE_ID: None,
+    _KEY_QUESTION:        "",
+    _KEY_RESULT:          None,
+    _KEY_TRACE_ID:        None,
     _KEY_REPLAY_TRACE_ID: None,
-    _KEY_STATUS: {"running": False, "message": "", "step": None},
+    _KEY_STATUS:          {"running": False, "message": "", "step": None},
+    _KEY_STEPS_REVEALED:  0,
+    _KEY_LIVE_PHASE:      "idle",
+    _KEY_LIVE_PLAN:       None,
+    _KEY_LIVE_ENTITIES:   {},
+    _KEY_LIVE_STEPS:      [],
+    _KEY_LIVE_CURRENT:    None,
+    _KEY_LIVE_TRACE_ID:   None,
+    _KEY_REPLAY_DATA:     None,
+    _KEY_REPLAY_STATUS:   "idle",
+    _KEY_REPLAY_ERROR:    None,
 }
 
 
@@ -118,6 +143,49 @@ def set_replay_trace_id(trace_id: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Replay result state
+# ---------------------------------------------------------------------------
+
+
+def get_replay_data() -> "dict | None":
+    """Return the loaded replay trace data dict, or None."""
+    return st.session_state.get(_KEY_REPLAY_DATA)
+
+
+def set_replay_data(data: "dict | None") -> None:
+    """Store the loaded replay trace data."""
+    st.session_state[_KEY_REPLAY_DATA] = data
+
+
+def get_replay_status() -> str:
+    """Return the replay status: 'idle' | 'loading' | 'loaded' | 'error'."""
+    return st.session_state.get(_KEY_REPLAY_STATUS, "idle")
+
+
+def set_replay_status(status: str) -> None:
+    """Set the replay status."""
+    st.session_state[_KEY_REPLAY_STATUS] = status
+
+
+def get_replay_error() -> "str | None":
+    """Return the replay error message, or None."""
+    return st.session_state.get(_KEY_REPLAY_ERROR)
+
+
+def set_replay_error(error: "str | None") -> None:
+    """Store a replay error message (pass None to clear)."""
+    st.session_state[_KEY_REPLAY_ERROR] = error
+
+
+def clear_replay_state() -> None:
+    """Reset all replay state (call when user clears the replay view)."""
+    st.session_state[_KEY_REPLAY_DATA]     = None
+    st.session_state[_KEY_REPLAY_STATUS]   = "idle"
+    st.session_state[_KEY_REPLAY_ERROR]    = None
+    st.session_state[_KEY_REPLAY_TRACE_ID] = None
+
+
+# ---------------------------------------------------------------------------
 # execution_status
 # ---------------------------------------------------------------------------
 
@@ -142,3 +210,151 @@ def set_status(*, running: bool, message: str = "", step: str | None = None) -> 
 def clear_status() -> None:
     """Reset execution status to the idle default."""
     set_status(running=False, message="", step=None)
+
+
+# ---------------------------------------------------------------------------
+# steps_revealed  (progressive rendering counter)
+# ---------------------------------------------------------------------------
+
+
+def get_steps_revealed() -> int:
+    """Return the number of execution step cards revealed so far."""
+    return st.session_state.get(_KEY_STEPS_REVEALED, 0)
+
+
+def set_steps_revealed(n: int) -> None:
+    """Set the number of revealed step cards."""
+    st.session_state[_KEY_STEPS_REVEALED] = n
+
+
+def reset_steps_revealed() -> None:
+    """Reset the reveal counter to zero (call at the start of a new run)."""
+    st.session_state[_KEY_STEPS_REVEALED] = 0
+
+
+# ---------------------------------------------------------------------------
+# Live / progressive rendering state
+# ---------------------------------------------------------------------------
+
+
+def get_live_phase() -> str:
+    return st.session_state.get(_KEY_LIVE_PHASE, "idle")
+
+
+def set_live_phase(phase: str) -> None:
+    st.session_state[_KEY_LIVE_PHASE] = phase
+
+
+def get_live_plan() -> "dict | None":
+    return st.session_state.get(_KEY_LIVE_PLAN)
+
+
+def get_live_entities() -> dict:
+    return st.session_state.get(_KEY_LIVE_ENTITIES, {})
+
+
+def get_live_steps() -> list:
+    return st.session_state.get(_KEY_LIVE_STEPS, [])
+
+
+def get_live_current_step() -> "dict | None":
+    return st.session_state.get(_KEY_LIVE_CURRENT)
+
+
+def get_live_trace_id() -> "str | None":
+    return st.session_state.get(_KEY_LIVE_TRACE_ID)
+
+
+def reset_all_run_state() -> None:
+    """Clear every piece of state that carries over from a previous run.
+
+    Call this as early as possible — ideally in the button handler — so
+    the *same* Streamlit render pass that detects the button press starts
+    a clean page.  Combining both helpers here keeps the call site simple.
+    """
+    reset_live_state()
+    clear_replay_state()
+
+
+def reset_live_state() -> None:
+    """Clear all live rendering state (call before starting a new run).
+
+    Resets every key that could carry over stale data from a previous run,
+    so the UI renders clean placeholders on the very first rerun after the
+    investigation thread starts.
+    """
+    st.session_state[_KEY_LIVE_PHASE]    = "planning"
+    st.session_state[_KEY_LIVE_PLAN]     = None
+    st.session_state[_KEY_LIVE_ENTITIES] = {}
+    st.session_state[_KEY_LIVE_STEPS]    = []
+    st.session_state[_KEY_LIVE_CURRENT]  = None
+    st.session_state[_KEY_LIVE_TRACE_ID] = None
+    # Clear previous result/trace so placeholders show correctly
+    st.session_state[_KEY_RESULT]        = None
+    st.session_state[_KEY_TRACE_ID]      = None
+    # Clear status banner and step counter so no stale indicators remain
+    st.session_state[_KEY_STATUS]        = _DEFAULTS[_KEY_STATUS].copy()
+    st.session_state[_KEY_STEPS_REVEALED] = 0
+
+
+def drain_run_queue() -> bool:
+    """Drain the progress queue and update live state.
+
+    Called on the main Streamlit thread at the start of each render pass.
+    The background orchestrator thread writes only to the queue; this
+    function applies those events to session_state (main-thread safe).
+
+    Returns True when the run is fully complete (phase set to "done").
+    """
+    q: "_queue.Queue | None" = st.session_state.get("run_queue")
+    if q is None:
+        return False
+
+    done = False
+    try:
+        while True:
+            event = q.get_nowait()
+            etype = event.get("event")
+            data  = event.get("data", {})
+
+            if etype == "plan_ready":
+                st.session_state[_KEY_LIVE_PLAN]  = data
+                st.session_state[_KEY_LIVE_PHASE] = "resolving"
+
+            elif etype == "trace_created":
+                st.session_state[_KEY_LIVE_TRACE_ID] = data.get("trace_id")
+
+            elif etype == "entity_resolved":
+                entities = dict(st.session_state.get(_KEY_LIVE_ENTITIES) or {})
+                entities.update(data)
+                st.session_state[_KEY_LIVE_ENTITIES] = entities
+                st.session_state[_KEY_LIVE_PHASE]    = "executing"
+
+            elif etype == "step_starting":
+                st.session_state[_KEY_LIVE_CURRENT] = data
+                st.session_state[_KEY_LIVE_PHASE]   = "executing"
+
+            elif etype == "step_complete":
+                steps = list(st.session_state.get(_KEY_LIVE_STEPS) or [])
+                steps.append(data)
+                st.session_state[_KEY_LIVE_STEPS]   = steps
+                st.session_state[_KEY_LIVE_CURRENT] = None
+
+            elif etype == "done":
+                result = data.get("result")
+                if result is not None:
+                    set_result(result)
+                    set_trace_id(result.trace_id)
+                st.session_state[_KEY_LIVE_PHASE] = "done"
+                done = True
+
+            elif etype == "error":
+                set_result(None)
+                set_status(running=False, message=f"Error: {data.get('error', 'Unknown error')}")
+                st.session_state[_KEY_LIVE_PHASE] = "done"
+                done = True
+
+    except _queue.Empty:
+        pass
+
+    return done

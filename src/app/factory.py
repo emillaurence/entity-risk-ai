@@ -18,6 +18,7 @@ planner + mcp_client + agents + trace_service + trace_repo ──► Orchestrato
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import streamlit as st
@@ -66,6 +67,14 @@ def create_app_components() -> AppComponents:
     # Config ----------------------------------------------------------------
     neo4j_settings = get_neo4j_settings()
     anthropic_settings = get_anthropic_settings()
+
+    _log = logging.getLogger(__name__)
+    _log.info(
+        "App components initialising: neo4j=%s db=%s model=%s",
+        neo4j_settings.uri,
+        neo4j_settings.database,
+        anthropic_settings.model_haiku,
+    )
 
     # Clients ---------------------------------------------------------------
     ai_client = AnthropicClient(anthropic_settings)

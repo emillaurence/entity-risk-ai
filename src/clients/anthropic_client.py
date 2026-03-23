@@ -6,9 +6,13 @@ for tasks that need stronger reasoning.
 """
 
 import json
+import logging
 import re
+import time
 
 import anthropic
+
+_log = logging.getLogger(__name__)
 
 from src.clients.ai_client import AIClient
 from src.config import AnthropicSettings, get_anthropic_settings
@@ -109,6 +113,7 @@ class AnthropicClient(AIClient):
             if cache_system
             else system_prompt
         )
+        t0 = time.monotonic()
         try:
             response = self._client.messages.create(
                 model=model,
@@ -116,15 +121,23 @@ class AnthropicClient(AIClient):
                 system=system_arg,
                 messages=[{"role": "user", "content": user_prompt}],
             )
+            elapsed = time.monotonic() - t0
             cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
             cache_written = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            in_tok  = response.usage.input_tokens
+            out_tok = response.usage.output_tokens
             self.last_usage = {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-                "total_tokens": response.usage.input_tokens + response.usage.output_tokens,
-                "cache_read_input_tokens": cache_read,
+                "input_tokens":               in_tok,
+                "output_tokens":              out_tok,
+                "total_tokens":               in_tok + out_tok,
+                "cache_read_input_tokens":    cache_read,
                 "cache_creation_input_tokens": cache_written,
             }
+            _log.info(
+                "%s %.2fs | in=%d out=%d total=%d cached=%d created=%d",
+                model, elapsed, in_tok, out_tok, in_tok + out_tok,
+                cache_read, cache_written,
+            )
             return response
         except anthropic.AuthenticationError as e:
             raise RuntimeError(f"Anthropic authentication failed: {e}") from e

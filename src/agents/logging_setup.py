@@ -39,8 +39,12 @@ import logging.handlers
 from pathlib import Path
 
 
-_LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(name)-30s  %(message)s"
-_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Module-level guard so a file handler is added only once regardless of how
+# many times configure_logging() is called (e.g. from app_logger + factory).
+_file_handler_path: str | None = None
 
 
 def configure_logging(
@@ -53,6 +57,8 @@ def configure_logging(
     Configure the root logger with a console handler and, optionally,
     a rotating file handler.
 
+    Safe to call multiple times — duplicate handlers are never added.
+
     Args:
         log_file:     Path to the log file.  Pass None for console-only output
                       (useful in Jupyter / development).
@@ -60,22 +66,23 @@ def configure_logging(
         max_bytes:    Rotate the file when it reaches this size.
         backup_count: Number of rotated files to keep.
     """
-    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
+    global _file_handler_path
 
+    formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Avoid adding duplicate handlers if called more than once.
-    if root.handlers:
-        return
+    # Add a console handler only if none exists yet.
+    has_console = any(
+        type(h) is logging.StreamHandler for h in root.handlers
+    )
+    if not has_console:
+        console = logging.StreamHandler()
+        console.setFormatter(formatter)
+        root.addHandler(console)
 
-    # Console handler — always present.
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-    root.addHandler(console)
-
-    # Rotating file handler — only when a path is given.
-    if log_file:
+    # Add a rotating file handler only once per unique path.
+    if log_file and log_file != _file_handler_path:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(
             log_file,
@@ -85,6 +92,5 @@ def configure_logging(
         )
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
-        logging.getLogger(__name__).info(
-            "File logging active: %s (level=%s)", log_file, logging.getLevelName(level)
-        )
+        _file_handler_path = log_file
+        logging.getLogger(__name__).info("Log file: %s", log_file)
