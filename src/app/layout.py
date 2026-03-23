@@ -1,40 +1,38 @@
 """
-src.app.layout — Three-column page layout.
+src.app.layout — Two-tab page layout.
 
-Column responsibilities
------------------------
-Left (2/5 width)
-    Investigation input (question entry + submit).
-    Final answer / risk assessment card.
+Tab 1 — Investigate
+    Three-column layout: AI Assistant | Context Graph | Decision Insights.
+    A "How this was analysed" expander at the bottom exposes the investigation
+    plan, step-by-step execution cards, and the decision trace ID.
 
-Center (2/5 width)
-    Planner output (mode, entities, steps).
-    Execution step results.
-
-Right (1/5 width)
-    Trace event viewer (trace ID, stats, warnings/errors).
-    Replay / audit panel.
+Tab 2 — Replay / Audit
+    Three-column layout: Risk Assessment | Investigation Activity | Trace Metadata.
+    Focused on reviewing a prior investigation by trace ID.
 
 Progressive rendering
 ---------------------
 When the user submits a question, the orchestrator runs in a background
-thread.  The thread emits progress events (plan_ready, entity_resolved,
-step_starting, step_complete, done) into a queue.Queue.
+thread.  The thread emits progress events into a queue.Queue.
 
-On each Streamlit rerun, ``render_layout`` calls ``state.drain_run_queue``
-which reads all pending events and updates the ``live_*`` session-state keys.
-The render functions read from those live keys so the UI updates as data
-arrives, without waiting for the full run to complete.
+Polling is handled by ``_polling_fragment`` — a Streamlit fragment that
+re-runs every 250 ms on its own scope (no full-page rebuild).  When it
+drains new events from the queue it calls ``st.rerun()`` to trigger a
+full-page rebuild so the columns pick up the updated live_* state.
+This means a full rebuild only happens when there is actually new data,
+instead of unconditionally every 350 ms.
 
-Polling: while the background thread is alive, the layout sleeps 350 ms and
-calls ``st.rerun()`` to pick up the next batch of events.
+Note on tab rendering
+---------------------
+Streamlit evaluates *all* tab contents on every rerun (not just the active
+tab), so trigger flags set by widgets inside either tab are always visible
+to the post-render trigger-handling block below.
 """
 
 from __future__ import annotations
 
 import queue as _queue
 import threading
-import time
 
 import streamlit as st
 
@@ -42,26 +40,14 @@ import src.app.state as state
 from src.app.app_logger import get_app_logger, log_event
 from src.app.components import (
     render_app_header,
-    render_execution_steps,
-    render_final_answer,
-    render_investigation_input,
-    render_planner_output,
-    render_replay_mode_banner,
-    render_replay_panel,
+    render_investigate_tab,
+    render_replay_tab,
     render_status_banner,
-    render_trace_viewer,
 )
 from src.app.factory import AppComponents, create_app_components
 from src.app.styles import inject_styles
 
 _log = get_app_logger()
-
-# Phase → status-banner message
-_PHASE_MESSAGES: dict[str, str] = {
-    "planning":  "Planning investigation…",
-    "resolving": "Resolving entities…",
-    "executing": "Executing steps…",
-}
 
 
 def _start_investigation(components: AppComponents, question: str) -> None:
@@ -69,7 +55,7 @@ def _start_investigation(components: AppComponents, question: str) -> None:
     seed the run queue so the UI picks up progress events on each rerun.
     """
     state.reset_live_state()
-    state.clear_replay_state()   # dismiss replay view when a new run starts
+    state.reset_replay_state()   # dismiss replay view when a new run starts
 
     q: _queue.Queue = _queue.Queue()
     st.session_state["run_queue"] = q
@@ -92,22 +78,23 @@ def _start_investigation(components: AppComponents, question: str) -> None:
     st.session_state["run_thread"] = thread
 
 
-def _update_status_from_live_phase() -> None:
-    """Keep the status banner in sync with the current live phase."""
-    phase = state.get_live_phase()
-    if phase in _PHASE_MESSAGES:
-        state.set_status(running=True, message=_PHASE_MESSAGES[phase])
-    elif phase == "done":
-        state.clear_status()
 
+@st.fragment(run_every=0.25)
+def _polling_fragment() -> None:
+    """Fragment-scoped poller — runs every 250 ms without rebuilding the page.
 
-def _maybe_rerun() -> None:
-    """Schedule a rerun if the investigation is still in progress.
-
-    Also handles the "done" transition: logs completion, resets phase to idle.
+    Drains the run queue and triggers a full rerun only when new events
+    arrive.  When the investigation is idle the fragment exits silently,
+    so the page is never rebuilt unnecessarily.
     """
     phase = state.get_live_phase()
 
+    # Nothing to poll when idle.
+    if phase == "idle":
+        return
+
+    # "done" transition: log completion, flip to idle, trigger one final
+    # full rebuild so the results columns render with the finished state.
     if phase == "done":
         result = state.get_result()
         if result is not None:
@@ -120,22 +107,24 @@ def _maybe_rerun() -> None:
             )
         state.set_live_phase("idle")
         state.clear_status()
-        # No extra rerun needed — result is already rendered on this pass.
+        st.rerun()
         return
 
-    if phase not in _PHASE_MESSAGES:
-        return  # idle or unknown — nothing to poll
+    # Active investigation — drain queue.
+    count, _done = state.drain_run_queue()
 
     thread = st.session_state.get("run_thread")
-    if thread and thread.is_alive():
-        time.sleep(0.35)
+
+    if count > 0:
+        # New events arrived — full rebuild so columns reflect new state.
         st.rerun()
-    else:
-        # Thread exited before putting "done" in the queue — drain remainder.
-        state.drain_run_queue()
+    elif thread and not thread.is_alive():
+        # Thread exited without sending "done" — force finalization.
         if state.get_live_phase() not in ("done", "idle"):
             state.set_live_phase("done")
         st.rerun()
+    # Otherwise: queue empty, thread still alive — fragment exits silently.
+    # No full rebuild; next fragment tick in 250 ms.
 
 
 def render_layout() -> None:
@@ -146,14 +135,12 @@ def render_layout() -> None:
       2. state.init            — seed session_state defaults on first load
       3. log startup           — once per browser session
       4. create_app_components — cached across reruns via @st.cache_resource
-      5. drain_run_queue       — apply progress events to live state
-      6. update status banner  — reflect current phase
-      7. render columns        — widgets run here and may set trigger flags
-      8. handle _trigger_replay / _trigger_run — consumed AFTER widgets render
-      9. _maybe_rerun          — poll while thread alive; handle completion
-
-    Triggers must be consumed AFTER rendering so that the widget that sets
-    them (e.g. the submit button) has already been evaluated on this rerun.
+      5. render header + error banner — above the tabs
+      6. render two tabs        — Investigate | Replay / Audit
+         (progress bar rendered inside the Investigate tab)
+      7. handle triggers        — consumed AFTER widgets render
+      8. _polling_fragment      — fragment-scoped poller; triggers full reruns
+                                  only when new events arrive
     """
     inject_styles()
     state.init()
@@ -164,37 +151,23 @@ def render_layout() -> None:
 
     components = create_app_components()
 
-    # ── Drain progress queue (updates live_* state) ────────────────────
-    state.drain_run_queue()
-
-    # ── Keep status banner message in sync with live phase ─────────────
-    _update_status_from_live_phase()
-
     # ── Render page ────────────────────────────────────────────────────
     render_app_header()
-    render_status_banner()
-    render_replay_mode_banner()
+    render_status_banner()  # error-only; hidden when idle
 
-    col_left, col_center, col_right = st.columns([2, 2, 1])
+    tab_investigate, tab_replay = st.tabs(["🔍 Investigate", "📼 Replay / Audit"])
 
-    with col_left:
-        render_investigation_input(components)
-        st.divider()
-        render_final_answer(components)
+    with tab_investigate:
+        render_investigate_tab(components)
 
-    with col_center:
-        render_planner_output(components)
-        st.divider()
-        render_execution_steps(components)
-
-    with col_right:
-        render_trace_viewer(components)
-        st.divider()
-        render_replay_panel(components)
+    with tab_replay:
+        render_replay_tab(components)
 
     # ── Handle triggers AFTER all widgets are rendered ─────────────────
     # Triggers are set by widgets during this rerun; checking them here
     # ensures they are consumed on the same rerun that set them.
+    # Both tabs are always evaluated by Streamlit on every rerun, so
+    # triggers from either tab are reliably visible here.
 
     if st.session_state.pop("_trigger_replay", False):
         replay_id = state.get_replay_trace_id()
@@ -225,7 +198,7 @@ def render_layout() -> None:
             st.rerun()
 
     if st.session_state.pop("_clear_replay", False):
-        state.clear_replay_state()
+        state.reset_replay_state()
         st.rerun()
 
     if st.session_state.pop("_trigger_run", False):
@@ -234,5 +207,6 @@ def render_layout() -> None:
             _start_investigation(components, question)
             st.rerun()  # immediately show "Planning…" state
 
-    # ── Poll / handle completion ───────────────────────────────────────
-    _maybe_rerun()
+    # ── Fragment-scoped poller ─────────────────────────────────────────
+    # Runs every 250 ms; triggers a full rerun only when new events arrive.
+    _polling_fragment()

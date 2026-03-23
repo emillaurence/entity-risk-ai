@@ -162,12 +162,14 @@ class InvestigationTrace:
     Attributes:
         request_id:  Links this trace to an InvestigationRequest.
         entity_name: The entity that was investigated (for search/listing).
+        question:    Original free-text question submitted by the user.
         created_at:  UTC timestamp when the trace was created.
         events:      Ordered list of TraceEvents.
     """
 
     request_id: str
     entity_name: str = ""
+    question: str = ""
     user_id: str = ""
     mode: str = "interactive"
     final_summary: str = ""

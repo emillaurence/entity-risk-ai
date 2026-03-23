@@ -12,6 +12,18 @@ orchestrator_result OrchestratorResult from the last completed run, or None.
 trace_id            Neo4j trace_id of the current/last investigation.
 replay_trace_id     trace_id entered by the user for replay/audit view.
 execution_status    Dict with running/message/step describing live progress.
+
+Live / progressive rendering keys
+----------------------------------
+live_phase          "idle"|"planning"|"resolving"|"executing"|"done"
+live_plan           InvestigationPlan dict, or None
+live_entities       dict[entity_name, resolution_dict | None]
+live_steps          list[dict] — completed steps emitted by step_complete events
+live_current_step   dict | None — step currently executing
+live_trace_id       str | None
+live_step_num       int — 1-based index of the current executing step (0 = none)
+live_step_total     int — total planned steps (0 = unknown)
+live_step_label     str — business-friendly label of the currently executing step
 """
 
 from __future__ import annotations
@@ -36,12 +48,15 @@ _KEY_STATUS          = "execution_status"
 _KEY_STEPS_REVEALED  = "steps_revealed"
 
 # Live / progressive rendering state
-_KEY_LIVE_PHASE    = "live_phase"         # "idle"|"planning"|"resolving"|"executing"|"done"
-_KEY_LIVE_PLAN     = "live_plan"          # dict | None
-_KEY_LIVE_ENTITIES = "live_entities"      # dict[str, dict | None]
-_KEY_LIVE_STEPS    = "live_steps"         # list[dict] — completed steps (as dicts)
-_KEY_LIVE_CURRENT  = "live_current_step"  # dict | None — step currently running
-_KEY_LIVE_TRACE_ID = "live_trace_id"      # str | None
+_KEY_LIVE_PHASE       = "live_phase"         # "idle"|"planning"|"resolving"|"executing"|"done"
+_KEY_LIVE_PLAN        = "live_plan"          # dict | None
+_KEY_LIVE_ENTITIES    = "live_entities"      # dict[str, dict | None]
+_KEY_LIVE_STEPS       = "live_steps"         # list[dict] — completed steps (as dicts)
+_KEY_LIVE_CURRENT     = "live_current_step"  # dict | None — step currently running
+_KEY_LIVE_TRACE_ID    = "live_trace_id"      # str | None
+_KEY_LIVE_STEP_NUM    = "live_step_num"      # int — 1-based current step, 0 if none
+_KEY_LIVE_STEP_TOTAL  = "live_step_total"    # int — total planned steps, 0 if unknown
+_KEY_LIVE_STEP_LABEL  = "live_step_label"    # str — business-friendly current step label
 
 # Replay / audit state
 _KEY_REPLAY_DATA   = "replay_data"    # dict from trace_repo.load_trace() | None
@@ -61,6 +76,9 @@ _DEFAULTS: dict[str, Any] = {
     _KEY_LIVE_STEPS:      [],
     _KEY_LIVE_CURRENT:    None,
     _KEY_LIVE_TRACE_ID:   None,
+    _KEY_LIVE_STEP_NUM:   0,
+    _KEY_LIVE_STEP_TOTAL: 0,
+    _KEY_LIVE_STEP_LABEL: "",
     _KEY_REPLAY_DATA:     None,
     _KEY_REPLAY_STATUS:   "idle",
     _KEY_REPLAY_ERROR:    None,
@@ -177,12 +195,16 @@ def set_replay_error(error: "str | None") -> None:
     st.session_state[_KEY_REPLAY_ERROR] = error
 
 
-def clear_replay_state() -> None:
-    """Reset all replay state (call when user clears the replay view)."""
+def reset_replay_state() -> None:
+    """Reset all replay state (call when user clears the replay view or starts a new run)."""
     st.session_state[_KEY_REPLAY_DATA]     = None
     st.session_state[_KEY_REPLAY_STATUS]   = "idle"
     st.session_state[_KEY_REPLAY_ERROR]    = None
     st.session_state[_KEY_REPLAY_TRACE_ID] = None
+
+
+# Keep old name as alias for backward compatibility during the transition.
+clear_replay_state = reset_replay_state
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +287,21 @@ def get_live_trace_id() -> "str | None":
     return st.session_state.get(_KEY_LIVE_TRACE_ID)
 
 
+def get_live_step_num() -> int:
+    """Return the 1-based index of the currently executing step (0 = none)."""
+    return st.session_state.get(_KEY_LIVE_STEP_NUM, 0)
+
+
+def get_live_step_total() -> int:
+    """Return the total number of planned steps (0 = unknown)."""
+    return st.session_state.get(_KEY_LIVE_STEP_TOTAL, 0)
+
+
+def get_live_step_label() -> str:
+    """Return the business-friendly label of the currently executing step."""
+    return st.session_state.get(_KEY_LIVE_STEP_LABEL, "")
+
+
 def reset_all_run_state() -> None:
     """Clear every piece of state that carries over from a previous run.
 
@@ -273,7 +310,7 @@ def reset_all_run_state() -> None:
     a clean page.  Combining both helpers here keeps the call site simple.
     """
     reset_live_state()
-    clear_replay_state()
+    reset_replay_state()
 
 
 def reset_live_state() -> None:
@@ -283,43 +320,74 @@ def reset_live_state() -> None:
     so the UI renders clean placeholders on the very first rerun after the
     investigation thread starts.
     """
-    st.session_state[_KEY_LIVE_PHASE]    = "planning"
-    st.session_state[_KEY_LIVE_PLAN]     = None
-    st.session_state[_KEY_LIVE_ENTITIES] = {}
-    st.session_state[_KEY_LIVE_STEPS]    = []
-    st.session_state[_KEY_LIVE_CURRENT]  = None
-    st.session_state[_KEY_LIVE_TRACE_ID] = None
+    st.session_state[_KEY_LIVE_PHASE]       = "planning"
+    st.session_state[_KEY_LIVE_PLAN]        = None
+    st.session_state[_KEY_LIVE_ENTITIES]    = {}
+    st.session_state[_KEY_LIVE_STEPS]       = []
+    st.session_state[_KEY_LIVE_CURRENT]     = None
+    st.session_state[_KEY_LIVE_TRACE_ID]    = None
+    st.session_state[_KEY_LIVE_STEP_NUM]    = 0
+    st.session_state[_KEY_LIVE_STEP_TOTAL]  = 0
+    st.session_state[_KEY_LIVE_STEP_LABEL]  = ""
     # Clear previous result/trace so placeholders show correctly
-    st.session_state[_KEY_RESULT]        = None
-    st.session_state[_KEY_TRACE_ID]      = None
+    st.session_state[_KEY_RESULT]           = None
+    st.session_state[_KEY_TRACE_ID]         = None
     # Clear status banner and step counter so no stale indicators remain
-    st.session_state[_KEY_STATUS]        = _DEFAULTS[_KEY_STATUS].copy()
-    st.session_state[_KEY_STEPS_REVEALED] = 0
+    st.session_state[_KEY_STATUS]           = _DEFAULTS[_KEY_STATUS].copy()
+    st.session_state[_KEY_STEPS_REVEALED]   = 0
 
 
-def drain_run_queue() -> bool:
+# Business-friendly step labels used in the progress banner.
+# Intentionally kept in state.py so layout.py can read them without
+# importing from components.py (which would create a circular dependency).
+_STEP_LABELS: dict[str, str] = {
+    "entity_lookup":                "Identifying company",
+    "company_profile":              "Retrieving company profile",
+    "expand_ownership":             "Mapping ownership structure",
+    "shared_address_check":         "Checking address",
+    "sic_context":                  "Analysing industry context",
+    "ownership_complexity_check":   "Assessing ownership complexity",
+    "control_signal_check":         "Analysing control signals",
+    "address_risk_check":           "Assessing address risk",
+    "industry_context_check":       "Assessing industry context",
+    "summarize_risk_for_company":   "Calculating overall risk",
+    "retrieve_trace":               "Retrieving decision trace",
+    "find_traces_by_entity":        "Finding company traces",
+    "summarize_trace":              "Summarising investigation",
+    "retrieve_and_summarize_trace": "Reviewing past investigation",
+    "retrieve_latest_for_entity":   "Finding latest investigation",
+}
+
+
+def drain_run_queue() -> tuple[int, bool]:
     """Drain the progress queue and update live state.
 
     Called on the main Streamlit thread at the start of each render pass.
     The background orchestrator thread writes only to the queue; this
     function applies those events to session_state (main-thread safe).
 
-    Returns True when the run is fully complete (phase set to "done").
+    Returns (events_drained, is_done) where:
+      events_drained — number of events consumed from the queue (0 = nothing new)
+      is_done        — True when the run is fully complete (phase set to "done")
     """
     q: "_queue.Queue | None" = st.session_state.get("run_queue")
     if q is None:
-        return False
+        return 0, False
 
     done = False
+    count = 0
     try:
         while True:
             event = q.get_nowait()
+            count += 1
             etype = event.get("event")
             data  = event.get("data", {})
 
             if etype == "plan_ready":
-                st.session_state[_KEY_LIVE_PLAN]  = data
-                st.session_state[_KEY_LIVE_PHASE] = "resolving"
+                st.session_state[_KEY_LIVE_PLAN]        = data
+                st.session_state[_KEY_LIVE_PHASE]       = "resolving"
+                plan_steps = data.get("plan") or []
+                st.session_state[_KEY_LIVE_STEP_TOTAL]  = len(plan_steps)
 
             elif etype == "trace_created":
                 st.session_state[_KEY_LIVE_TRACE_ID] = data.get("trace_id")
@@ -333,6 +401,21 @@ def drain_run_queue() -> bool:
             elif etype == "step_starting":
                 st.session_state[_KEY_LIVE_CURRENT] = data
                 st.session_state[_KEY_LIVE_PHASE]   = "executing"
+                task  = data.get("task", "")
+                label = _STEP_LABELS.get(task, task.replace("_", " ").title())
+                # Determine 1-based step number from plan order
+                plan_steps = (st.session_state.get(_KEY_LIVE_PLAN) or {}).get("plan") or []
+                num = next(
+                    (i + 1 for i, s in enumerate(plan_steps) if s.get("task") == task),
+                    len(st.session_state.get(_KEY_LIVE_STEPS) or []) + 1,
+                )
+                total = max(
+                    len(plan_steps),
+                    st.session_state.get(_KEY_LIVE_STEP_TOTAL, 0),
+                )
+                st.session_state[_KEY_LIVE_STEP_NUM]   = num
+                st.session_state[_KEY_LIVE_STEP_TOTAL] = total
+                st.session_state[_KEY_LIVE_STEP_LABEL] = label
 
             elif etype == "step_complete":
                 steps = list(st.session_state.get(_KEY_LIVE_STEPS) or [])
@@ -357,4 +440,4 @@ def drain_run_queue() -> bool:
     except _queue.Empty:
         pass
 
-    return done
+    return count, done

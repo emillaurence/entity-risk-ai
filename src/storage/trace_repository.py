@@ -58,6 +58,7 @@ class TraceRepository:
                 t.mode        = $mode,
                 t.user_id     = $user_id,
                 t.query       = $query,
+                t.question    = $question,
                 t.started_at  = $started_at,
                 t.ended_at    = null,
                 t.final_summary = null
@@ -67,6 +68,7 @@ class TraceRepository:
                 "mode":       trace.mode,
                 "user_id":    trace.user_id,
                 "query":      trace.entity_name,
+                "question":   trace.question,
                 "started_at": trace.created_at.isoformat(),
             },
         )
@@ -169,6 +171,7 @@ class TraceRepository:
             RETURN
                 t.trace_id       AS trace_id,
                 t.query          AS query,
+                t.question       AS question,
                 t.user_id        AS user_id,
                 t.mode           AS mode,
                 t.started_at     AS started_at,

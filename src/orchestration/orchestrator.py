@@ -299,6 +299,7 @@ class Orchestrator:
         trace = InvestigationTrace(
             request_id=_run_id,
             entity_name=entity_name,
+            question=query,
             user_id=user_id,
             mode=plan.mode,
         )
