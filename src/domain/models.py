@@ -25,7 +25,7 @@ from typing import Any
 class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
-    DONE = "done"
+    SUCCESS = "success"
     FAILED = "failed"
     SKIPPED = "skipped"
 
@@ -206,6 +206,8 @@ class AgentResult:
                      (e.g. {"ownership": [...], "address_risk": [...]}).
         trace:       Full event trace for auditing and explanation.
         error:       Top-level error message if success is False.
+        tools_used:  Ordered list of MCP tool names called during this task.
+                     Empty when the agent failed before calling any tool.
     """
 
     request_id: str
@@ -215,3 +217,4 @@ class AgentResult:
     findings: dict[str, Any] = field(default_factory=dict)
     trace: InvestigationTrace | None = None
     error: str | None = None
+    tools_used: list[str] = field(default_factory=list)

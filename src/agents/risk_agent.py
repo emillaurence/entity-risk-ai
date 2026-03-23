@@ -242,6 +242,7 @@ class RiskAgent(BaseAgent):
                     f"Supported tasks: {', '.join(sorted(_SUPPORTED_TASKS))}."
                 ),
                 trace=trace,
+                tools_used=[],
             )
 
         if not company_name:
@@ -251,6 +252,7 @@ class RiskAgent(BaseAgent):
                 success=False,
                 error="context must include a non-empty 'company_name'.",
                 trace=trace,
+                tools_used=[],
             )
 
         if task in _DIRECT_TOOL_TASKS:
@@ -296,6 +298,7 @@ class RiskAgent(BaseAgent):
                 findings={task: None},
                 trace=trace,
                 error=result.error,
+                tools_used=[result.tool_name],
             )
 
         return AgentResult(
@@ -305,6 +308,7 @@ class RiskAgent(BaseAgent):
             summary=result.summary,
             findings={task: result.data},
             trace=trace,
+            tools_used=[result.tool_name],
         )
 
     # ------------------------------------------------------------------
@@ -328,9 +332,11 @@ class RiskAgent(BaseAgent):
         findings: dict[str, Any] = {}
         tool_summaries: list[str] = []
         failed_tasks: list[str] = []
+        tools_called: list[str] = []
 
         for task in sorted(_DIRECT_TOOL_TASKS):  # stable alphabetical order
             result = self._call_tool(task, company_name, context)
+            tools_called.append(result.tool_name)
             input_summary = ", ".join(f"{k}={v}" for k, v in result.input.items())
             self.log_tool_event(
                 trace,
@@ -424,6 +430,7 @@ class RiskAgent(BaseAgent):
             summary=final_summary,
             findings=findings,
             trace=trace,
+            tools_used=tools_called,
         )
 
     # ------------------------------------------------------------------

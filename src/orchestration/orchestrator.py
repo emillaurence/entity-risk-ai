@@ -90,7 +90,20 @@ _RISK_SIGNAL_MAP: dict[str, str] = {
 
 @dataclass
 class StepRecord:
-    """Result record for one plan step."""
+    """Result record for one plan step.
+
+    Attributes:
+        step_id:        Stable identifier within the plan (e.g. "step_1").
+        agent:          Agent that ran the step (e.g. "graph-agent").
+        task:           Task name dispatched to the agent.
+        success:        True when the agent completed without error.
+        summary:        Short natural-language summary of what the step produced.
+        findings:       Structured output keyed by task name.
+        tools_executed: Ordered list of MCP tool names the agent called.
+        error:          Error message when success is False and skipped is False.
+        skipped:        True when the step was not executed (entity gate or halt).
+        skip_reason:    Why the step was skipped, when skipped is True.
+    """
 
     step_id: str
     agent: str
@@ -98,21 +111,40 @@ class StepRecord:
     success: bool
     summary: str = ""
     findings: dict[str, Any] = field(default_factory=dict)
+    tools_executed: list[str] = field(default_factory=list)
     error: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
 
+    @property
+    def status(self) -> str:
+        """Lifecycle status string for UI consumption.
+
+        Derived from ``skipped`` and ``success`` so construction sites
+        need not change.  "pending" and "running" are not emitted at
+        runtime yet but are reserved for future async/streaming support.
+
+        Returns one of: "success" | "failed" | "skipped".
+        """
+        if self.skipped:
+            return "skipped"
+        if self.success:
+            return "success"
+        return "failed"
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "step_id":     self.step_id,
-            "agent":       self.agent,
-            "task":        self.task,
-            "success":     self.success,
-            "summary":     self.summary,
-            "findings":    self.findings,
-            "error":       self.error,
-            "skipped":     self.skipped,
-            "skip_reason": self.skip_reason,
+            "step_id":        self.step_id,
+            "agent":          self.agent,
+            "task":           self.task,
+            "status":         self.status,
+            "success":        self.success,
+            "summary":        self.summary,
+            "findings":       self.findings,
+            "tools_executed": self.tools_executed,
+            "error":          self.error,
+            "skipped":        self.skipped,
+            "skip_reason":    self.skip_reason,
         }
 
 
@@ -385,6 +417,7 @@ class Orchestrator:
                 success=result.success,
                 summary=result.summary,
                 findings=result.findings,
+                tools_executed=result.tools_used,
                 error=result.error,
             ))
 

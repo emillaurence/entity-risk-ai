@@ -106,6 +106,7 @@ class GraphAgent(BaseAgent):
                     f"Supported tasks: {', '.join(sorted(_SUPPORTED_TASKS))}."
                 ),
                 trace=trace,
+                tools_used=[],
             )
 
         if not company_name:
@@ -115,6 +116,7 @@ class GraphAgent(BaseAgent):
                 success=False,
                 error="context must include a non-empty 'company_name'.",
                 trace=trace,
+                tools_used=[],
             )
 
         # ---- dispatch ------------------------------------------------
@@ -142,6 +144,7 @@ class GraphAgent(BaseAgent):
                 findings={task: None},
                 trace=trace,
                 error=result.error,
+                tools_used=[result.tool_name],
             )
 
         # ---- optional AI enrichment ----------------------------------
@@ -172,6 +175,7 @@ class GraphAgent(BaseAgent):
             summary=summary,
             findings={task: result.data},
             trace=trace,
+            tools_used=[result.tool_name],
         )
 
     # ------------------------------------------------------------------

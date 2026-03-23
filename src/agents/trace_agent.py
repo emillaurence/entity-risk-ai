@@ -117,6 +117,7 @@ class TraceAgent(BaseAgent):
                     f"Supported tasks: {', '.join(sorted(_SUPPORTED_TASKS))}."
                 ),
                 trace=trace,
+                tools_used=[],
             )
 
         if task == "retrieve_trace":
@@ -167,6 +168,7 @@ class TraceAgent(BaseAgent):
                 findings={"retrieve_trace": None},
                 trace=trace,
                 error=result.error,
+                tools_used=["retrieve_trace"],
             )
 
         entity_name = result.data.get("query", "") if result.data else ""
@@ -178,6 +180,7 @@ class TraceAgent(BaseAgent):
             summary=result.summary,
             findings={"retrieve_trace": result.data},
             trace=trace,
+            tools_used=["retrieve_trace"],
         )
 
     # ------------------------------------------------------------------
@@ -214,6 +217,7 @@ class TraceAgent(BaseAgent):
                 findings={"find_traces_by_entity": None},
                 trace=trace,
                 error=result.error,
+                tools_used=["find_traces_by_entity"],
             )
 
         return AgentResult(
@@ -223,6 +227,7 @@ class TraceAgent(BaseAgent):
             summary=result.summary,
             findings={"find_traces_by_entity": result.data},
             trace=trace,
+            tools_used=["find_traces_by_entity"],
         )
 
     # ------------------------------------------------------------------
@@ -299,6 +304,7 @@ class TraceAgent(BaseAgent):
                 }
             },
             trace=trace,
+            tools_used=[],  # summarize_trace uses AI only — no MCP tool calls
         )
 
     # ------------------------------------------------------------------
@@ -347,6 +353,7 @@ class TraceAgent(BaseAgent):
                 findings={"retrieve_and_summarize_trace": None},
                 trace=trace,
                 error=retrieve_result.error,
+                tools_used=["retrieve_trace"],
             )
 
         trace_data = retrieve_result.data
@@ -372,6 +379,7 @@ class TraceAgent(BaseAgent):
                 }
             },
             trace=trace,
+            tools_used=["retrieve_trace"],  # summarize step uses AI only
         )
 
     # ------------------------------------------------------------------
@@ -413,6 +421,7 @@ class TraceAgent(BaseAgent):
                 findings={"retrieve_latest_for_entity": None},
                 trace=trace,
                 error=find_result.error,
+                tools_used=["find_traces_by_entity"],
             )
 
         traces = find_result.data if isinstance(find_result.data, list) else []
@@ -429,6 +438,7 @@ class TraceAgent(BaseAgent):
                 findings={"retrieve_latest_for_entity": None},
                 trace=trace,
                 error=f"No traces found for entity '{entity_name}'.",
+                tools_used=["find_traces_by_entity"],
             )
 
         # Take the first row — list is sorted newest-first by the repository.
@@ -456,6 +466,8 @@ class TraceAgent(BaseAgent):
             },
             trace=trace,
             error=summarize_result.error,
+            # find_traces_by_entity + retrieve_trace (inside _retrieve_and_summarize)
+            tools_used=["find_traces_by_entity", "retrieve_trace"],
         )
 
     # ------------------------------------------------------------------
