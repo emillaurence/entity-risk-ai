@@ -33,6 +33,7 @@ Known agents and tasks
     retrieve_trace               load a full trace by its ID
     find_traces_by_entity        find traces linked to an entity name
     retrieve_and_summarize_trace retrieve a trace and produce an AI audit narrative
+    retrieve_latest_for_entity   find + retrieve + summarise the most recent trace for an entity
 """
 
 from __future__ import annotations
@@ -83,6 +84,7 @@ VALID_TASKS: frozenset[str] = frozenset({
     "retrieve_trace",
     "find_traces_by_entity",
     "retrieve_and_summarize_trace",
+    "retrieve_latest_for_entity",
 })
 
 # Tasks belonging to each agent, for validation
@@ -98,6 +100,7 @@ _AGENT_TASKS: dict[str, frozenset[str]] = {
     }),
     "trace-agent": frozenset({
         "retrieve_trace", "find_traces_by_entity", "retrieve_and_summarize_trace",
+        "retrieve_latest_for_entity",
     }),
 }
 
@@ -228,6 +231,9 @@ AVAILABLE AGENTS AND TASKS — use only these exact values:
                                  parameters: {"entity_name": str}
     retrieve_and_summarize_trace retrieve a trace and produce an AI audit narrative
                                  parameters: {"trace_id": str}
+    retrieve_latest_for_entity   find + retrieve + summarise the most recent
+                                 investigation for an entity (no trace ID needed)
+                                 parameters: {"entity_name": str}
 
 PLANNING RULES:
 1. Company queries: always start with graph-agent entity_lookup (step_1) to
@@ -245,7 +251,9 @@ PLANNING RULES:
    - Query contains a trace ID AND asks to replay, summarise, or explain: use
      retrieve_and_summarize_trace (retrieves + narrates in one step).
    - Query contains a trace ID but only asks to load or retrieve: use retrieve_trace.
-   - Query names an entity but has no trace ID: use find_traces_by_entity.
+   - Query names an entity AND asks for the latest/most recent/last investigation
+     (no trace ID supplied): use retrieve_latest_for_entity.
+   - Query names an entity but has no trace ID and only asks to list/find: use find_traces_by_entity.
 9. stop_conditions: include only when the query implies a termination
    criterion (e.g. "stop if no UBOs are found"). Otherwise return [].
 10. parameters: fill in the extracted entity name for company_name / name /

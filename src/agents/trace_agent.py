@@ -47,6 +47,7 @@ _SUPPORTED_TASKS = frozenset({
     "find_traces_by_entity",
     "summarize_trace",
     "retrieve_and_summarize_trace",
+    "retrieve_latest_for_entity",
 })
 
 _SYSTEM_PROMPT = (
@@ -101,6 +102,8 @@ class TraceAgent(BaseAgent):
                                                          ``model: str`` (optional)
                      - ``retrieve_and_summarize_trace``→ ``trace_id: str``
                                                          ``model: str`` (optional)
+                     - ``retrieve_latest_for_entity``  → ``entity_name: str``
+                                                         ``model: str`` (optional)
             trace:   The agent's own *operational* trace. Must differ from any
                      target trace being retrieved (enforced for retrieve tasks).
         """
@@ -122,8 +125,10 @@ class TraceAgent(BaseAgent):
             return self._find_by_entity(context, trace)
         if task == "summarize_trace":
             return self._summarize(context, trace)
-        # retrieve_and_summarize_trace
-        return self._retrieve_and_summarize(context, trace)
+        if task == "retrieve_and_summarize_trace":
+            return self._retrieve_and_summarize(context, trace)
+        # retrieve_latest_for_entity
+        return self._retrieve_latest_for_entity(context, trace)
 
     # ------------------------------------------------------------------
     # Private — retrieve_trace
@@ -367,6 +372,90 @@ class TraceAgent(BaseAgent):
                 }
             },
             trace=trace,
+        )
+
+    # ------------------------------------------------------------------
+    # Private — retrieve_latest_for_entity
+    # ------------------------------------------------------------------
+
+    def _retrieve_latest_for_entity(
+        self, context: dict[str, Any], trace: InvestigationTrace
+    ) -> AgentResult:
+        entity_name = context.get("entity_name", "").strip()
+        if not entity_name:
+            return self._input_error(
+                trace, "context must include a non-empty 'entity_name'."
+            )
+
+        # Step 1 — find traces for entity.
+        find_result = self._mcp.call_tool(
+            "find_traces_by_entity", {"entity_name": entity_name}
+        )
+        self.log_tool_event(
+            trace,
+            tool_name=find_result.tool_name,
+            input_summary=f"entity_name={entity_name}",
+            output_summary=find_result.summary,
+            decision=(
+                "trace list found — retrieving most recent"
+                if find_result.success
+                else "entity lookup failed"
+            ),
+            entity_refs=[{"label": "Company", "name": entity_name}],
+        )
+
+        if not find_result.success:
+            return AgentResult(
+                request_id=trace.request_id,
+                entity_name=entity_name,
+                success=False,
+                summary=find_result.summary,
+                findings={"retrieve_latest_for_entity": None},
+                trace=trace,
+                error=find_result.error,
+            )
+
+        traces = find_result.data if isinstance(find_result.data, list) else []
+        # Exclude the current operational trace — it was persisted before this
+        # step ran and may appear first in the results if the query entity name
+        # matches the trace's own query field.
+        traces = [t for t in traces if t.get("trace_id") != trace.request_id]
+        if not traces:
+            return AgentResult(
+                request_id=trace.request_id,
+                entity_name=entity_name,
+                success=False,
+                summary=f"No prior investigations found for '{entity_name}'.",
+                findings={"retrieve_latest_for_entity": None},
+                trace=trace,
+                error=f"No traces found for entity '{entity_name}'.",
+            )
+
+        # Take the first row — list is sorted newest-first by the repository.
+        latest_trace_id = traces[0].get("trace_id", "")
+        if not latest_trace_id:
+            return self._input_error(trace, "Most recent trace row has no trace_id.")
+
+        # Step 2 — retrieve and summarise the most recent trace.
+        summarize_result = self._retrieve_and_summarize(
+            {"trace_id": latest_trace_id, "model": context.get("model")}, trace
+        )
+
+        return AgentResult(
+            request_id=trace.request_id,
+            entity_name=entity_name,
+            success=summarize_result.success,
+            summary=summarize_result.summary,
+            findings={
+                "retrieve_latest_for_entity": {
+                    "entity_name": entity_name,
+                    "traces_found": len(traces),
+                    "latest_trace_id": latest_trace_id,
+                    **(summarize_result.findings.get("retrieve_and_summarize_trace") or {}),
+                }
+            },
+            trace=trace,
+            error=summarize_result.error,
         )
 
     # ------------------------------------------------------------------

@@ -461,6 +461,9 @@ class Orchestrator:
                 outer = sr.findings.get("retrieve_and_summarize_trace") or {}
                 data = outer.get("trace_data") or {}
                 retrieved_trace_id = data.get("trace_id", "")
+            elif sr.task == "retrieve_latest_for_entity":
+                outer = sr.findings.get("retrieve_latest_for_entity") or {}
+                retrieved_trace_id = outer.get("latest_trace_id", "")
             if retrieved_trace_id:
                 break
 
