@@ -165,6 +165,7 @@ class TraceAgent(BaseAgent):
             )
 
         entity_name = result.data.get("query", "") if result.data else ""
+        self._trace_service.link_retrieved_trace(trace.request_id, trace_id)
         return AgentResult(
             request_id=trace.request_id,
             entity_name=entity_name,
@@ -345,6 +346,7 @@ class TraceAgent(BaseAgent):
 
         trace_data = retrieve_result.data
         entity_name = trace_data.get("query", "") if trace_data else ""
+        self._trace_service.link_retrieved_trace(trace.request_id, trace_id)
 
         # Step 2 — summarise (reuse _summarize logic via context).
         summarize_ctx = {

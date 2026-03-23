@@ -78,6 +78,14 @@ class TraceService:
             ended_at=trace.ended_at.isoformat(),
         )
 
+    def link_retrieved_trace(self, source_trace_id: str, target_trace_id: str) -> None:
+        """
+        Create a :RETRIEVED edge from the operational trace to the retrieved trace.
+        Delegates to TraceRepository. No-op if either ID is empty.
+        """
+        if source_trace_id and target_trace_id:
+            self._repo.link_retrieved_trace(source_trace_id, target_trace_id)
+
     # ------------------------------------------------------------------
     # Event recording
     # ------------------------------------------------------------------

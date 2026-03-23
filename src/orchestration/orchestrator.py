@@ -145,6 +145,7 @@ class OrchestratorResult:
     final_answer: str
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    retrieved_trace_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,8 +157,9 @@ class OrchestratorResult:
             "resolved_entities":  self.resolved_entities,
             "step_results":       [sr.to_dict() for sr in self.step_results],
             "final_answer":       self.final_answer,
-            "warnings":           self.warnings,
-            "errors":             self.errors,
+            "warnings":             self.warnings,
+            "errors":               self.errors,
+            "retrieved_trace_id":   self.retrieved_trace_id,
         }
 
 
@@ -447,6 +449,21 @@ class Orchestrator:
 
         overall_success = any(sr.success for sr in step_results)
 
+        # Extract the target trace_id if a retrieve step succeeded.
+        retrieved_trace_id = ""
+        for sr in step_results:
+            if not sr.success:
+                continue
+            if sr.task == "retrieve_trace":
+                data = sr.findings.get("retrieve_trace") or {}
+                retrieved_trace_id = data.get("trace_id", "")
+            elif sr.task == "retrieve_and_summarize_trace":
+                outer = sr.findings.get("retrieve_and_summarize_trace") or {}
+                data = outer.get("trace_data") or {}
+                retrieved_trace_id = data.get("trace_id", "")
+            if retrieved_trace_id:
+                break
+
         return OrchestratorResult(
             mode=plan.mode,
             query=query,
@@ -458,6 +475,7 @@ class Orchestrator:
             final_answer=final_answer,
             warnings=warnings,
             errors=errors,
+            retrieved_trace_id=retrieved_trace_id,
         )
 
     # ------------------------------------------------------------------

@@ -247,10 +247,37 @@ class TraceRepository:
                 t.user_id    AS user_id,
                 t.started_at AS started_at,
                 t.ended_at   AS ended_at
-            ORDER BY t.started_at DESC
+            UNION
+            MATCH (t:InvestigationTrace {query: $entity_name})
+            RETURN
+                t.trace_id   AS trace_id,
+                t.query      AS query,
+                t.user_id    AS user_id,
+                t.started_at AS started_at,
+                t.ended_at   AS ended_at
+            ORDER BY started_at DESC
             LIMIT $limit
             """,
             {"entity_name": entity_name, "limit": limit},
+        )
+
+    # ------------------------------------------------------------------
+    # Delete operations
+    # ------------------------------------------------------------------
+
+    def link_retrieved_trace(self, source_trace_id: str, target_trace_id: str) -> None:
+        """
+        Create a :RETRIEVED relationship from the source (operational) trace
+        to the target (retrieved) trace.  Safe to call multiple times — uses MERGE.
+        Silently does nothing if either trace node does not exist.
+        """
+        self._repo.run_query(
+            """
+            MATCH (s:InvestigationTrace {trace_id: $source_id})
+            MATCH (t:InvestigationTrace {trace_id: $target_id})
+            MERGE (s)-[:RETRIEVED]->(t)
+            """,
+            {"source_id": source_trace_id, "target_id": target_trace_id},
         )
 
     # ------------------------------------------------------------------

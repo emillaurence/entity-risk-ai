@@ -30,8 +30,9 @@ Known agents and tasks
     summarize_risk_for_company   full 4-signal risk synthesis
 
   trace-agent:
-    retrieve_trace         load a full trace by its ID
-    find_traces_by_entity  find traces linked to an entity name
+    retrieve_trace               load a full trace by its ID
+    find_traces_by_entity        find traces linked to an entity name
+    retrieve_and_summarize_trace retrieve a trace and produce an AI audit narrative
 """
 
 from __future__ import annotations
@@ -81,6 +82,7 @@ VALID_TASKS: frozenset[str] = frozenset({
     # trace-agent
     "retrieve_trace",
     "find_traces_by_entity",
+    "retrieve_and_summarize_trace",
 })
 
 # Tasks belonging to each agent, for validation
@@ -95,7 +97,7 @@ _AGENT_TASKS: dict[str, frozenset[str]] = {
         "summarize_risk_for_company",
     }),
     "trace-agent": frozenset({
-        "retrieve_trace", "find_traces_by_entity",
+        "retrieve_trace", "find_traces_by_entity", "retrieve_and_summarize_trace",
     }),
 }
 
@@ -220,10 +222,12 @@ AVAILABLE AGENTS AND TASKS — use only these exact values:
                                  parameters: {"company_name": str}
 
   trace-agent
-    retrieve_trace         load a full investigation trace by its ID
-                           parameters: {"trace_id": str}
-    find_traces_by_entity  find prior investigation traces by entity name
-                           parameters: {"entity_name": str}
+    retrieve_trace               load a full investigation trace by its ID
+                                 parameters: {"trace_id": str}
+    find_traces_by_entity        find prior investigation traces by entity name
+                                 parameters: {"entity_name": str}
+    retrieve_and_summarize_trace retrieve a trace and produce an AI audit narrative
+                                 parameters: {"trace_id": str}
 
 PLANNING RULES:
 1. Company queries: always start with graph-agent entity_lookup (step_1) to
@@ -238,7 +242,9 @@ PLANNING RULES:
 6. Address queries: add graph-agent shared_address_check after entity_lookup.
 7. SIC / industry queries: add graph-agent sic_context after entity_lookup.
 8. Trace queries: use trace-agent only; skip entity_lookup entirely.
-   - Query contains a trace ID (UUID or numeric string): use retrieve_trace.
+   - Query contains a trace ID AND asks to replay, summarise, or explain: use
+     retrieve_and_summarize_trace (retrieves + narrates in one step).
+   - Query contains a trace ID but only asks to load or retrieve: use retrieve_trace.
    - Query names an entity but has no trace ID: use find_traces_by_entity.
 9. stop_conditions: include only when the query implies a termination
    criterion (e.g. "stop if no UBOs are found"). Otherwise return [].
