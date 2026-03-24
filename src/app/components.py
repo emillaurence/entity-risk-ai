@@ -1684,6 +1684,208 @@ def _extract_graph_insights(result: Any) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Context Graph — streamlit-agraph data builder
+# ---------------------------------------------------------------------------
+
+# Node colour dicts (background / border / highlight) by entity type.
+# Using dicts lets vis-network apply richer selection highlighting.
+_GRAPH_COLOR_FOCAL: dict = {
+    "background": "#1D4ED8", "border": "#1E3A8A",
+    "highlight":  {"background": "#3B82F6", "border": "#1E3A8A"},
+}
+_GRAPH_COLOR_COMPANY: dict = {
+    "background": "#DBEAFE", "border": "#93C5FD",
+    "highlight":  {"background": "#BFDBFE", "border": "#60A5FA"},
+}
+_GRAPH_COLOR_PERSON: dict = {
+    "background": "#D1FAE5", "border": "#34D399",
+    "highlight":  {"background": "#A7F3D0", "border": "#10B981"},
+}
+_GRAPH_COLOR_ADDRESS: dict = {
+    "background": "#FEF3C7", "border": "#FCD34D",
+    "highlight":  {"background": "#FDE68A", "border": "#F59E0B"},
+}
+
+# Legend colours (flat hex, for the HTML legend below the graph)
+_LEGEND_FOCAL   = "#1D4ED8"
+_LEGEND_COMPANY = "#93C5FD"
+_LEGEND_PERSON  = "#34D399"
+_LEGEND_ADDRESS = "#FCD34D"
+
+_GRAPH_MAX_PATH_DEPTH = 3   # max ownership hops rendered
+_GRAPH_MAX_NODES      = 12  # cap non-focal nodes for readability
+
+
+def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
+    """Build Node and Edge lists plus per-node metadata from an investigation result.
+
+    Data sources (in priority order):
+      1. expand_ownership  — ownership paths + UBOs
+      2. company_profile   — direct_owners (fallback), address node
+      3. resolved_entities — focal node always present
+
+    Returns (nodes, edges, node_meta) where node_meta maps each node id to
+    {"full_name", "type", "context"} for the selection panel.
+    """
+    from streamlit_agraph import Edge, Node  # local import — optional dependency
+
+    nodes: list[Node] = []
+    edges: list[Edge] = []
+    seen:  set[str]   = set()
+    node_meta: dict[str, dict] = {}
+
+    def add_node(
+        nid: str, label: str, color: dict, size: int,
+        full_name: str, node_type: str, context: str = "",
+        border_width: int = 1,
+    ) -> None:
+        if nid not in seen:
+            seen.add(nid)
+            # title = hover tooltip (full, untruncated name)
+            nodes.append(Node(
+                id=nid, label=label, color=color, size=size,
+                title=full_name, borderWidth=border_width,
+            ))
+            node_meta[nid] = {"full_name": full_name, "type": node_type, "context": context}
+
+    def add_edge(src: str, dst: str, label: str = "", color: str = "#9CA3AF") -> None:
+        edges.append(Edge(
+            source=src, target=dst, label=label, color=color,
+            width=2,
+            font={"size": 10, "align": "middle",
+                  "strokeWidth": 2, "strokeColor": "#FFFFFF"},
+        ))
+
+    def _short(name: str, n: int = 22) -> str:
+        return name if len(name) <= n else name[: n - 1] + "\u2026"
+
+    def _pct_label(lo: Any, hi: Any) -> str:
+        if lo is None:
+            return ""
+        lo_i = int(lo)
+        hi_i = int(hi) if hi is not None else lo_i
+        return f"{lo_i}%" if lo_i == hi_i else f"{lo_i}\u2013{hi_i}%"
+
+    # ── Focal entity ──────────────────────────────────────────────────────
+    focal_id = ""
+    focal_number = ""
+    for _, edata in (result.resolved_entities or {}).items():
+        if edata:
+            focal_id     = edata.get("canonical_name", "")
+            focal_number = edata.get("company_number", "")
+            break
+    if not focal_id:
+        focal_id = result.query or "Entity"
+
+    focal_ctx = f"Company No. {focal_number}" if focal_number else "Investigated entity"
+    add_node(focal_id, _short(focal_id, 24), _GRAPH_COLOR_FOCAL, size=34,
+             full_name=focal_id, node_type="Focal Company",
+             context=focal_ctx, border_width=3)
+
+    non_focal: int = 0
+    ownership_found = False
+
+    # ── Ownership paths from expand_ownership ─────────────────────────────
+    for sr in (result.step_results or []):
+        if sr.task != "expand_ownership" or not sr.success:
+            continue
+        eo    = (sr.findings or {}).get("expand_ownership") or {}
+        paths = eo.get("paths") or []
+        ubos  = eo.get("ultimate_owners") or []
+
+        for row in paths:
+            if non_focal >= _GRAPH_MAX_NODES:
+                break
+            if (row.get("path_depth") or 0) > _GRAPH_MAX_PATH_DEPTH:
+                continue
+            from_name = (row.get("from_name") or "").strip()
+            to_name   = (row.get("to_name") or "").strip()
+            if not from_name or not to_name:
+                continue
+            from_labels = row.get("from_labels") or []
+            is_person   = "Person" in from_labels
+            color       = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
+            node_type   = "Individual" if is_person else "Company"
+            pct         = _pct_label(row.get("ownership_pct_min"), row.get("ownership_pct_max"))
+            if from_name not in seen:
+                non_focal += 1
+            add_node(from_name, _short(from_name), color,
+                     size=22 if is_person else 18,
+                     full_name=from_name, node_type=node_type,
+                     context=f"Ownership: {pct}" if pct else "Owner")
+            add_edge(from_name, to_name, label=pct, color="#9CA3AF")
+            ownership_found = True
+
+        # UBOs not already captured via path rows
+        for ubo in ubos:
+            if non_focal >= _GRAPH_MAX_NODES:
+                break
+            name = (ubo.get("owner_name") or "").strip()
+            if not name:
+                continue
+            pct = _pct_label(ubo.get("ownership_pct_min"), ubo.get("ownership_pct_max"))
+            if name not in seen:
+                non_focal += 1
+            add_node(name, _short(name), _GRAPH_COLOR_PERSON, size=26,
+                     full_name=name, node_type="Individual / Beneficial Owner",
+                     context=f"Ownership: {pct}" if pct else "Beneficial owner")
+            if not any(e.source == name and e.target == focal_id for e in edges):
+                add_edge(name, focal_id, color="#34D399")
+            ownership_found = True
+        break  # only process the first expand_ownership step
+
+    # ── Fallback: direct owners from company_profile ──────────────────────
+    if not ownership_found:
+        for sr in (result.step_results or []):
+            if sr.task != "company_profile" or not sr.success:
+                continue
+            cp = (sr.findings or {}).get("company_profile") or {}
+            for owner in (cp.get("direct_owners") or []):
+                if non_focal >= _GRAPH_MAX_NODES:
+                    break
+                name = (owner.get("owner_name") or "").strip()
+                if not name:
+                    continue
+                labels    = owner.get("owner_labels") or []
+                is_person = "Person" in labels
+                color     = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
+                node_type = "Individual" if is_person else "Company"
+                pct       = _pct_label(owner.get("ownership_pct_min"), owner.get("ownership_pct_max"))
+                if name not in seen:
+                    non_focal += 1
+                add_node(name, _short(name), color, size=20,
+                         full_name=name, node_type=node_type,
+                         context=f"Ownership: {pct}" if pct else "Direct owner")
+                add_edge(name, focal_id, label=pct, color="#9CA3AF")
+            break
+
+    # ── Address node from company_profile ─────────────────────────────────
+    for sr in (result.step_results or []):
+        if sr.task != "company_profile" or not sr.success:
+            continue
+        cp      = (sr.findings or {}).get("company_profile") or {}
+        address = cp.get("address") or {}
+        if address and non_focal < _GRAPH_MAX_NODES:
+            postal     = (address.get("postal_code") or "").strip()
+            town       = (address.get("post_town") or "").strip()
+            addr_label = postal or town or "Address"
+            full_addr  = ", ".join(filter(None, [
+                address.get("address_line_1", ""),
+                town,
+                postal,
+            ]))
+            addr_id = f"__addr__{focal_id}"
+            if addr_id not in seen:
+                non_focal += 1
+            add_node(addr_id, addr_label, _GRAPH_COLOR_ADDRESS, size=14,
+                     full_name=full_addr or addr_label,
+                     node_type="Registered Address",
+                     context=full_addr or addr_label)
+            add_edge(focal_id, addr_id, label="at", color="#F59E0B")
+        break
+
+    return nodes, edges, node_meta
 
 
 # ===========================================================================
@@ -2487,21 +2689,9 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
 
 
 def _render_graph_column() -> None:
-    """Col 2 of the Investigate tab: live step checklist + entity panels when done."""
+    """Col 2 of the Investigate tab: hierarchical interactive ownership graph when
+    done; live step checklist during execution."""
     _section_header("🕸️ Context Graph", "Entity ownership and relationship map")
-
-    legend_items = [
-        ("🔵", "Company"),
-        ("🟢", "Beneficial Owner"),
-        ("🟡", "Address"),
-        ("🔗", "Ownership Link"),
-    ]
-    legend_html = "".join(
-        f'<span style="margin-right:12px;font-size:0.78em;color:#6B7280">'
-        f'{icon} {_esc(label)}</span>'
-        for icon, label in legend_items
-    )
-    st.markdown(f'<div style="margin-bottom:12px">{legend_html}</div>', unsafe_allow_html=True)
 
     live_phase    = state.get_live_phase()
     live_entities = state.get_live_entities()
@@ -2537,28 +2727,94 @@ def _render_graph_column() -> None:
         _render_live_step_checklist()
         return
 
-    # Done: show entity detail panels + graph insights
+    # Done: render interactive hierarchical graph
     if result is not None and result.resolved_entities:
-        _label_row("Entity Details")
-        for name, data in result.resolved_entities.items():
-            if data is None:
-                continue
+        # Clear node selection when a new investigation result arrives
+        trace_key = getattr(result, "trace_id", None) or id(result)
+        if st.session_state.get("_graph_result_trace") != trace_key:
+            st.session_state["_graph_result_trace"] = trace_key
+            st.session_state.pop("_graph_selected_node", None)
+
+        node_meta: dict = {}
+        try:
+            from streamlit_agraph import Config, agraph
+
+            nodes, edges, node_meta = _build_agraph_data(result)
+            if nodes:
+                config = Config(
+                    height=560,
+                    directed=True,
+                    physics=False,
+                    hierarchical=True,
+                    **{
+                        "layout": {
+                            "hierarchical": {
+                                "enabled":             True,
+                                "direction":           "LR",
+                                "sortMethod":          "directed",
+                                "levelSeparation":     220,
+                                "nodeSpacing":         130,
+                                "treeSpacing":         150,
+                                "blockShifting":       True,
+                                "edgeMinimization":    True,
+                                "parentCentralization": False,
+                            }
+                        },
+                        "interaction": {
+                            "hover":                True,
+                            "tooltipDelay":         100,
+                            "selectConnectedEdges": True,
+                        },
+                        "edges": {
+                            "smooth":  {"enabled": False},
+                            "arrows":  {"to": {"enabled": True, "scaleFactor": 0.7}},
+                            "font":    {"size": 10, "align": "middle",
+                                        "strokeWidth": 2, "strokeColor": "#F8FAFC"},
+                        },
+                        "nodes": {
+                            "font": {"size": 13},
+                        },
+                    },
+                )
+                raw_selection = agraph(nodes=nodes, edges=edges, config=config)
+                # Persist the last non-None selection across reruns
+                if raw_selection is not None:
+                    st.session_state["_graph_selected_node"] = raw_selection
+            else:
+                st.caption("No graph data available for this entity.")
+        except Exception:
+            st.caption("Graph could not be rendered.")
+
+        # Compact colour legend (matches actual node fill colours)
+        legend_html = (
+            f'<span style="margin-right:12px;font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{_LEGEND_FOCAL}">■</span> Focal entity</span>'
+            f'<span style="margin-right:12px;font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{_LEGEND_COMPANY}">■</span> Company</span>'
+            f'<span style="margin-right:12px;font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{_LEGEND_PERSON}">■</span> Individual / UBO</span>'
+            f'<span style="font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{_LEGEND_ADDRESS}">■</span> Address</span>'
+        )
+        st.markdown(f'<div style="margin:4px 0 10px">{legend_html}</div>',
+                    unsafe_allow_html=True)
+
+        # Selected node detail panel (shown only after a node is clicked)
+        selected_id = st.session_state.get("_graph_selected_node")
+        if selected_id and selected_id in node_meta:
+            meta = node_meta[selected_id]
+            _label_row("Selected Node")
             with st.container(border=True):
-                canonical  = data.get("canonical_name", name)
-                company_no = data.get("company_number", "")
-                exact      = data.get("exact_match", True)
                 st.markdown(
-                    f'<div style="font-weight:600;color:#111827;font-size:0.92em;'
-                    f'margin-bottom:4px">🔵 {_esc(canonical)}</div>',
+                    f'<div style="font-weight:600;font-size:0.9em;color:#111827;'
+                    f'margin-bottom:2px">{_esc(meta["full_name"])}</div>',
                     unsafe_allow_html=True,
                 )
-                meta = []
-                if company_no:
-                    meta.append(f"No. {company_no}")
-                meta.append("exact match" if exact else "closest match")
-                st.caption("  ·  ".join(meta))
+                st.caption(meta["type"])
+                if meta.get("context"):
+                    st.caption(meta["context"])
 
-        # Graph Insights — derived from ownership analysis, aligned with risk drivers
+        # Graph Insights — derived from ownership analysis
         insights = _extract_graph_insights(result)
         _label_row("Graph Insights")
         gi_rows = (
