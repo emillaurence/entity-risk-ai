@@ -240,23 +240,36 @@ PLANNING RULES:
    resolve the canonical company name before running any other step.
 2. Ownership queries: add graph-agent expand_ownership after entity_lookup.
    Default max_depth to 5 unless the query specifies otherwise.
-3. Risk queries: add risk-agent summarize_risk_for_company. This single task
-   covers all four risk dimensions — do NOT list them individually as well.
-4. Combined ownership + risk: include both expand_ownership AND
+3. Generic risk queries (no specific dimension named — e.g. "is it risky?",
+   "risk assessment", "any red flags?"): add risk-agent
+   summarize_risk_for_company. This covers all four dimensions in one step —
+   do NOT add individual risk checks as well.
+4. Specific risk dimension queries: when the query names one or more
+   dimensions explicitly, add only the matching individual tasks (NOT
+   summarize_risk_for_company):
+     "address" / "co-location"           → address_risk_check
+     "control" / "controllers"            → control_signal_check
+     "ownership complexity" / "structure" → ownership_complexity_check
+     "industry" / "SIC" / "sector"        → industry_context_check
+   Add one step per named dimension. If all four are named, use
+   summarize_risk_for_company instead.
+5. Combined ownership + generic risk: include both expand_ownership AND
    summarize_risk_for_company as separate steps.
-5. Profile queries: add graph-agent company_profile after entity_lookup.
-6. Address queries: add graph-agent shared_address_check after entity_lookup.
-7. SIC / industry queries: add graph-agent sic_context after entity_lookup.
-8. Trace queries: use trace-agent only; skip entity_lookup entirely.
+6. Profile queries: add graph-agent company_profile after entity_lookup.
+7. Address queries (factual — "where is it registered?"): add graph-agent
+   shared_address_check after entity_lookup.
+8. SIC / industry queries (factual — "what industry is it in?"): add
+   graph-agent sic_context after entity_lookup.
+9. Trace queries: use trace-agent only; skip entity_lookup entirely.
    - Query contains a trace ID AND asks to replay, summarise, or explain: use
      retrieve_and_summarize_trace (retrieves + narrates in one step).
    - Query contains a trace ID but only asks to load or retrieve: use retrieve_trace.
    - Query names an entity AND asks for the latest/most recent/last investigation
      (no trace ID supplied): use retrieve_latest_for_entity.
    - Query names an entity but has no trace ID and only asks to list/find: use find_traces_by_entity.
-9. stop_conditions: include only when the query implies a termination
-   criterion (e.g. "stop if no UBOs are found"). Otherwise return [].
-10. parameters: fill in the extracted entity name for company_name / name /
+10. stop_conditions: include only when the query implies a termination
+    criterion (e.g. "stop if no UBOs are found"). Otherwise return [].
+11. parameters: fill in the extracted entity name for company_name / name /
     entity_name fields. Fill in the extracted ID for trace_id.
 
 EXAMPLES:
@@ -266,6 +279,9 @@ Query: "who owns ACME Holdings?"
 
 Query: "who owns ACME Holdings and is it risky?"
 {"mode":"investigate","reason":"Combined ownership and risk query. Walking the ownership chain, then synthesising all four risk signals.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":5}},{"step_id":"step_3","agent":"risk-agent","task":"summarize_risk_for_company","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}
+
+Query: "who owns ACME Holdings and is it risky address and control?"
+{"mode":"investigate","reason":"Combined ownership query with specific risk dimensions: address and control only.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":5}},{"step_id":"step_3","agent":"risk-agent","task":"address_risk_check","parameters":{"company_name":"ACME Holdings"}},{"step_id":"step_4","agent":"risk-agent","task":"control_signal_check","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}
 
 Query: "replay investigation trace abc-123-def"
 {"mode":"trace","reason":"User wants to retrieve a specific prior investigation by trace ID.","entities":[{"name":"abc-123-def","type":"Trace"}],"plan":[{"step_id":"step_1","agent":"trace-agent","task":"retrieve_trace","parameters":{"trace_id":"abc-123-def"}}],"stop_conditions":[]}

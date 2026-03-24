@@ -39,6 +39,7 @@ Replay / Audit tab
 from __future__ import annotations
 
 import html as _html
+import json as _json
 import re as _re
 from datetime import datetime as _datetime
 from types import SimpleNamespace as _NS
@@ -219,11 +220,18 @@ _TOOL_RETURNED_LABELS: dict[str, str] = {
     "summarize_risk_for_company":    "Risk signals evaluated",
 }
 
-# Recommendations keyed by risk level — shown under the headline in assessment cards
+# Canonical recommendation strings — never vary
 _RISK_RECOMMENDATIONS: dict[str, str] = {
-    "HIGH":   "Recommendation: Enhanced due diligence required.",
-    "MEDIUM": "Recommendation: Additional review advised.",
-    "LOW":    "Recommendation: Standard monitoring applies.",
+    "HIGH":   "Enhanced due diligence required before onboarding",
+    "MEDIUM": "Additional review recommended before proceeding",
+    "LOW":    "Standard monitoring applies",
+}
+
+_RISK_ACTION_REQUIRED: dict[str, str] = {
+    "HIGH":    "Enhanced due diligence required before onboarding",
+    "MEDIUM":  "Additional review recommended before proceeding",
+    "LOW":     "Standard monitoring applies",
+    "UNKNOWN": "—",
 }
 
 # Fallback plan description per investigation mode
@@ -254,7 +262,7 @@ _RISK_HEADLINE: dict[str, tuple[str, str]] = {
     "HIGH":    ("High Risk Identified",           "⚠️"),
     "MEDIUM":  ("Moderate Risk Identified",       "⚡"),
     "LOW":     ("Low Risk — Standard Profile",    "✅"),
-    "UNKNOWN": ("Risk Assessment Incomplete",     "❓"),
+    "UNKNOWN": ("Assessment in Progress",          "·"),
 }
 
 # Tasks that produce a risk_level in their findings
@@ -384,16 +392,26 @@ def _agent_display(agent: str) -> str:
 
 
 def _first_sentences(text: str, n: int = 1) -> str:
-    """Return the first n sentences from text."""
+    """Return the first n sentences from text.
+
+    A sentence boundary is a '.', '!', or '?' that is either followed by
+    whitespace or is the last character — this avoids cutting on dots inside
+    company-name suffixes like 'VODAFONE 2.' mid-paragraph.
+    """
     if not text:
         return ""
     s = text.strip()
     count = 0
     for i, ch in enumerate(s):
         if ch in ".!?":
-            count += 1
-            if count >= n:
-                return s[: i + 1].strip()
+            # Require boundary: end-of-string OR followed by whitespace
+            if i == len(s) - 1 or s[i + 1].isspace():
+                # Skip "2." pattern — digit-terminated company names are not sentence ends
+                if ch == "." and i > 0 and s[i - 1].isdigit():
+                    continue
+                count += 1
+                if count >= n:
+                    return s[: i + 1].strip()
     return s
 
 
@@ -429,6 +447,37 @@ def _get_summarize_findings(result: Any) -> dict | None:
         if sr.task == "summarize_risk_for_company" and sr.success and sr.findings:
             return sr.findings
     return None
+
+
+def _collect_risk_dims(result: Any) -> dict[str, str]:
+    """
+    Return {dim_key: risk_level} for all four risk dimensions.
+
+    Prefers summarize_risk_for_company (covers all four in one step).
+    Falls back to collecting from whichever individual risk tasks ran.
+    Dimensions not assessed are marked "NOT RUN"; dimensions assessed
+    but with no graph data are marked "UNKNOWN".
+    """
+    _TASK_TO_DIM = {task: dim for task, dim, _ in _RISK_DIM_TASKS}
+
+    # Prefer the summary step (all four dimensions present)
+    summarize_findings = _get_summarize_findings(result)
+    if summarize_findings:
+        return {
+            dim: (summarize_findings.get(task) or {}).get("risk_level", "UNKNOWN")
+            if isinstance(summarize_findings.get(task), dict) else "UNKNOWN"
+            for task, dim, _ in _RISK_DIM_TASKS
+        }
+
+    # Fall back: collect from whichever individual risk tasks ran
+    dims = {dim: "NOT RUN" for _, dim, _ in _RISK_DIM_TASKS}
+    for sr in result.step_results or []:
+        dim = _TASK_TO_DIM.get(sr.task)
+        if dim and sr.success and sr.findings:
+            data = sr.findings.get(sr.task)
+            if isinstance(data, dict):
+                dims[dim] = data.get("risk_level", "UNKNOWN")
+    return dims
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +538,7 @@ def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
         "address_risk_check":         "address",
         "industry_context_check":     "industry",
     }
-    dims = {v: "UNKNOWN" for v in _DIM_TASKS.values()}
+    dims = {v: "NOT RUN" for v in _DIM_TASKS.values()}
 
     for ev in (replay_data.get("events") or []):
         if ev.get("event_type") != "tool_returned":
@@ -498,8 +547,25 @@ def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
         if tool_name not in _DIM_TASKS:
             continue
         dim = _DIM_TASKS[tool_name]
-        if dims[dim] != "UNKNOWN":
+        if dims[dim] not in ("NOT RUN", "UNKNOWN"):
             continue
+        # Prefer structured data_json (traces after backend update)
+        raw_json = ev.get("data_json") or ""
+        if raw_json:
+            try:
+                import json as _json_mod
+                data = _json_mod.loads(raw_json)
+                lvl = (data.get("risk_level") or "").upper()
+                if lvl in ("HIGH", "MEDIUM", "LOW"):
+                    dims[dim] = lvl
+                    continue
+                # Tool ran but had no data
+                dims[dim] = "UNKNOWN"
+                continue
+            except Exception:
+                pass
+        # Fall back: parse output_summary text (old traces without data_json)
+        dims[dim] = "UNKNOWN"  # tool ran, mark as at least assessed
         out = (ev.get("output_summary") or "").upper()
         for lvl in ("HIGH", "MEDIUM", "LOW"):
             if (
@@ -515,6 +581,218 @@ def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
                 break
 
     return dims
+
+
+def _extract_replay_graph_insights(events: list) -> dict:
+    """Extract graph insight values from replay events.
+
+    Scans the ownership_complexity_check tool_returned event output_summary
+    to derive the same three metrics shown in the Investigate tab's
+    Context Graph column.
+
+    Returns dict with keys: ownership_depth, beneficial_owner, structure_complexity.
+    Values are display strings or "—" when not determinable.
+    """
+    out = {"ownership_depth": "—", "beneficial_owner": "—", "structure_complexity": "—"}
+    for ev in events:
+        if ev.get("event_type") != "tool_returned":
+            continue
+        if ev.get("tool_name") != "ownership_complexity_check":
+            continue
+        # Try structured data first (available in traces after backend update)
+        raw_json = ev.get("data_json", "")
+        if raw_json:
+            try:
+                data = _json.loads(raw_json)
+                depth = data.get("max_chain_depth")
+                if depth is not None:
+                    out["ownership_depth"] = f"{depth} hop{'s' if depth != 1 else ''}"
+                has_ubos = data.get("has_individual_ubos")
+                if has_ubos is not None:
+                    out["beneficial_owner"] = "Yes" if has_ubos else "No"
+                risk_lvl = data.get("risk_level", "")
+                _cmap = {"HIGH": "High", "MEDIUM": "Medium", "LOW": "Low"}
+                if risk_lvl in _cmap:
+                    out["structure_complexity"] = _cmap[risk_lvl]
+                break
+            except Exception:
+                pass
+
+        # Fall back to parsing output_summary text (for traces before backend update)
+        text = ev.get("output_summary") or ""
+        m = _re.search(r"max depth\s+(\d+)", text, _re.IGNORECASE)
+        if m:
+            out["ownership_depth"] = f"{m.group(1)} hops"
+        tl = text.lower()
+        # "K individual UBO(s)" — use count directly (matches actual tool output format)
+        m2 = _re.search(r"(\d+)\s+individual\s+ubo", tl)
+        if m2:
+            out["beneficial_owner"] = "Yes" if int(m2.group(1)) > 0 else "No"
+        elif "corporate entities" in tl or "corporate-only" in tl or "corporate only" in tl:
+            out["beneficial_owner"] = "No"
+        tu = text.upper()
+        for lvl, label in (("HIGH", "High"), ("MEDIUM", "Medium"), ("LOW", "Low")):
+            if f" {lvl}" in tu or f":{lvl}" in tu:
+                out["structure_complexity"] = label
+                break
+        break  # only need the first matching event
+    return out
+
+
+def _extract_replay_company_number(events: list) -> str:
+    """Extract company number from the entity_lookup tool_returned event.
+
+    Returns the number string (e.g. "04083193") or "" if not found.
+    """
+    for ev in events:
+        if ev.get("event_type") != "tool_returned":
+            continue
+        if ev.get("tool_name") != "entity_lookup":
+            continue
+        text = ev.get("output_summary") or ""
+        m = _re.search(r"No\.\s*([A-Z0-9]+)", text, _re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return ""
+
+
+# Maps individual tool names to the logical plan-step (task, agent) pair
+_TOOL_TO_PLAN_STEP: dict[str, tuple[str, str]] = {
+    "entity_lookup":               ("entity_lookup",              "graph-agent"),
+    "expand_ownership":            ("expand_ownership",           "graph-agent"),
+    "ownership_complexity_check":  ("summarize_risk_for_company", "risk-agent"),
+    "control_signal_check":        ("summarize_risk_for_company", "risk-agent"),
+    "address_risk_check":          ("summarize_risk_for_company", "risk-agent"),
+    "industry_context_check":      ("summarize_risk_for_company", "risk-agent"),
+}
+
+
+def _replay_plan_steps(events: list) -> list[dict]:
+    """Derive ordered, deduplicated plan steps from replay tool_returned events.
+
+    Maps individual tool calls back to the three logical plan steps so the
+    Replay tab can show the same step structure as the Investigate tab.
+    Returns list of {task, agent, success} dicts.
+    """
+    seen: list[tuple] = []
+    for ev in events:
+        if ev.get("event_type") != "tool_returned":
+            continue
+        key = _TOOL_TO_PLAN_STEP.get(ev.get("tool_name", ""))
+        if key and key not in seen:
+            seen.append(key)
+    return [{"task": k[0], "agent": k[1], "success": True} for k in seen]
+
+
+_REPLAY_RISK_TOOLS: frozenset = frozenset({
+    "ownership_complexity_check", "control_signal_check",
+    "address_risk_check", "industry_context_check",
+})
+_REPLAY_TOOL_DIM: dict[str, str] = {
+    "ownership_complexity_check": "ownership",
+    "control_signal_check":       "control",
+    "address_risk_check":         "address",
+    "industry_context_check":     "industry",
+}
+
+
+def _render_replay_step_cards(events: list) -> None:
+    """Render replay audit trail as 3 grouped step cards matching the Investigate tab.
+
+    Groups all tool_returned events into the same 3 logical plan steps used by
+    _replay_plan_steps (entity_lookup, expand_ownership, summarize_risk_for_company).
+    The "Assess risk signals" card shows a risk driver grid for the 4 sub-checks.
+    """
+    groups: dict[tuple, list] = {}
+    order: list[tuple] = []
+    for ev in events:
+        if ev.get("event_type") != "tool_returned":
+            continue
+        key = _TOOL_TO_PLAN_STEP.get(ev.get("tool_name", ""))
+        if not key:
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(ev)
+
+    if not order:
+        st.caption("No steps were recorded for this investigation.")
+        return
+
+    for i, key in enumerate(order, 1):
+        task_key, agent_key = key
+        task_disp  = _task_label(task_key)
+        agent_disp = _agent_display(agent_key)
+        evs = groups[key]
+
+        summary = next(
+            (e.get("output_summary", "").strip() for e in evs
+             if e.get("output_summary", "").strip()),
+            "",
+        )
+
+        _accent_bar("success")
+        with st.container(border=True):
+            st.markdown(
+                _step_header_html(i, task_disp, agent_disp, "success"),
+                unsafe_allow_html=True,
+            )
+            if summary:
+                st.markdown(
+                    f'<div style="color:#374151;font-size:0.87em;line-height:1.55;'
+                    f'padding:4px 0">{_esc(_first_sentences(summary, 1))}</div>',
+                    unsafe_allow_html=True,
+                )
+            # Tools used pills — same as _render_step_card
+            tool_names = [e.get("tool_name", "") for e in evs if e.get("tool_name")]
+            tools_html = _tool_pills(tool_names)
+            if tools_html:
+                st.markdown(tools_html, unsafe_allow_html=True)
+            # Risk breakdown grid for the "Assess risk signals" grouped step
+            risk_evs = [e for e in evs if e.get("tool_name") in _REPLAY_RISK_TOOLS]
+            if risk_evs:
+                dims: dict[str, str] = {}
+                for e in risk_evs:
+                    dim = _REPLAY_TOOL_DIM.get(e.get("tool_name", ""))
+                    if not dim:
+                        continue
+                    out_text = (e.get("output_summary") or "").upper()
+                    for lvl in ("HIGH", "MEDIUM", "LOW"):
+                        if f" {lvl}" in out_text or f":{lvl}" in out_text:
+                            dims[dim] = lvl
+                            break
+                if dims:
+                    _label_row("Risk Breakdown")
+                    _render_risk_drivers_grid(dims)
+            # "View step details" expander — mirrors _render_step_card
+            with st.expander("View step details", expanded=False):
+                reasoning = _TASK_REASONING.get(task_key, "")
+                if reasoning:
+                    st.markdown(
+                        f'<div style="font-size:0.83em;color:#374151;line-height:1.55;'
+                        f'margin-bottom:8px">{_esc(reasoning)}</div>',
+                        unsafe_allow_html=True,
+                    )
+                if summary:
+                    _label_row("Full Summary")
+                    st.markdown(
+                        f'<div style="font-size:0.83em;color:#374151;line-height:1.55">'
+                        f'{_esc(summary)}</div>',
+                        unsafe_allow_html=True,
+                    )
+                # Findings from structured data_json (available in new traces)
+                for e in evs:
+                    raw = e.get("data_json") or ""
+                    if raw:
+                        try:
+                            findings = _json.loads(raw)
+                            if findings:
+                                _label_row("Findings")
+                                st.json(findings)
+                                break
+                        except Exception:
+                            pass
 
 
 # ---------------------------------------------------------------------------
@@ -543,14 +821,13 @@ def _render_assessment_card(
         f'margin:2px 0 10px 0">{_esc(recommendation)}</div>'
         if recommendation else ""
     )
-    short_summary = _first_sentences(summary, 2)
     summary_section = (
         f'<div style="font-size:0.66em;font-weight:700;color:{tc};opacity:0.7;'
         f'text-transform:uppercase;letter-spacing:0.06em;margin:12px 0 4px 0">'
         f'Summary</div>'
         f'<div style="color:#374151;font-size:0.87em;line-height:1.65">'
-        f'{_esc(short_summary)}</div>'
-        if short_summary else ""
+        f'{_esc(summary)}</div>'
+        if summary else ""
     )
     st.markdown(
         f'<div style="background:{bg};border:1px solid {border};'
@@ -836,9 +1113,10 @@ def _render_replay_plan(replay_data: dict) -> None:
     mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "—")
     short_query  = query[:38] + "…" if len(query) > 38 else query
 
+    _section_header("📋 Investigation Plan")
     with st.container(border=True):
-        col_type, col_entity = st.columns([1, 2])
-        col_type.metric("Type", mode_display)
+        col_mode, col_entity = st.columns([1, 2])
+        col_mode.metric("Mode", mode_display)
         col_entity.metric("Entity", short_query)
 
         if started_at:
@@ -851,15 +1129,35 @@ def _render_replay_plan(replay_data: dict) -> None:
         focus_text = plan_reason or _MODE_PLAN_FALLBACK.get(mode, "")
         if focus_text:
             st.markdown(
-                f'<div style="font-size:0.66em;font-weight:700;color:#9CA3AF;'
-                f'text-transform:uppercase;letter-spacing:0.06em;margin:10px 0 4px 0">'
-                f'Investigation focus</div>'
-                f'<div style="font-size:0.84em;'
-                f'border-left:3px solid #BFDBFE;padding:5px 0 5px 10px;'
-                f'margin:0 0 8px 0;line-height:1.55;color:#1E3A8A">'
+                f'<div style="font-size:0.83em;color:#374151;'
+                f'border-left:3px solid #E5E7EB;padding:4px 0 4px 10px;'
+                f'margin:10px 0 8px 0;line-height:1.55">'
                 f'{_esc(focus_text)}</div>',
                 unsafe_allow_html=True,
             )
+
+        plan_steps = _replay_plan_steps(events)
+        if plan_steps:
+            _label_row("Steps")
+            for i, s in enumerate(plan_steps, 1):
+                task_disp  = _task_label(s["task"])
+                agent_disp = _agent_display(s["agent"])
+                st.markdown(
+                    f'<div style="display:flex;align-items:center;'
+                    f'justify-content:space-between;padding:7px 2px;'
+                    f'border-bottom:1px solid #F3F4F6">'
+                    f'  <div style="display:flex;align-items:center;gap:8px">'
+                    f'    <span style="font-size:0.68em;font-weight:700;color:#9CA3AF;'
+                    f'      background:#F3F4F6;border-radius:3px;padding:1px 6px">#{i}</span>'
+                    f'    <span style="font-size:0.87em;color:#1F2937;font-weight:500">'
+                    f'      {_esc(task_disp)}</span>'
+                    f'  </div>'
+                    f'  <span style="font-size:0.74em;background:#F3F4F6;color:#374151;'
+                    f'    border-radius:10px;padding:2px 9px;white-space:nowrap">'
+                    f'    {_esc(agent_disp)}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_replay_event_timeline(events: list) -> None:
@@ -1123,17 +1421,18 @@ def _render_live_step_checklist() -> None:
             color = "#16A34A"
             weight = "500"
         elif task == current_task:
-            icon  = "🔄"
-            color = "#D97706"
+            icon  = "›"
+            color = "#2563EB"
             weight = "600"
         else:
-            icon  = "⏳"
+            icon  = "·"
             color = "#9CA3AF"
             weight = "400"
         rows_html += (
             f'<div style="display:flex;align-items:center;gap:8px;'
-            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-            f'<span style="font-size:0.85em;width:18px;text-align:center">{icon}</span>'
+            f'padding:6px 0;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.92em;width:16px;text-align:center;'
+            f'color:{color};font-weight:700">{icon}</span>'
             f'<span style="font-size:0.83em;color:{color};font-weight:{weight}">'
             f'{_esc(label)}</span>'
             f'</div>'
@@ -1141,7 +1440,7 @@ def _render_live_step_checklist() -> None:
 
     if rows_html:
         st.markdown(
-            f'<div style="background:#FAFAFA;border:1px solid #E5E7EB;'
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
             f'border-radius:8px;padding:10px 14px;margin:4px 0">'
             f'{rows_html}'
             f'</div>',
@@ -1149,47 +1448,269 @@ def _render_live_step_checklist() -> None:
         )
 
 
+def _render_assessment_card_skeleton(
+    message: str = "Preparing assessment…",
+    show_pending_rows: bool = True,
+) -> None:
+    """Locked 4-field assessment card with pending placeholders.
+
+    Shown during planning / resolving / executing so the card shape never
+    disappears or shifts — only the values change once the run completes.
+    When show_pending_rows=False (idle state), only the summary message is shown.
+    """
+    _PENDING = '<span style="color:#CBD5E1;font-size:0.84em">Pending…</span>'
+    pending_rows_html = (
+        # Row 1 — Assessment Level
+        f'<div style="display:flex;align-items:center;gap:10px;margin:0 0 8px 0">'
+        f'<span style="font-size:0.66em;font-weight:700;color:#94A3B8;'
+        f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px">'
+        f'Assessment Level</span>{_PENDING}</div>'
+        # Row 2 — Recommendation
+        f'<div style="display:flex;align-items:baseline;gap:10px;margin:4px 0">'
+        f'<span style="font-size:0.66em;font-weight:700;color:#94A3B8;'
+        f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px;'
+        f'white-space:nowrap">Recommendation</span>{_PENDING}</div>'
+    ) if show_pending_rows else ""
+    st.markdown(
+        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+        f'border-left:5px solid #CBD5E1;border-radius:8px;'
+        f'padding:16px 20px;margin:4px 0 12px 0">'
+        f'{pending_rows_html}'
+        # Summary row
+        f'<div style="font-size:0.66em;font-weight:700;color:#94A3B8;'
+        f'text-transform:uppercase;letter-spacing:0.06em;margin:10px 0 4px 0">'
+        f'Summary</div>'
+        f'<div style="color:#94A3B8;font-size:0.87em;line-height:1.65">'
+        f'{_esc(message)}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _extract_graph_insights(result: Any) -> dict:
+    """Extract ownership graph metrics from ownership_complexity_check findings.
+
+    Returns dict with keys: ownership_depth, beneficial_owner, structure_complexity.
+    Values are display strings ("3 hops", "Yes", "High") or "—" when unavailable.
+    """
+    out = {"ownership_depth": "—", "beneficial_owner": "—", "structure_complexity": "—"}
+    for sr in (result.step_results or []):
+        if not sr.success:
+            continue
+        findings_sr = sr.findings or {}
+        if sr.task == "ownership_complexity_check":
+            data = findings_sr.get("ownership_complexity_check") or {}
+        elif sr.task == "summarize_risk_for_company":
+            data = findings_sr.get("ownership_complexity_check") or {}
+        else:
+            continue
+        if not isinstance(data, dict) or not data:
+            continue
+        depth = data.get("max_chain_depth")
+        if depth is not None:
+            out["ownership_depth"] = f"{depth} hop{'s' if depth != 1 else ''}"
+        has_ubos = data.get("has_individual_ubos")
+        if has_ubos is not None:
+            out["beneficial_owner"] = "Yes" if has_ubos else "No"
+        risk_lvl = data.get("risk_level", "")
+        _cmap = {"HIGH": "High", "MEDIUM": "Medium", "LOW": "Low"}
+        if risk_lvl in _cmap:
+            out["structure_complexity"] = _cmap[risk_lvl]
+        break
+    # Fallback: derive graph insights from expand_ownership when complexity check didn't run
+    if out["ownership_depth"] == "—":
+        for sr in (result.step_results or []):
+            if sr.task != "expand_ownership" or not sr.success:
+                continue
+            data = (sr.findings or {}).get("expand_ownership") or {}
+            paths = data.get("paths") or []
+            ubos  = data.get("ultimate_owners") or []
+            if not paths and not ubos:
+                break
+            max_d    = max((r.get("path_depth", 0) for r in paths), default=0)
+            unique_n = len({r.get("from_name") for r in paths if r.get("from_name")})
+            has_ubos_flag = len(ubos) > 0
+            corporate = len(paths) > 0 and not has_ubos_flag
+            out["ownership_depth"]  = f"{max_d} hop{'s' if max_d != 1 else ''}"
+            out["beneficial_owner"] = "Yes" if has_ubos_flag else "No"
+            score = 0
+            if max_d >= 4:      score += 2
+            elif max_d >= 2:    score += 1
+            if unique_n >= 5:   score += 2
+            elif unique_n >= 2: score += 1
+            if corporate:       score += 2
+            out["structure_complexity"] = "High" if score >= 4 else ("Medium" if score >= 2 else "Low")
+            break
+    return out
+
+
+# Activity phase buckets used in the left-column live status list
+_ACTIVITY_PHASES: list[tuple[frozenset, str]] = [
+    (frozenset({"entity_lookup", "company_profile"}),
+     "Confirming company identity"),
+    (frozenset({"expand_ownership", "sic_context", "shared_address_check"}),
+     "Mapping ownership structure"),
+    (frozenset({"ownership_complexity_check", "control_signal_check",
+                "address_risk_check", "industry_context_check"}),
+     "Assessing risk signals"),
+    (frozenset({"summarize_risk_for_company"}),
+     "Synthesising risk outcome"),
+]
+
+
+def _render_activity_list() -> None:
+    """Compact activity list shown in the left column during execution.
+
+    Shows 4 high-level phases with ✔ / › / · markers — no warning colours.
+    """
+    live_steps  = state.get_live_steps()
+    live_cur    = state.get_live_current_step()
+    live_phase  = state.get_live_phase()
+
+    completed = {s.get("task") for s in live_steps}
+    current   = (live_cur or {}).get("task") if live_cur else None
+
+    rows_html = ""
+    for task_set, label in _ACTIVITY_PHASES:
+        is_done   = bool(completed & task_set)
+        is_active = bool(current and current in task_set) or (
+            live_phase == "resolving" and not is_done
+            and task_set == _ACTIVITY_PHASES[0][0]
+        )
+        if is_done:
+            icon, color, weight = "✔", "#16A34A", "500"
+        elif is_active:
+            icon, color, weight = "›", "#2563EB", "600"
+        else:
+            icon, color, weight = "·", "#9CA3AF", "400"
+        rows_html += (
+            f'<div style="display:flex;align-items:center;gap:10px;'
+            f'padding:6px 2px;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.92em;width:14px;color:{color};font-weight:700">'
+            f'{icon}</span>'
+            f'<span style="font-size:0.85em;color:{color};font-weight:{weight}">'
+            f'{_esc(label)}</span>'
+            f'</div>'
+        )
+    st.markdown(
+        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+        f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+        f'{rows_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+
+def _render_assessment_summary_card(
+    risk_level: "str | None",
+    summary: str,
+) -> None:
+    """Render the assessment summary card.
+
+    Shows: Assessment Level, Recommendation, Summary.
+    """
+    key = risk_level.upper() if risk_level else "UNKNOWN"
+    tc, bg, border = _RISK_COLORS.get(key, _RISK_COLORS["UNKNOWN"])
+    headline_text, headline_emoji = _RISK_HEADLINE.get(key, ("Assessment Complete", "✅"))
+    recommendation = _RISK_ACTION_REQUIRED.get(key, "—") or "—"
+    short          = summary.strip() or "—"
+
+    # Use neutral styling for UNKNOWN so it never looks like an error
+    if key == "UNKNOWN":
+        tc, bg, border = "#64748B", "#F8FAFC", "#E2E8F0"
+
+    def _row(label: str, value_html: str) -> str:
+        return (
+            f'<div style="display:flex;align-items:baseline;gap:10px;margin:5px 0">'
+            f'<span style="font-size:0.66em;font-weight:700;color:{tc};opacity:0.75;'
+            f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px;'
+            f'white-space:nowrap">{label}</span>'
+            f'{value_html}'
+            f'</div>'
+        )
+
+    _dash_span  = '<span style="color:#94A3B8;font-size:0.84em">—</span>'
+    level_html = (
+        f'<div style="display:flex;align-items:center;gap:10px;margin:8px 0 6px 0">'
+        f'<span style="font-size:0.66em;font-weight:700;color:{tc};opacity:0.75;'
+        f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px">'
+        f'Assessment Level</span>'
+        f'{_risk_badge(key) if risk_level else _dash_span}'
+        f'</div>'
+    )
+    rec_html    = _row("Recommendation",
+                       f'<span style="font-size:0.84em;color:{tc};font-weight:500;'
+                       f'line-height:1.4">{_esc(recommendation)}</span>')
+    summary_html = (
+        f'<div style="font-size:0.66em;font-weight:700;color:{tc};opacity:0.75;'
+        f'text-transform:uppercase;letter-spacing:0.06em;margin:10px 0 4px 0">'
+        f'Summary</div>'
+        f'<div style="color:#374151;font-size:0.87em;line-height:1.65">'
+        f'{_esc(short)}</div>'
+    )
+
+    st.markdown(
+        f'<div style="background:{bg};border:1px solid {border};'
+        f'border-left:5px solid {tc};border-radius:8px;'
+        f'padding:16px 20px;margin:4px 0 12px 0">'
+        f'<div style="font-size:1.05em;font-weight:800;color:{tc};'
+        f'line-height:1.2;margin-bottom:2px">'
+        f'{headline_emoji} &nbsp;{_esc(headline_text)}</div>'
+        f'{level_html}{rec_html}{summary_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 # ===========================================================================
 # INVESTIGATE TAB
 # ===========================================================================
 
 
-def _render_progress_section() -> None:
-    """Compact progress bar shown at the top of the Investigate tab during a run.
+# Three-phase labels shown in the progress bar, mapping task groups → user-facing step
+_PROGRESS_PHASE1 = frozenset({"entity_lookup", "company_profile"})
+_PROGRESS_PHASE2 = frozenset({"expand_ownership", "sic_context", "shared_address_check"})
+_PROGRESS_PHASE3 = frozenset({
+    "ownership_complexity_check", "control_signal_check",
+    "address_risk_check", "industry_context_check", "summarize_risk_for_company",
+})
 
-    Hidden when idle or done.  Reads live_phase and step counters directly
-    so it reflects the latest state on each full-page rerun.
+
+def _render_progress_section() -> None:
+    """Thin progress bar at the top of the Investigate tab during a run.
+
+    Maps the investigation lifecycle to 3 user-friendly phases:
+        Step 1/3 — Identifying entity
+        Step 2/3 — Mapping ownership
+        Step 3/3 — Assessing risk
+    Hidden when idle or done.
     """
     phase = state.get_live_phase()
     if phase not in ("planning", "resolving", "executing"):
         return
 
-    num   = state.get_live_step_num()
-    total = state.get_live_step_total()
-    label = state.get_live_step_label()
+    live_cur     = state.get_live_current_step()
+    current_task = (live_cur or {}).get("task", "") if live_cur else ""
 
-    if phase == "planning":
-        pct  = 0.03
-        text = "Planning investigation…"
-    elif phase == "resolving":
-        pct  = 0.06
-        text = "Identifying company…"
-    else:  # executing
-        if num and total:
-            pct  = num / total
-            text = f"Step {num} of {total} — {label}"
-        elif label:
-            pct  = 0.10
-            text = label
-        else:
-            pct  = 0.10
-            text = "Running investigation…"
+    if phase in ("planning", "resolving") or current_task in _PROGRESS_PHASE1:
+        pct  = 0.12
+        text = "Step 1/3 — Identifying entity"
+    elif current_task in _PROGRESS_PHASE2:
+        pct  = 0.45
+        text = "Step 2/3 — Mapping ownership"
+    elif current_task in _PROGRESS_PHASE3:
+        pct  = 0.78
+        text = "Step 3/3 — Assessing risk"
+    else:
+        # Fallback: use raw step counters if task doesn't map to a known phase
+        num   = state.get_live_step_num()
+        total = state.get_live_step_total()
+        pct   = (num / total) if num and total else 0.12
+        text  = f"Step {num}/{total}" if num and total else "Running…"
 
     st.progress(pct, text=text)
-    st.markdown(
-        '<div style="margin-bottom:6px"></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div style="margin-bottom:4px"></div>', unsafe_allow_html=True)
 
 
 def render_investigate_tab(components: "AppComponents") -> None:
@@ -1236,8 +1757,15 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
         key="_input_question",
     )
     st.caption("Enter a company name or a free-text compliance question.")
-    submitted = st.button("Run Investigation", type="primary", use_container_width=True)
-    if submitted and question.strip():
+    _running  = state.get_live_phase() in ("planning", "resolving", "executing")
+    _btn_label = "Running…" if _running else "Run Investigation"
+    submitted = st.button(
+        _btn_label,
+        type="primary",
+        use_container_width=True,
+        disabled=_running,
+    )
+    if submitted and question.strip() and not _running:
         state.set_question(question.strip())
         state.reset_all_run_state()
         st.session_state["_trigger_run"] = True
@@ -1253,120 +1781,49 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
 
 
 def _render_live_risk_assessment(live_dims: dict) -> None:
-    """Risk Assessment for the Investigate tab — staged progressive rendering.
+    """Assessment Summary for the Investigate tab — staged progressive rendering.
 
-    Stages
-    ------
-    1. planning / resolving  → spinner placeholder
-    2. executing, no signals → "Calculating risk profile…" + partial grid if any dims known
-    3. executing, dims known → partial risk driver grid with live values
-    4. done / result ready   → full assessment card + full grid + entity chips
+    The card schema (Assessment Level / Recommendation / Primary Driver / Summary)
+    is ALWAYS rendered in all states so the layout never shifts:
+
+    1. idle             → skeleton card (placeholders)
+    2. planning         → skeleton card + activity list
+    3. resolving        → skeleton card + activity list
+    4. executing        → skeleton card + activity list + partial signals if known
+    5. done / success   → full card
+    6. done / failed    → error card
     """
-    _section_header("📊 Risk Assessment")
+    _section_header("📊 Assessment Summary")
 
     live_phase = state.get_live_phase()
     result     = state.get_result()
 
-    # ── Stage 1: planning or resolving ──────────────────────────────────
-    if live_phase in ("planning", "resolving"):
-        st.markdown(
-            '<div style="background:#F9FAFB;border:1px solid #E5E7EB;'
-            'border-left:4px solid #D1D5DB;border-radius:8px;'
-            'padding:16px 20px;margin:4px 0 12px 0;'
-            'color:#9CA3AF;font-size:0.87em">'
-            '⏳ &nbsp;Starting analysis…'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    # ── Stage 2 / 3: executing — show partial risk grid progressively ────
-    if live_phase == "executing" and result is None:
-        has_signals = any(v != "UNKNOWN" for v in live_dims.values())
-
-        st.markdown(
-            '<div style="background:#FFFBEB;border:1px solid #FDE68A;'
-            'border-left:4px solid #D97706;border-radius:8px;'
-            'padding:14px 20px;margin:4px 0 12px 0;'
-            'color:#92400E;font-size:0.87em">'
-            '⏳ &nbsp;Calculating risk profile…'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        if has_signals:
-            _label_row("Risk Signals (in progress)")
-            _render_risk_drivers_grid(live_dims)
-        return
-
-    # ── Stage 4: idle with no result (initial state) ─────────────────────
+    # ── Stages 1–4: no result yet — show skeleton card + activity list ──
     if result is None:
-        st.markdown(
-            '<div style="color:#9CA3AF;font-size:0.85em;padding:10px 0">'
-            'The risk assessment will appear here after a run.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+        if live_phase == "idle":
+            _render_assessment_card_skeleton("Run an investigation to see the assessment.", show_pending_rows=False)
+        elif live_phase in ("planning", "resolving"):
+            _render_assessment_card_skeleton("Preparing investigation…")
+        else:  # executing
+            _render_assessment_card_skeleton("Analysing — assessment will populate shortly.")
+            has_signals = any(v != "UNKNOWN" for v in live_dims.values())
+            if has_signals:
+                _label_row("Risk Signals (in progress)")
+                _render_risk_drivers_grid(live_dims)
         return
 
-    # ── Stage 4: full result ready ────────────────────────────────────────
+    # ── Stage 5–6: result ready ───────────────────────────────────────
     answer = result.final_answer or "Investigation complete — no summary generated."
 
     if result.success:
         risk_level = _overall_risk_from_result(result)
-        if risk_level:
-            headline_text, headline_emoji = _RISK_HEADLINE.get(
-                risk_level, ("Assessment Complete", "✅")
-            )
-            tc, bg, border = _RISK_COLORS.get(risk_level, _RISK_COLORS["UNKNOWN"])
-        else:
-            headline_text, headline_emoji = "Investigation Complete", "✅"
-            tc, bg, border = "#14532D", "#F0FDF4", "#BBF7D0"
-            risk_level = None
+        _render_assessment_summary_card(risk_level, answer)
     else:
-        headline_text, headline_emoji = "Investigation Failed", "🔴"
-        tc, bg, border = "#B91C1C", "#FEF2F2", "#FECACA"
-        risk_level = None
-
-    _render_assessment_card(headline_text, headline_emoji, risk_level, answer, tc, bg, border)
-
-    # Trace ID — muted inline row with working copy button (execCommand works in sandboxed iframe)
-    trace_id = result.trace_id
-    if trace_id:
-        _st_components.html(
-            f"""
-            <div style="display:flex;align-items:center;gap:6px;padding:4px 0 8px 2px;
-                        font-size:11.5px;color:#9CA3AF;font-family:monospace">
-              <span style="font-family:sans-serif;font-weight:600;letter-spacing:.04em;font-size:10px">TRACE ID</span>
-              <span id="tid" style="user-select:all;word-break:break-all">{_esc(trace_id)}</span>
-              <button id="cpybtn"
-                style="background:none;border:1px solid #D1D5DB;border-radius:4px;
-                       cursor:pointer;padding:1px 7px;font-size:12px;color:#6B7280;
-                       line-height:1.5;flex-shrink:0"
-                title="Copy trace ID">⎘</button>
-            </div>
-            <script>
-              document.getElementById('cpybtn').addEventListener('click', function() {{
-                var el = document.getElementById('tid');
-                var range = document.createRange();
-                range.selectNode(el);
-                window.getSelection().removeAllRanges();
-                window.getSelection().addRange(range);
-                document.execCommand('copy');
-                window.getSelection().removeAllRanges();
-                this.textContent = '✓';
-                setTimeout(function(btn){{ btn.textContent = '⎘'; }}, 1500, this);
-              }});
-            </script>
-            """,
-            height=36,
+        _render_assessment_card(
+            "Investigation Failed", "🔴", None, answer,
+            "#B91C1C", "#FEF2F2", "#FECACA",
         )
 
-    with st.expander("Full Assessment", expanded=False):
-        st.markdown(
-            f'<div style="font-size:0.87em;color:#1F2937;line-height:1.7">'
-            f'{_esc(answer)}</div>',
-            unsafe_allow_html=True,
-        )
 
     if not result.success and result.errors:
         for e in result.errors:
@@ -1429,10 +1886,10 @@ def _render_graph_column() -> None:
     # Planning: nothing useful yet
     if live_phase == "planning":
         st.markdown(
-            '<div style="background:#F9FAFB;border:1px solid #E5E7EB;'
+            '<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
             'border-radius:8px;padding:40px 20px;text-align:center;'
-            'color:#9CA3AF;font-size:0.85em">'
-            '⏳ &nbsp;Generating investigation plan…'
+            'color:#94A3B8;font-size:0.85em">'
+            'Generating investigation plan…'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1450,27 +1907,12 @@ def _render_graph_column() -> None:
         )
         return
 
-    # Show entity banner once resolved
-    if live_entities:
-        for name, data in live_entities.items():
-            canonical  = (data or {}).get("canonical_name", name)
-            company_no = (data or {}).get("company_number", "")
-            no_str     = f" (No. {company_no})" if company_no else ""
-            status_html = (
-                f'<div style="font-size:0.85em;color:#14532D;font-weight:600;'
-                f'margin-bottom:8px">✔ {_esc(canonical)}{_esc(no_str)}</div>'
-                if data else
-                f'<div style="font-size:0.85em;color:#B91C1C;margin-bottom:8px">'
-                f'❌ {_esc(name)} — not found</div>'
-            )
-            st.markdown(status_html, unsafe_allow_html=True)
-
     # Show live step checklist while executing
     if live_phase == "executing" and live_plan:
         _render_live_step_checklist()
         return
 
-    # Done: show entity detail panels
+    # Done: show entity detail panels + graph insights
     if result is not None and result.resolved_entities:
         _label_row("Entity Details")
         for name, data in result.resolved_entities.items():
@@ -1490,27 +1932,63 @@ def _render_graph_column() -> None:
                     meta.append(f"No. {company_no}")
                 meta.append("exact match" if exact else "closest match")
                 st.caption("  ·  ".join(meta))
+
+        # Graph Insights — derived from ownership analysis, aligned with risk drivers
+        insights = _extract_graph_insights(result)
+        _label_row("Graph Insights")
+        gi_rows = (
+            f'<div style="display:flex;justify-content:space-between;'
+            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["ownership_depth"])}</span></div>'
+            f'<div style="display:flex;justify-content:space-between;'
+            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["beneficial_owner"])}</span></div>'
+            f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
+            f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["structure_complexity"])}</span></div>'
+        )
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+            f'{gi_rows}</div>',
+            unsafe_allow_html=True,
+        )
         return
 
     if live_phase == "idle" and result is None:
         st.markdown(
-            '<div style="background:#F9FAFB;border:1px solid #E5E7EB;'
+            '<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
             'border-radius:8px;padding:40px 20px;text-align:center;'
-            'color:#9CA3AF;font-size:0.85em">'
-            '🕸️ &nbsp;Entity graph will appear here after an investigation.'
+            'color:#94A3B8;font-size:0.85em">'
+            'Entity graph will appear here after an investigation.'
             '</div>',
             unsafe_allow_html=True,
         )
 
 
 def _render_insights_column(live_dims: dict) -> None:
-    """Col 3 of the Investigate tab: progressive risk signals + final reasoning.
+    """Col 3 of the Investigate tab: Assessment panel.
 
-    During execution: shows which risk dimensions are resolved and which are pending.
-    After completion: shows reasoning, confidence, and the complete risk driver grid.
-    Always ends with a collapsed "How this decision was made" expander when data exists.
+    Structure
+    ---------
+    A. Assessment (top)
+       - Outcome badge
+       - Key Risk Drivers (directly below outcome)
+       - Reasoning summary
+    B. Details
+       - Steps completed / agents
+       - Trace ID (copy button)
+    C. Expander
+       - "How this was assessed"
+
+    During execution: shows investigation type + live risk signal list.
     """
-    _section_header("💡 Decision Insights", "Reasoning and risk factor breakdown")
+    _section_header("⚡ Assessment", "Outcome and risk factor breakdown")
 
     live_phase = state.get_live_phase()
     result     = state.get_result()
@@ -1521,7 +1999,7 @@ def _render_insights_column(live_dims: dict) -> None:
     if live_phase == "idle" and result is None:
         st.markdown(
             '<div style="color:#9CA3AF;font-size:0.85em;padding:10px 0">'
-            'Decision insights will appear here after a run.'
+            'Assessment details will appear here after a run.'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -1549,65 +2027,77 @@ def _render_insights_column(live_dims: dict) -> None:
         completed_set = {s.get("task") for s in live_steps}
 
         _label_row("Risk Signals")
-
         signal_rows = ""
         for task_key, dim, label in _RISK_DIM_TASKS:
             risk = live_dims.get(dim, "UNKNOWN")
             if task_key in completed_set:
                 tc, bg, border = _RISK_COLORS.get(risk, _RISK_COLORS["UNKNOWN"])
-                icon    = "✔"
-                c_icon  = "#16A34A"
-                badge   = (
+                icon, c_icon   = "✔", "#16A34A"
+                badge = (
                     f'<span style="background:{bg};color:{tc};border:1px solid {border};'
                     f'border-radius:4px;padding:1px 8px;font-size:0.76em;font-weight:700">'
                     f'{_esc(risk)}</span>'
                 )
             elif task_key == current_task:
-                icon    = "🔄"
-                c_icon  = "#D97706"
-                badge   = (
-                    '<span style="color:#D97706;font-size:0.76em;font-style:italic">'
-                    'Computing…</span>'
-                )
+                icon, c_icon = "›", "#2563EB"
+                badge = '<span style="color:#2563EB;font-size:0.76em;font-style:italic">Computing…</span>'
             else:
-                icon    = "⏳"
-                c_icon  = "#9CA3AF"
-                badge   = (
-                    '<span style="color:#9CA3AF;font-size:0.76em">Pending</span>'
-                )
+                icon, c_icon = "·", "#9CA3AF"
+                badge = '<span style="color:#9CA3AF;font-size:0.76em">Pending</span>'
             signal_rows += (
                 f'<div style="display:flex;align-items:center;justify-content:space-between;'
                 f'padding:6px 0;border-bottom:1px solid #F3F4F6">'
-                f'<span style="font-size:0.83em;color:{c_icon}">{icon} {_esc(label)}</span>'
-                f'{badge}'
-                f'</div>'
+                f'<span style="font-size:0.83em;color:{c_icon};font-weight:500">'
+                f'{icon} {_esc(label)}</span>{badge}</div>'
             )
-
         if signal_rows:
             st.markdown(
-                f'<div style="background:#FAFAFA;border:1px solid #E5E7EB;'
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
                 f'border-radius:8px;padding:10px 14px;margin:4px 0">'
-                f'{signal_rows}'
-                f'</div>',
+                f'{signal_rows}</div>',
                 unsafe_allow_html=True,
             )
 
     # ── Full result ────────────────────────────────────────────────────
     elif result is not None:
-        # Reasoning summary
+
+        # A. Outcome badge
+        outcome_color = "#16A34A" if result.success else "#DC2626"
+        outcome_text  = "✓ Completed" if result.success else "✗ Failed"
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px 0">'
+            f'<span style="font-size:0.66em;font-weight:700;color:#6B7280;'
+            f'text-transform:uppercase;letter-spacing:0.06em">Outcome</span>'
+            f'<span style="background:{outcome_color}18;color:{outcome_color};'
+            f'border:1px solid {outcome_color}40;border-radius:6px;'
+            f'padding:2px 10px;font-size:0.80em;font-weight:700">'
+            f'{_esc(outcome_text)}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # A. Key Risk Drivers — directly below outcome
+        dims = _collect_risk_dims(result)
+        if any(v in ("HIGH", "MEDIUM", "LOW") for v in dims.values()):
+            _label_row("Key Risk Drivers")
+            _render_risk_drivers_grid(dims)
+
+        # A. Reasoning summary
         if plan:
             reason = plan.get("reason", "")
             if reason:
-                _label_row("Reasoning Summary")
+                _label_row("Assessment Summary")
                 st.markdown(
                     f'<div style="font-size:0.84em;color:#374151;'
                     f'border-left:3px solid #BFDBFE;padding:5px 0 5px 10px;'
-                    f'margin:0 0 12px 0;line-height:1.55">'
+                    f'margin:0 0 10px 0;line-height:1.55">'
                     f'{_esc(reason)}</div>',
                     unsafe_allow_html=True,
                 )
 
-        # Confidence indicators
+        st.divider()
+
+        # B. Details
         steps      = result.step_results or []
         n_done     = sum(1 for s in steps if s.status == "success")
         n_total    = len(steps)
@@ -1616,52 +2106,86 @@ def _render_insights_column(live_dims: dict) -> None:
             for s in steps if s.status == "success"
         })
 
-        _label_row("Confidence Indicators")
-        c1, c2 = st.columns(2)
-        c1.metric("Steps Completed", f"{n_done}/{n_total}")
-        c2.metric("Outcome", "✓ Success" if result.success else "✗ Failed")
+        _label_row("Details")
+        st.metric("Steps", f"{n_done}/{n_total}")
+        for s in steps:
+            icon  = "✓" if s.status == "success" else "✗"
+            color = "#16A34A" if s.status == "success" else "#DC2626"
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                f'border-radius:6px;padding:6px 10px;margin:3px 0;'
+                f'display:flex;justify-content:space-between;align-items:center">'
+                f'<div style="display:flex;align-items:center;gap:8px">'
+                f'<span style="color:{color};font-size:0.70em">●</span>'
+                f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
+                f'{_esc(_task_label(s.task))}</span>'
+                f'</div>'
+                f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
+                f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
+                f'white-space:nowrap">'
+                f'{_esc(_agent_display(s.agent))}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
         if agents_run:
             st.markdown(
-                f'<div style="font-size:0.78em;color:#374151;margin:6px 0 12px 0">'
+                f'<div style="font-size:0.78em;color:#374151;margin:6px 0 6px 0">'
                 f'<span style="color:#6B7280">Agents:</span> '
                 f'{_esc(", ".join(agents_run))}</div>',
                 unsafe_allow_html=True,
             )
 
-        # Complete risk driver grid
-        summarize_findings = _get_summarize_findings(result)
-        if summarize_findings:
-            dims = {
-                dim: (summarize_findings.get(task) or {}).get("risk_level", "UNKNOWN")
-                if isinstance(summarize_findings.get(task), dict) else "UNKNOWN"
-                for task, dim, _ in _RISK_DIM_TASKS
-            }
-            if any(v != "UNKNOWN" for v in dims.values()):
-                _label_row("Key Risk Drivers")
-                _render_risk_drivers_grid(dims)
+        # B. Trace ID
+        trace_id = result.trace_id
+        if trace_id:
+            _st_components.html(
+                f"""
+                <div style="display:flex;align-items:center;gap:6px;padding:4px 0 10px 2px;
+                            font-size:11.5px;color:#9CA3AF;font-family:monospace">
+                  <span style="font-family:sans-serif;font-weight:600;letter-spacing:.04em;
+                               font-size:10px;color:#6B7280">TRACE ID</span>
+                  <span id="tid" style="user-select:all;word-break:break-all">{_esc(trace_id)}</span>
+                  <button id="cpybtn"
+                    style="background:none;border:1px solid #D1D5DB;border-radius:4px;
+                           cursor:pointer;padding:1px 7px;font-size:12px;color:#6B7280;
+                           line-height:1.5;flex-shrink:0"
+                    title="Copy trace ID">⎘</button>
+                </div>
+                <script>
+                  document.getElementById('cpybtn').addEventListener('click', function() {{
+                    var el = document.getElementById('tid');
+                    var range = document.createRange();
+                    range.selectNode(el);
+                    window.getSelection().removeAllRanges();
+                    window.getSelection().addRange(range);
+                    document.execCommand('copy');
+                    window.getSelection().removeAllRanges();
+                    this.textContent = '✓';
+                    setTimeout(function(btn){{ btn.textContent = '⎘'; }}, 1500, this);
+                  }});
+                </script>
+                """,
+                height=38,
+            )
 
         if result.warnings:
             with st.expander(f"⚠️ {len(result.warnings)} warning(s)", expanded=False):
                 for w in result.warnings:
                     st.warning(w)
 
-    # ── How this decision was made ─────────────────────────────────────
-    # Shown whenever plan or result data is available; always collapsed.
+    # ── C. How this was assessed ───────────────────────────────────────
     if result is not None or live_plan is not None:
-        st.markdown(
-            '<div style="margin-top:14px"></div>',
-            unsafe_allow_html=True,
-        )
-        with st.expander("🔍 How this decision was made", expanded=False):
+        st.markdown('<div style="margin-top:10px"></div>', unsafe_allow_html=True)
+        with st.expander("🔍 How this was assessed", expanded=False):
             _render_analysis_expander()
 
 
 def _render_analysis_expander() -> None:
-    """Content for the 'How this decision was made' expander.
+    """Content for the 'How this was assessed' expander.
 
-    Shows investigation plan, step-by-step execution cards, and trace ID.
-    Rendered at the bottom of the Decision Insights column, always collapsed.
+    Shows investigation plan and step-by-step audit trail.
+    Rendered at the bottom of the Assessment column, always collapsed.
     """
     result     = state.get_result()
     live_plan  = state.get_live_plan()
@@ -1721,8 +2245,8 @@ def _render_analysis_expander() -> None:
 
         st.divider()
 
-    # ── Execution Steps ─────────────────────────────────────────────────
-    _section_header("🔍 Investigation Steps", "How the analysis was performed")
+    # ── Audit Trail ─────────────────────────────────────────────────────
+    _section_header("📋 Audit Trail", "Step-by-step record of how the analysis was performed")
 
     live_steps = state.get_live_steps()
     live_cur   = state.get_live_current_step()
@@ -1736,7 +2260,7 @@ def _render_analysis_expander() -> None:
     elif live_phase in ("planning", "resolving"):
         st.markdown(
             '<div style="color:#9CA3AF;font-size:0.85em;padding:12px 0">'
-            '⏳ &nbsp;Steps will appear as they complete…</div>',
+            'Steps will appear as they complete…</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -1764,30 +2288,6 @@ def _render_analysis_expander() -> None:
             )
             _render_step_card(n_done + 1, running)
 
-    # ── Decision Trace ──────────────────────────────────────────────────
-    trace_id = state.get_trace_id() or state.get_live_trace_id()
-    if trace_id:
-        st.divider()
-        _section_header("🗂️ Decision Trace")
-        st.markdown(
-            '<div style="background:#F3F4F6;border-radius:6px;'
-            'padding:10px 12px;margin:6px 0 10px 0">'
-            '<div style="font-size:0.66em;color:#6B7280;text-transform:uppercase;'
-            'letter-spacing:0.06em;font-weight:700;margin-bottom:4px">Trace ID</div>'
-            f'<code style="font-size:0.76em;color:#374151;word-break:break-all">'
-            f'{_esc(trace_id)}</code></div>',
-            unsafe_allow_html=True,
-        )
-        if result is not None:
-            steps = result.step_results or []
-            if steps:
-                n_ok      = sum(1 for s in steps if s.status == "success")
-                n_failed  = sum(1 for s in steps if s.status == "failed")
-                n_skipped = sum(1 for s in steps if s.status == "skipped")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Completed", n_ok)
-                c2.metric("Failed",    n_failed)
-                c3.metric("Skipped",   n_skipped)
 
 
 # ===========================================================================
@@ -1798,214 +2298,364 @@ def _render_analysis_expander() -> None:
 def render_replay_tab(components: "AppComponents") -> None:
     """Render the Replay / Audit tab.
 
-    Layout
-    ------
-    [Col 1 — Risk Assessment]  [Col 2 — Investigation Activity]  [Col 3 — Replayed Trace]
+    Layout mirrors the Investigate tab exactly:
+    [Col 1 — Replay loader + Assessment]  [Col 2 — Context Graph]  [Col 3 — Assessment panel]
     """
-    col1, col2, col3 = st.columns([2, 3, 2])
+    col1, col2, col3 = st.columns([2, 2, 2])
 
     with col1:
-        _render_replay_assessment_column()
+        _render_replay_input_column(components)
 
     with col2:
-        _render_replay_activity_column()
+        _render_replay_graph_column()
 
     with col3:
-        _render_replay_metadata_column(components)
+        _render_replay_insights_column()
 
 
-def _render_replay_assessment_column() -> None:
-    """Col 1 of the Replay tab: original question + risk assessment + risk drivers."""
-    replay_status = state.get_replay_status()
-    replay_data   = state.get_replay_data()
+def _render_replay_input_column(components: "AppComponents") -> None:
+    """Col 1 of the Replay tab: trace loader + entity banner + assessment card.
 
-    _section_header("📊 Risk Assessment")
-
-    if replay_status == "idle":
-        st.markdown(
-            '<div style="color:#9CA3AF;font-size:0.85em;padding:10px 0">'
-            'Load a past investigation using the trace ID panel on the right.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    if replay_status == "loading":
-        st.markdown(
-            '<div style="color:#D97706;font-size:0.85em;padding:10px 0">'
-            '⏳ &nbsp;Loading investigation…</div>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    if replay_status == "error":
-        error = state.get_replay_error()
-        if error:
-            st.error(error)
-        return
-
-    if not replay_data:
-        return
-
-    # Original question — prefer full question text (new traces); fall back
-    # to entity name (legacy traces that predate the question field).
-    question_raw = replay_data.get("question") or replay_data.get("query", "")
-    if question_raw:
-        display_q = _display_question(question_raw)
-        st.markdown(
-            f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;'
-            f'border-left:4px solid #3B82F6;border-radius:6px;'
-            f'padding:10px 14px;margin-bottom:14px">'
-            f'<div style="font-size:0.66em;font-weight:700;color:#3B82F6;'
-            f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px">'
-            f'Original Question</div>'
-            f'<div style="font-size:0.87em;color:#1E3A8A;line-height:1.55;'
-            f'font-style:italic">&ldquo;{_esc(display_q)}&rdquo;</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    # 2. Assessment card
-    summary  = replay_data.get("final_summary") or ""
-    ended_at = replay_data.get("ended_at") or ""
-
-    if not summary:
-        st.markdown(
-            '<div style="color:#9CA3AF;font-size:0.85em;padding:10px 0">'
-            'No summary was recorded for this investigation.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    risk_level = _risk_from_summary(summary)
-    if risk_level:
-        tc, bg, border = _RISK_COLORS[risk_level]
-        headline_text, headline_emoji = _RISK_HEADLINE.get(
-            risk_level, ("Assessment Complete", "✅")
-        )
-    else:
-        tc, bg, border = _RISK_COLORS["UNKNOWN"]
-        headline_text, headline_emoji = "Past Investigation Summary", "📋"
-
-    if ended_at:
-        st.markdown(
-            f'<div style="font-size:0.72em;color:#6B7280;margin-bottom:4px">'
-            f'Completed: {_esc(_fmt_ts(ended_at))}</div>',
-            unsafe_allow_html=True,
-        )
-
-    _render_assessment_card(headline_text, headline_emoji, risk_level, summary, tc, bg, border)
-
-    # 3. Key Risk Drivers
-    replay_dims = _extract_replay_risk_dimensions(replay_data)
-    if any(v != "UNKNOWN" for v in replay_dims.values()):
-        st.markdown(_KEY_RISK_DRIVERS_LABEL, unsafe_allow_html=True)
-        _render_risk_drivers_grid(replay_dims)
-
-    # 4. Full Assessment expander
-    with st.expander("Full Assessment", expanded=False):
-        st.markdown(
-            f'<div style="font-size:0.87em;color:#1F2937;line-height:1.7">'
-            f'{_esc(summary)}</div>',
-            unsafe_allow_html=True,
-        )
-
-
-def _render_replay_activity_column() -> None:
-    """Col 2 of the Replay tab: investigation plan snapshot + event timeline."""
-    replay_status = state.get_replay_status()
-    replay_data   = state.get_replay_data()
-
-    _section_header("📋 Investigation Plan")
-
-    if replay_status != "loaded" or not replay_data:
-        st.markdown(
-            '<div style="color:#9CA3AF;font-size:0.85em;padding:10px 0">'
-            'Load a trace to view the investigation plan and activity timeline.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    _render_replay_plan(replay_data)
-
-    st.divider()
-
-    _section_header(
-        "🗂️ Investigation Activity",
-        "Step-by-step record of what was done during this investigation",
-    )
-    _render_replay_event_timeline(replay_data.get("events") or [])
-
-
-def _render_replay_metadata_column(components: "AppComponents") -> None:
-    """Col 3 of the Replay tab: trace ID input, load/clear controls, trace metadata."""
+    Mirrors _render_input_column from the Investigate tab.
+    """
     replay_status = state.get_replay_status()
     replay_data   = state.get_replay_data()
     replay_error  = state.get_replay_error()
 
-    _section_header("🗂️ Replayed Trace", "Load a previous investigation by trace ID")
+    _section_header("🎬 Replay / Audit", "Load a previous investigation by trace ID")
 
-    # Load controls (always shown)
-    with st.container(border=True):
-        replay_id = st.text_input(
-            label="Trace ID",
-            label_visibility="collapsed",
-            value=state.get_replay_trace_id() or "",
-            placeholder="Enter a trace ID to replay…",
-            key="_input_replay_trace_id",
-        )
+    _loading = (replay_status == "loading")
+    replay_id = st.text_input(
+        label="Trace ID",
+        label_visibility="collapsed",
+        value=state.get_replay_trace_id() or "",
+        placeholder="Enter a trace ID to replay a past investigation…",
+        key="_input_replay_trace_id",
+        disabled=_loading,
+    )
+
+    if replay_status == "loaded" and replay_data:
+        if st.button("Clear Replay", type="primary", use_container_width=True):
+            st.session_state["_clear_replay"] = True
+    else:
         load_clicked = st.button(
-            "Load Trace",
+            "Loading…" if _loading else "Load Trace",
+            type="primary",
             use_container_width=True,
-            disabled=(replay_status == "loading"),
+            disabled=_loading,
         )
         if load_clicked and replay_id.strip():
             state.set_replay_trace_id(replay_id.strip())
             st.session_state["_trigger_replay"] = True
 
-        if replay_status == "loading":
+    st.caption("Enter a trace ID to replay a past investigation.")
+
+    if replay_status == "loading":
+        st.markdown(
+            '<div style="color:#D97706;font-size:0.85em;padding:6px 0">'
+            '⏳ &nbsp;Loading trace…</div>',
+            unsafe_allow_html=True,
+        )
+    elif replay_status == "error" and replay_error:
+        st.markdown(
+            f'<div style="background:#FEF2F2;border:1px solid #FECACA;'
+            f'border-left:4px solid #DC2626;border-radius:6px;'
+            f'padding:10px 14px;margin:8px 0">'
+            f'<div style="font-size:0.66em;font-weight:700;color:#DC2626;'
+            f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px">'
+            f'Failed to load</div>'
+            f'<div style="font-size:0.87em;color:#7F1D1D">{_esc(replay_error)}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif replay_status == "loaded" and replay_data:
+        # Original question — shown first
+        question = replay_data.get("question", "")
+        if question:
             st.markdown(
-                '<div style="color:#D97706;font-size:0.82em;padding:6px 0">'
-                '⏳ &nbsp;Loading trace…</div>',
-                unsafe_allow_html=True,
-            )
-        elif replay_status == "error" and replay_error:
-            st.markdown(
-                f'<div style="background:#FEF2F2;border:1px solid #FECACA;'
-                f'border-left:3px solid #DC2626;border-radius:6px;'
-                f'padding:10px 14px;margin-top:10px">'
-                f'<div style="font-size:0.72em;font-weight:700;color:#DC2626;'
+                f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;'
+                f'border-left:3px solid #3B82F6;border-radius:6px;'
+                f'padding:10px 14px;margin:8px 0">'
+                f'<div style="font-size:0.66em;font-weight:700;color:#3B82F6;'
                 f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px">'
-                f'Failed to load</div>'
-                f'<div style="font-size:0.82em;color:#7F1D1D">{_esc(replay_error)}</div>'
+                f'Original Question</div>'
+                f'<div style="font-size:0.88em;color:#1E3A8A;line-height:1.55;'
+                f'font-style:italic">&ldquo;{_esc(question)}&rdquo;</div>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
-        elif replay_status == "loaded" and replay_data:
-            trace_id     = replay_data.get("trace_id", "")
-            mode         = replay_data.get("mode", "")
-            n_events     = len(replay_data.get("events") or [])
-            short_id     = (trace_id[:16] + "…") if len(trace_id) > 16 else trace_id
-            mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "—")
+        # Identified entity banner
+        query = replay_data.get("query", "")
+        if query:
+            events_col1 = replay_data.get("events") or []
+            company_no = _extract_replay_company_number(events_col1)
+            no_str = f". (No. {company_no})" if company_no else ""
             st.markdown(
                 f'<div style="background:#F0FDF4;border:1px solid #BBF7D0;'
-                f'border-left:3px solid #16A34A;border-radius:6px;'
-                f'padding:10px 14px;margin-top:10px">'
-                f'<div style="font-size:0.82em;font-weight:700;color:#15803D;'
-                f'margin-bottom:5px">✓ Investigation loaded</div>'
-                f'<code style="font-size:0.76em;color:#166534;word-break:break-all">'
-                f'{_esc(short_id)}</code>'
-                f'<div style="font-size:0.78em;color:#6B7280;margin-top:6px">'
-                f'{_esc(mode_display)} &nbsp;·&nbsp; {n_events} activity event(s)</div>'
+                f'border-left:4px solid #16A34A;border-radius:6px;'
+                f'padding:10px 14px;margin:8px 0">'
+                f'<div style="font-size:0.66em;font-weight:700;color:#16A34A;'
+                f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px">'
+                f'Identified Entity</div>'
+                f'<div style="font-size:0.92em;color:#14532D;font-weight:700">'
+                f'✔ {_esc(query)}{_esc(no_str)}</div>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
-            if st.button("Clear Replay", use_container_width=True, type="secondary"):
-                st.session_state["_clear_replay"] = True
 
-    # Trace metadata (shown below controls when loaded)
-    if replay_status == "loaded" and replay_data:
+    st.divider()
+
+    # Assessment Summary card
+    _section_header("📊 Assessment Summary")
+    if replay_status == "idle":
+        _render_assessment_card_skeleton("Load a trace to see the assessment.", show_pending_rows=False)
+    elif replay_status == "loading":
+        _render_assessment_card_skeleton("Loading investigation…")
+    elif replay_status == "error":
+        _render_assessment_card_skeleton("Could not load investigation.")
+    elif replay_status == "loaded" and replay_data:
+        summary = replay_data.get("final_summary") or ""
+        if summary:
+            # Derive overall risk from per-dimension data (more reliable than text parsing)
+            _replay_dims = _extract_replay_risk_dimensions(replay_data)
+            _RISK_ORDER_LOCAL = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            risk_level = max(
+                (v for v in _replay_dims.values() if v in _RISK_ORDER_LOCAL),
+                key=lambda v: _RISK_ORDER_LOCAL[v],
+                default=None,
+            ) or _risk_from_summary(summary)
+            _render_assessment_summary_card(risk_level, summary)
+        else:
+            _render_assessment_card_skeleton("No summary recorded for this investigation.", show_pending_rows=False)
+
+
+def _render_replay_graph_column() -> None:
+    """Col 2 of the Replay tab: entity context panel.
+
+    Mirrors _render_graph_column from the Investigate tab.
+    """
+    replay_status = state.get_replay_status()
+    replay_data   = state.get_replay_data()
+
+    _section_header("🕸️ Context Graph", "Entity ownership and relationship map")
+
+    legend_items = [
+        ("🔵", "Company"),
+        ("🟢", "Beneficial Owner"),
+        ("🟡", "Address"),
+        ("🔗", "Ownership Link"),
+    ]
+    legend_html = "".join(
+        f'<span style="margin-right:12px;font-size:0.78em;color:#6B7280">'
+        f'{icon} {_esc(label)}</span>'
+        for icon, label in legend_items
+    )
+    st.markdown(f'<div style="margin-bottom:12px">{legend_html}</div>', unsafe_allow_html=True)
+
+    if replay_status != "loaded" or not replay_data:
+        st.markdown(
+            '<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            'border-radius:8px;padding:40px 20px;text-align:center;'
+            'color:#94A3B8;font-size:0.85em">'
+            'Load a trace to view the entity context.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Entity details box
+    query = replay_data.get("query", "")
+    events_col2 = replay_data.get("events") or []
+    company_no_col2 = _extract_replay_company_number(events_col2)
+    no_str_col2 = f". (No. {company_no_col2})" if company_no_col2 else ""
+    _label_row("Entity Details")
+    with st.container(border=True):
+        st.markdown(
+            f'<div style="font-weight:600;color:#111827;font-size:0.92em;'
+            f'margin-bottom:4px">🔵 {_esc(query)}{_esc(no_str_col2)}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("loaded from trace")
+
+    # Graph insights derived from events
+    events  = replay_data.get("events") or []
+    insights = _extract_replay_graph_insights(events)
+    _label_row("Graph Insights")
+    gi_rows = (
+        f'<div style="display:flex;justify-content:space-between;'
+        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+        f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["ownership_depth"])}</span></div>'
+        f'<div style="display:flex;justify-content:space-between;'
+        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+        f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["beneficial_owner"])}</span></div>'
+        f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
+        f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["structure_complexity"])}</span></div>'
+    )
+    st.markdown(
+        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+        f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+        f'{gi_rows}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_replay_insights_column() -> None:
+    """Col 3 of the Replay tab: assessment details panel.
+
+    Mirrors _render_insights_column from the Investigate tab.
+    """
+    replay_status = state.get_replay_status()
+    replay_data   = state.get_replay_data()
+
+    _section_header("⚡ Assessment", "Outcome and risk factor breakdown")
+
+    if replay_status != "loaded" or not replay_data:
+        st.markdown(
+            '<div style="color:#9CA3AF;font-size:0.85em;padding:10px 0">'
+            'Assessment details will appear here after loading a trace.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    events       = replay_data.get("events") or []
+    mode         = replay_data.get("mode", "")
+    mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "")
+    trace_id     = replay_data.get("trace_id", "")
+
+    # Investigation Type
+    if mode_display:
+        st.markdown(
+            f'<div style="font-size:0.72em;font-weight:700;color:#6B7280;'
+            f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px">'
+            f'Investigation Type</div>'
+            f'<div style="font-size:0.88em;color:#1F2937;font-weight:600;'
+            f'margin-bottom:10px">{_esc(mode_display)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Outcome badge
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:8px;margin:4px 0 10px 0">'
+        '<span style="font-size:0.66em;font-weight:700;color:#6B7280;'
+        'text-transform:uppercase;letter-spacing:0.06em">Outcome</span>'
+        '<span style="background:#16A34A18;color:#16A34A;'
+        'border:1px solid #16A34A40;border-radius:6px;'
+        'padding:2px 10px;font-size:0.80em;font-weight:700">'
+        '✓ Completed</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Key Risk Drivers
+    replay_dims = _extract_replay_risk_dimensions(replay_data)
+    if any(v in ("HIGH", "MEDIUM", "LOW") for v in replay_dims.values()):
+        _label_row("Key Risk Drivers")
+        _render_risk_drivers_grid(replay_dims)
+
+    # Assessment Summary (plan reason)
+    plan_reason = ""
+    for ev in events:
+        if ev.get("event_type") == "plan_created":
+            raw = ev.get("input_summary", "") or ""
+            m = _re.search(r"reason:\s*(.+)$", raw, _re.IGNORECASE | _re.DOTALL)
+            if m:
+                plan_reason = m.group(1).strip()
+            break
+    if plan_reason:
+        _label_row("Assessment Summary")
+        st.markdown(
+            f'<div style="font-size:0.84em;color:#374151;'
+            f'border-left:3px solid #BFDBFE;padding:5px 0 5px 10px;'
+            f'margin:0 0 10px 0;line-height:1.55">'
+            f'{_esc(plan_reason)}</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # Details
+    _label_row("Details")
+    replay_steps = _replay_plan_steps(events)
+    n = len(replay_steps)
+    st.metric("Steps", f"{n}/{n}")
+    for s in replay_steps:
+        color = "#16A34A" if s["success"] else "#DC2626"
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-radius:6px;padding:6px 10px;margin:3px 0;'
+            f'display:flex;justify-content:space-between;align-items:center">'
+            f'<div style="display:flex;align-items:center;gap:8px">'
+            f'<span style="color:{color};font-size:0.70em">●</span>'
+            f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
+            f'{_esc(_task_label(s["task"]))}</span>'
+            f'</div>'
+            f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
+            f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
+            f'white-space:nowrap">'
+            f'{_esc(_agent_display(s["agent"]))}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    agents_run = sorted({
+        _AGENT_LABELS.get(ev.get("agent_name", ""), ev.get("agent_name", ""))
+        for ev in events
+        if ev.get("agent_name")
+    } - {""})
+    if agents_run:
+        st.markdown(
+            f'<div style="font-size:0.78em;color:#374151;margin:6px 0">'
+            f'<span style="color:#6B7280">Agents:</span> '
+            f'{_esc(", ".join(agents_run))}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Trace ID with copy button
+    if trace_id:
+        _st_components.html(
+            f"""
+            <div style="display:flex;align-items:center;gap:6px;padding:4px 0 10px 2px;
+                        font-size:11.5px;color:#9CA3AF;font-family:monospace">
+              <span style="font-family:sans-serif;font-weight:600;letter-spacing:.04em;
+                           font-size:10px;color:#6B7280">TRACE ID</span>
+              <span id="tid" style="user-select:all;word-break:break-all">{_esc(trace_id)}</span>
+              <button id="cpybtn"
+                style="background:none;border:1px solid #D1D5DB;border-radius:4px;
+                       cursor:pointer;padding:1px 7px;font-size:12px;color:#6B7280;
+                       line-height:1.5;flex-shrink:0"
+                title="Copy trace ID">⎘</button>
+            </div>
+            <script>
+              document.getElementById('cpybtn').addEventListener('click', function() {{
+                var el = document.getElementById('tid');
+                var range = document.createRange();
+                range.selectNode(el);
+                window.getSelection().removeAllRanges();
+                window.getSelection().addRange(range);
+                document.execCommand('copy');
+                window.getSelection().removeAllRanges();
+                this.textContent = '✓';
+                setTimeout(function(btn){{ btn.textContent = '⎘'; }}, 1500, this);
+              }});
+            </script>
+            """,
+            height=38,
+        )
+
+    # How this was assessed expander
+    st.markdown('<div style="margin-top:10px"></div>', unsafe_allow_html=True)
+    with st.expander("🔍 How this was assessed", expanded=False):
+        _render_replay_plan(replay_data)
         st.divider()
-        _render_replay_trace_metadata(replay_data)
+        _section_header(
+            "📋 Audit Trail",
+            "Step-by-step record of what was done during this investigation",
+        )
+        _render_replay_step_cards(events)

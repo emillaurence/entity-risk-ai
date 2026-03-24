@@ -133,6 +133,7 @@ class GraphAgent(BaseAgent):
             output_summary=result.summary,
             decision="result available for downstream agents" if result.success else "step failed",
             entity_refs=entity_refs,
+            data=result.data,
         )
 
         if not result.success:

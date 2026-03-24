@@ -287,6 +287,7 @@ class RiskAgent(BaseAgent):
                 else "step failed"
             ),
             entity_refs=company_ref,
+            data=result.data,
         )
 
         if not result.success:
@@ -349,6 +350,7 @@ class RiskAgent(BaseAgent):
                     else "tool unavailable — partial assessment"
                 ),
                 entity_refs=company_ref,
+                data=result.data,
             )
             if result.success and result.data is not None:
                 findings[task] = result.data

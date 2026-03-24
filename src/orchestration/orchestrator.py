@@ -66,6 +66,15 @@ _FAILURE_SYSTEM_PROMPT = (
     "Be concise and factual. Do not use bullet points or markdown."
 )
 
+_INDIVIDUAL_RISK_SYNTHESIS_PROMPT = (
+    "You are a financial crime compliance analyst. "
+    "Given one or more structured risk assessment findings, rewrite them as a "
+    "clear, natural 2-3 sentence business narrative for a compliance decision-maker. "
+    "Do not use bullet points or markdown. "
+    "End with the overall risk level (LOW, MEDIUM, or HIGH) "
+    "based on the highest individual signal found."
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -512,7 +521,7 @@ class Orchestrator:
                     break
 
         # ── 6. Build final answer ──────────────────────────────────────
-        final_answer = _build_final_answer(step_results)
+        final_answer = _build_final_answer(step_results, self._ai_client)
 
         # If nothing succeeded, ask the AI to explain the failure.
         if self._ai_client and not any(sr.success for sr in step_results):
@@ -665,15 +674,19 @@ def _build_context(
     return context
 
 
-def _build_final_answer(step_results: list[StepRecord]) -> str:
+def _build_final_answer(
+    step_results: list[StepRecord],
+    ai_client: AIClient | None = None,
+) -> str:
     """
     Synthesise a final answer from completed step summaries.
 
     Priority:
       1. risk-agent summarize_risk_for_company  (richest narrative)
       2. trace-agent retrieve_and_summarize_trace / summarize_trace
-      3. Last successful step summary
-      4. Fallback message indicating what went wrong
+      3. Individual risk task summaries — AI-synthesised if client available
+      4. Last successful step summary
+      5. Fallback message indicating what went wrong
     """
     successful = [sr for sr in step_results if sr.success and sr.summary]
 
@@ -684,6 +697,33 @@ def _build_final_answer(step_results: list[StepRecord]) -> str:
     for sr in successful:
         if sr.task in ("retrieve_and_summarize_trace", "summarize_trace"):
             return sr.summary
+
+    _INDIVIDUAL_RISK_TASKS = frozenset({
+        "address_risk_check",
+        "control_signal_check",
+        "ownership_complexity_check",
+        "industry_context_check",
+    })
+    risk_summaries = [
+        sr.summary
+        for sr in successful
+        if sr.task in _INDIVIDUAL_RISK_TASKS
+    ]
+    if risk_summaries:
+        joined = " ".join(risk_summaries)
+        if ai_client:
+            try:
+                synthesized = ai_client.generate_text(
+                    system_prompt=_INDIVIDUAL_RISK_SYNTHESIS_PROMPT,
+                    user_prompt=joined,
+                    max_tokens=150,
+                )
+                if synthesized:
+                    return synthesized
+                _log.warning("_build_final_answer: AI synthesis returned empty string")
+            except Exception as exc:
+                _log.warning("_build_final_answer: AI synthesis failed (%s), using raw join", exc)
+        return joined
 
     if successful:
         return successful[-1].summary

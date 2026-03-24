@@ -11,6 +11,7 @@ No agent or tool should write Cypher or call TraceRepository directly.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from src.domain.models import (
@@ -126,6 +127,7 @@ class TraceService:
         message: str = "",
         agent_name: str = "",
         entity_refs: list[dict] | None = None,
+        data: dict | None = None,
     ) -> TraceEvent:
         """
         Build, persist, and return a tool-related TraceEvent.
@@ -146,6 +148,7 @@ class TraceService:
                 "output_summary": output_summary,
                 "decision":       decision,
                 "why":            why,
+                "data_json":      json.dumps(data) if data else "",
             },
         )
         self.add_event(trace, event, entity_refs)

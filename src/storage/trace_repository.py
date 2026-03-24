@@ -108,6 +108,7 @@ class TraceRepository:
                 output_summary: $output_summary,
                 decision:      $decision,
                 why:           $why,
+                data_json:     $data_json,
                 created_at:    $created_at
             })
             CREATE (t)-[:HAS_EVENT]->(e)
@@ -126,6 +127,7 @@ class TraceRepository:
                 "output_summary": event.payload.get("output_summary", ""),
                 "decision":      event.payload.get("decision", ""),
                 "why":           event.payload.get("why", ""),
+                "data_json":     event.payload.get("data_json", ""),
                 "created_at":    event.timestamp.isoformat(),
             },
         )
@@ -197,6 +199,7 @@ class TraceRepository:
                 e.output_summary AS output_summary,
                 e.decision       AS decision,
                 e.why            AS why,
+                e.data_json      AS data_json,
                 e.created_at     AS created_at,
                 collect(DISTINCT {
                     labels: labels(n),

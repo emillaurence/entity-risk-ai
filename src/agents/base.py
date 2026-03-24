@@ -96,6 +96,7 @@ class BaseAgent(ABC):
         why: str = "",
         step_id: str | None = None,
         entity_refs: list[dict] | None = None,
+        data: dict | None = None,
     ) -> None:
         """
         Persist a TOOL_RETURNED event attributed to this agent.
@@ -129,6 +130,7 @@ class BaseAgent(ABC):
             why=why,
             agent_name=self.name,
             entity_refs=entity_refs,
+            data=data,
         )
 
     def log_decision_event(
