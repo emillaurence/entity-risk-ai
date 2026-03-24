@@ -1361,7 +1361,7 @@ def _extract_live_risk_dims() -> dict[str, str]:
 
 
 def _render_resolved_entity_banner(entities: dict) -> None:
-    """Render a prominent 'Identified Entity' banner for each resolved entity.
+    """Render a structured 'Identified Entity' card for each resolved entity.
 
     Called as soon as ``live_entities`` is populated so the user knows
     which company is being investigated before results arrive.
@@ -1376,23 +1376,46 @@ def _render_resolved_entity_banner(entities: dict) -> None:
                 f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px">'
                 f'Entity not found</div>'
                 f'<div style="font-size:0.87em;color:#7F1D1D;font-weight:500">'
-                f'❌ {_esc(name)}</div>'
+                f'❌ {_esc(name)} — no match in registry</div>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
         else:
             canonical  = data.get("canonical_name", name)
             company_no = data.get("company_number", "")
-            no_str     = f" (No. {company_no})" if company_no else ""
+            exact      = data.get("exact_match", True)
+            status     = data.get("status", "")
+            confidence = "High — exact match" if exact else "Closest match"
+
+            def _meta_row(label: str, value: str, last: bool = False) -> str:
+                border = "" if last else "border-bottom:1px solid #D1FAE5;"
+                return (
+                    f'<div style="display:flex;justify-content:space-between;'
+                    f'padding:4px 0;{border}">'
+                    f'<span style="font-size:0.78em;color:#4ADE80">{_esc(label)}</span>'
+                    f'<span style="font-size:0.78em;font-weight:600;color:#14532D">'
+                    f'{_esc(value)}</span></div>'
+                )
+
+            rows = ""
+            if company_no:
+                rows += _meta_row("Company No.", company_no)
+            if status:
+                rows += _meta_row("Status", status)
+            rows += _meta_row("Jurisdiction", "UK")
+            rows += _meta_row("Match confidence", confidence, last=True)
+
             st.markdown(
                 f'<div style="background:#F0FDF4;border:1px solid #BBF7D0;'
                 f'border-left:4px solid #16A34A;border-radius:6px;'
                 f'padding:10px 14px;margin:8px 0">'
-                f'<div style="font-size:0.66em;font-weight:700;color:#16A34A;'
-                f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px">'
+                f'<div style="font-size:0.62em;font-weight:700;color:#16A34A;'
+                f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px">'
                 f'Identified Entity</div>'
-                f'<div style="font-size:0.92em;color:#14532D;font-weight:700">'
-                f'✔ {_esc(canonical)}{_esc(no_str)}</div>'
+                f'<div style="font-size:0.96em;color:#14532D;font-weight:800;'
+                f'margin-bottom:7px;letter-spacing:0.01em">'
+                f'{_esc(canonical.upper())}</div>'
+                f'{rows}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -1449,39 +1472,44 @@ def _render_live_step_checklist() -> None:
 
 
 def _render_assessment_card_skeleton(
-    message: str = "Preparing assessment…",
+    message: str = "Analysis in progress…",
     show_pending_rows: bool = True,
 ) -> None:
-    """Locked 4-field assessment card with pending placeholders.
+    """Skeleton assessment card shown before results arrive.
 
-    Shown during planning / resolving / executing so the card shape never
-    disappears or shifts — only the values change once the run completes.
-    When show_pending_rows=False (idle state), only the summary message is shown.
+    When show_pending_rows=False (idle), renders only the status message.
+    When True, shows the decision-first card shape with pending placeholders.
     """
+    if not show_pending_rows:
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-left:5px solid #CBD5E1;border-radius:8px;'
+            f'padding:16px 20px;margin:4px 0 12px 0;'
+            f'color:#94A3B8;font-size:0.87em;line-height:1.6">'
+            f'{_esc(message)}</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
     _PENDING = '<span style="color:#CBD5E1;font-size:0.84em">Pending…</span>'
-    pending_rows_html = (
-        # Row 1 — Assessment Level
-        f'<div style="display:flex;align-items:center;gap:10px;margin:0 0 8px 0">'
-        f'<span style="font-size:0.66em;font-weight:700;color:#94A3B8;'
-        f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px">'
-        f'Assessment Level</span>{_PENDING}</div>'
-        # Row 2 — Recommendation
-        f'<div style="display:flex;align-items:baseline;gap:10px;margin:4px 0">'
-        f'<span style="font-size:0.66em;font-weight:700;color:#94A3B8;'
-        f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px;'
-        f'white-space:nowrap">Recommendation</span>{_PENDING}</div>'
-    ) if show_pending_rows else ""
     st.markdown(
         f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
         f'border-left:5px solid #CBD5E1;border-radius:8px;'
         f'padding:16px 20px;margin:4px 0 12px 0">'
-        f'{pending_rows_html}'
-        # Summary row
-        f'<div style="font-size:0.66em;font-weight:700;color:#94A3B8;'
-        f'text-transform:uppercase;letter-spacing:0.06em;margin:10px 0 4px 0">'
-        f'Summary</div>'
-        f'<div style="color:#94A3B8;font-size:0.87em;line-height:1.65">'
+        # Title placeholder
+        f'<div style="font-size:1.0em;font-weight:800;color:#CBD5E1;margin-bottom:12px">'
         f'{_esc(message)}</div>'
+        # Primary driver placeholder
+        f'<div style="font-size:0.62em;font-weight:700;color:#94A3B8;'
+        f'text-transform:uppercase;letter-spacing:0.06em;margin:0 0 4px 0">'
+        f'Primary Risk Driver</div>'
+        f'<div style="color:#CBD5E1;font-size:0.84em;line-height:1.55;margin-bottom:12px">'
+        f'{_PENDING}</div>'
+        # Actions placeholder
+        f'<div style="font-size:0.62em;font-weight:700;color:#94A3B8;'
+        f'text-transform:uppercase;letter-spacing:0.06em;margin:0 0 4px 0">'
+        f'Recommended Actions</div>'
+        f'<div style="color:#CBD5E1;font-size:0.84em">{_PENDING}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -1547,14 +1575,14 @@ def _extract_graph_insights(result: Any) -> dict:
 # Activity phase buckets used in the left-column live status list
 _ACTIVITY_PHASES: list[tuple[frozenset, str]] = [
     (frozenset({"entity_lookup", "company_profile"}),
-     "Confirming company identity"),
+     "Resolving entity"),
     (frozenset({"expand_ownership", "sic_context", "shared_address_check"}),
-     "Mapping ownership structure"),
+     "Mapping ownership"),
     (frozenset({"ownership_complexity_check", "control_signal_check",
                 "address_risk_check", "industry_context_check"}),
-     "Assessing risk signals"),
+     "Evaluating risk signals"),
     (frozenset({"summarize_risk_for_company"}),
-     "Synthesising risk outcome"),
+     "Generating assessment"),
 ]
 
 
@@ -1664,6 +1692,373 @@ def _render_assessment_summary_card(
 
 
 # ===========================================================================
+# STRUCTURED ASSESSMENT — decision-first rendering
+# ===========================================================================
+
+_DIM_TASK_MAP: dict[str, str] = {
+    "ownership": "ownership_complexity_check",
+    "control":   "control_signal_check",
+    "address":   "address_risk_check",
+    "industry":  "industry_context_check",
+}
+_TASK_DIM_MAP: dict[str, str] = {v: k for k, v in _DIM_TASK_MAP.items()}
+
+_DIM_DISPLAY_LABELS: dict[str, str] = {
+    "ownership": "Ownership Complexity",
+    "control":   "Control Concerns",
+    "address":   "Address Concentration",
+    "industry":  "Industry Risk",
+}
+
+# Priority order for picking primary driver when risk levels tie
+_DIM_PRIORITY = ["ownership", "control", "address", "industry"]
+
+
+def _get_all_risk_findings(result: Any) -> dict[str, dict]:
+    """Return {task_name: findings_dict} for all risk tasks that ran."""
+    out: dict[str, dict] = {}
+    for sr in (result.step_results or []):
+        if not sr.success or not sr.findings:
+            continue
+        if sr.task == "summarize_risk_for_company":
+            for task in _RISK_TASKS:
+                data = sr.findings.get(task)
+                if isinstance(data, dict):
+                    out[task] = data
+        elif sr.task in _RISK_TASKS:
+            data = sr.findings.get(sr.task)
+            if isinstance(data, dict):
+                out[sr.task] = data
+    return out
+
+
+def _format_risk_driver_text(task: str, findings: dict, company_name: str) -> str:
+    """1-2 sentence explanation of a risk driver, derived from structured findings."""
+    name = company_name or "This company"
+    if task == "address_risk_check":
+        total = findings.get("co_located_total", 0)
+        rate  = findings.get("dissolution_rate", 0.0)
+        rate_pct = round(rate * 100)
+        if total > 0:
+            text = f"{name} is registered at an address shared with {total} other entities"
+            if rate_pct > 10:
+                text += f", {rate_pct}% of which are dissolved"
+            text += "."
+            if total > 30:
+                text += " This is consistent with a formation-agent or registered-office provider."
+            return text
+        return "The registered address shows no significant co-location patterns."
+
+    if task == "ownership_complexity_check":
+        depth     = findings.get("max_chain_depth", 0)
+        has_ubos  = findings.get("has_individual_ubos", False)
+        corp_only = findings.get("corporate_chain_only", False)
+        ubo_count = findings.get("ubo_count", 0)
+        if corp_only:
+            return (f"{name} has no identified natural-person beneficial owner — "
+                    "the full ownership chain consists of corporate entities only.")
+        if depth >= 4:
+            text = f"{name} has a complex ownership chain spanning {depth} hops"
+            if not has_ubos:
+                text += " with no natural-person UBO identified"
+            return text + "."
+        if depth >= 2:
+            text = f"{name} has a {depth}-hop ownership chain"
+            if ubo_count > 0:
+                s = "s" if ubo_count != 1 else ""
+                text += f" with {ubo_count} beneficial owner{s} identified"
+            return text + "."
+        return f"{name} has a shallow, standard ownership structure."
+
+    if task == "control_signal_check":
+        elevated = findings.get("elevated_control_types", [])
+        if elevated:
+            types_str = "; ".join(
+                str(e).replace("-", " ").replace("_", " ") for e in elevated[:2]
+            )
+            return f"{name} shows elevated PSC control signals: {types_str}."
+        if findings.get("mixed_control"):
+            return f"{name} shows mixed control arrangements beyond standard share ownership."
+        return f"{name} shows no elevated control signals beyond standard share ownership."
+
+    if task == "industry_context_check":
+        high      = findings.get("high_scrutiny_sic_codes", [])
+        is_hold   = findings.get("is_holding_structure", False)
+        peer_rate = findings.get("peer_dissolution_rate", 0.0)
+        if high:
+            codes  = ", ".join(str(c.get("sic_code", "")) for c in high[:2] if c.get("sic_code"))
+            reason = high[0].get("reason", "") if high else ""
+            text   = f"{name} is classified under high-scrutiny SIC code(s): {codes}"
+            if reason:
+                text += f" ({reason})"
+            return text + "."
+        if is_hold:
+            return (f"{name} is classified as a holding structure — "
+                    "a category that warrants additional scrutiny.")
+        if round(peer_rate * 100) > 30:
+            return (f"{name}'s industry sector has a {round(peer_rate*100)}% "
+                    "peer dissolution rate.")
+        return f"{name}'s industry classification shows no high-scrutiny risk signals."
+
+    return ""
+
+
+def _build_secondary_signals(all_findings: dict, primary_task: str) -> list[str]:
+    """Extract up to 3 material secondary signals (skipping the primary dimension)."""
+    signals: list[str] = []
+
+    addr = all_findings.get("address_risk_check", {})
+    own  = all_findings.get("ownership_complexity_check", {})
+    ctrl = all_findings.get("control_signal_check", {})
+    ind  = all_findings.get("industry_context_check", {})
+
+    if primary_task != "address_risk_check":
+        total = addr.get("co_located_total", 0)
+        if total > 10:
+            signals.append(f"Registered address shared with {total} other entities")
+        rate = addr.get("dissolution_rate", 0.0)
+        if rate > 0.3 and total <= 10:
+            signals.append(f"{round(rate*100)}% dissolution rate among address-linked entities")
+
+    if primary_task != "ownership_complexity_check" and own:
+        if not own.get("has_individual_ubos") and own.get("path_count", 1) > 0:
+            signals.append("No natural-person beneficial owner identified")
+        elif own.get("max_chain_depth", 0) >= 4:
+            signals.append(f"Ownership chain spans {own['max_chain_depth']} hops")
+
+    if primary_task != "control_signal_check":
+        if ctrl.get("elevated_control_types"):
+            signals.append("Elevated PSC control signals present")
+
+    if primary_task != "industry_context_check":
+        if ind.get("high_scrutiny_sic_codes"):
+            signals.append("Classified under high-scrutiny industry sector")
+        elif ind.get("peer_dissolution_rate", 0.0) > 0.4:
+            signals.append(f"{round(ind['peer_dissolution_rate']*100)}% dissolution rate among industry peers")
+
+    return signals[:3]
+
+
+def _build_no_concerns(dims: dict, all_findings: dict) -> list[str]:
+    """Return what was checked and found clear (LOW-rated dimensions only)."""
+    concerns: list[str] = []
+    own = all_findings.get("ownership_complexity_check", {})
+
+    if dims.get("address") == "LOW":
+        concerns.append("Registered address shows no co-location concerns")
+    if dims.get("ownership") == "LOW":
+        if own.get("has_individual_ubos"):
+            concerns.append("Beneficial owner identified — ownership structure is transparent")
+        else:
+            concerns.append("Ownership structure appears standard")
+    if dims.get("control") == "LOW":
+        concerns.append("Control structure shows no elevated PSC signals")
+    if dims.get("industry") == "LOW":
+        concerns.append("Industry classification shows no high-scrutiny codes")
+    return concerns
+
+
+def _build_recommended_actions(dims: dict, all_findings: dict, overall_risk: str) -> list[str]:
+    """Generate 2-3 concrete recommended actions based on the risk profile."""
+    actions: list[str] = []
+    addr = all_findings.get("address_risk_check", {})
+    own  = all_findings.get("ownership_complexity_check", {})
+    ctrl = all_findings.get("control_signal_check", {})
+
+    if dims.get("address") in ("HIGH", "MEDIUM"):
+        if addr.get("co_located_total", 0) > 20:
+            actions.append("Check whether entity belongs to a known formation cluster")
+        actions.append("Validate legitimacy of the registered address before onboarding")
+
+    if dims.get("ownership") in ("HIGH", "MEDIUM"):
+        if not (own or {}).get("has_individual_ubos"):
+            actions.append("Request beneficial ownership documentation from the entity")
+        elif (own or {}).get("max_chain_depth", 0) >= 4:
+            actions.append("Map ownership chain to natural-person level before proceeding")
+
+    if dims.get("control") in ("HIGH", "MEDIUM"):
+        if ctrl.get("elevated_control_types"):
+            actions.append("Obtain PSC register and verify stated control arrangements")
+
+    if not actions:
+        if overall_risk == "HIGH":
+            actions.append("Conduct enhanced due diligence before any onboarding decision")
+        elif overall_risk == "MEDIUM":
+            actions.append("Apply standard enhanced checks before proceeding")
+        else:
+            actions.append("No immediate action required — standard monitoring applies")
+
+    if overall_risk == "HIGH":
+        edd = "Conduct enhanced due diligence before any onboarding decision"
+        if edd not in actions:
+            actions.insert(0, edd)
+
+    return actions[:3]
+
+
+def _build_structured_assessment(result: Any) -> dict:
+    """Deterministically build a decision-first assessment from step findings.
+
+    Returns a dict suitable for _render_decision_first_assessment.
+    """
+    all_findings = _get_all_risk_findings(result)
+    dims         = _collect_risk_dims(result)
+    overall_risk = _overall_risk_from_result(result) or "UNKNOWN"
+    key          = overall_risk.upper()
+
+    # Find primary dimension: highest risk, priority-ordered on tie
+    primary_dim  = None
+    primary_risk = "UNKNOWN"
+    for dim in _DIM_PRIORITY:
+        lvl = dims.get(dim, "NOT RUN")
+        if _RISK_ORDER.get(lvl, -1) > _RISK_ORDER.get(primary_risk, -1):
+            primary_risk = lvl
+            primary_dim  = dim
+
+    # Decision title
+    any_material = any(v in ("HIGH", "MEDIUM") for v in dims.values())
+    if key in ("LOW", "UNKNOWN") and not any_material:
+        decision_title = "Low Risk — No Material Risk Signals"
+    elif primary_dim and key in ("HIGH", "MEDIUM", "LOW"):
+        level_word     = {"HIGH": "High Risk", "MEDIUM": "Moderate Risk", "LOW": "Low Risk"}[key]
+        decision_title = f"{level_word} — {_DIM_DISPLAY_LABELS.get(primary_dim, primary_dim.title())}"
+    elif key in ("HIGH", "MEDIUM", "LOW"):
+        decision_title = {
+            "HIGH":   "High Risk Identified",
+            "MEDIUM": "Moderate Risk Identified",
+            "LOW":    "Low Risk — Standard Profile",
+        }[key]
+    else:
+        decision_title = "Investigation Complete"
+
+    # Company name for narrative text
+    company_name = ""
+    for _, data in (result.resolved_entities or {}).items():
+        if data:
+            company_name = data.get("canonical_name", "")
+            break
+    if not company_name:
+        company_name = result.query or ""
+
+    # Primary driver text: deterministic from findings; fall back to final_answer
+    primary_task = _DIM_TASK_MAP.get(primary_dim or "", "")
+    if primary_task and primary_task in all_findings:
+        primary_driver_text = _format_risk_driver_text(
+            primary_task, all_findings[primary_task], company_name
+        )
+    else:
+        primary_driver_text = _first_sentences(result.final_answer or "", 2)
+
+    return {
+        "overall_risk":          key,
+        "decision_title":        decision_title,
+        "primary_driver_label":  _DIM_DISPLAY_LABELS.get(primary_dim or "", ""),
+        "primary_driver_text":   primary_driver_text,
+        "secondary_signals":     _build_secondary_signals(all_findings, primary_task),
+        "no_immediate_concerns": _build_no_concerns(dims, all_findings),
+        "recommended_actions":   _build_recommended_actions(dims, all_findings, key),
+    }
+
+
+def _render_decision_first_assessment(assessment: dict) -> None:
+    """Decision-first assessment card: title → driver → signals → concerns → actions."""
+    risk   = assessment["overall_risk"]
+    tc, bg, border = _RISK_COLORS.get(risk, _RISK_COLORS["UNKNOWN"])
+
+    # Neutral styling for UNKNOWN so it never looks alarming
+    if risk == "UNKNOWN":
+        tc, bg, border = "#64748B", "#F8FAFC", "#E2E8F0"
+
+    title           = assessment["decision_title"]
+    primary_label   = assessment["primary_driver_label"]
+    primary_text    = assessment["primary_driver_text"]
+    secondary       = assessment["secondary_signals"]
+    no_concerns     = assessment["no_immediate_concerns"]
+    actions         = assessment["recommended_actions"]
+
+    def _subsection(label: str) -> str:
+        return (
+            f'<div style="font-size:0.62em;font-weight:700;color:#6B7280;'
+            f'text-transform:uppercase;letter-spacing:0.06em;margin:12px 0 5px 0">'
+            f'{_esc(label)}</div>'
+        )
+
+    def _bullet(text: str, color: str, icon: str) -> str:
+        return (
+            f'<div style="display:flex;gap:7px;margin:3px 0">'
+            f'<span style="color:{color};flex-shrink:0;font-size:0.84em;'
+            f'line-height:1.55">{icon}</span>'
+            f'<span style="font-size:0.84em;color:#374151;line-height:1.55">'
+            f'{_esc(text)}</span></div>'
+        )
+
+    # Primary driver section
+    driver_html = ""
+    if primary_text:
+        driver_lbl  = primary_label or "Primary Risk Driver"
+        driver_html = (
+            _subsection(driver_lbl)
+            + f'<div style="color:#374151;font-size:0.87em;line-height:1.6;'
+            f'border-left:3px solid {border};padding:4px 0 4px 10px">'
+            f'{_esc(primary_text)}</div>'
+        )
+
+    # Secondary signals
+    secondary_html = ""
+    if secondary:
+        items = "".join(_bullet(s, "#9CA3AF", "·") for s in secondary)
+        secondary_html = _subsection("Secondary Signals") + items
+
+    # No immediate concerns
+    concerns_html = ""
+    if no_concerns:
+        items = "".join(_bullet(c, "#16A34A", "✔") for c in no_concerns)
+        concerns_html = _subsection("No Immediate Concerns") + items
+
+    # Recommended actions
+    actions_html = ""
+    if actions:
+        items = "".join(_bullet(a, "#1D4ED8", "→") for a in actions)
+        actions_html = _subsection("Recommended Actions") + items
+
+    badge = _risk_badge(risk) if risk and risk != "UNKNOWN" else ""
+
+    st.markdown(
+        f'<div style="background:{bg};border:1px solid {border};'
+        f'border-left:5px solid {tc};border-radius:8px;'
+        f'padding:16px 20px;margin:4px 0 12px 0">'
+        # Title row with risk badge
+        f'<div style="display:flex;align-items:flex-start;justify-content:space-between;'
+        f'gap:10px;margin-bottom:2px">'
+        f'<div style="font-size:1.0em;font-weight:800;color:{tc};line-height:1.3">'
+        f'{_esc(title)}</div>'
+        f'{badge}</div>'
+        f'{driver_html}{secondary_html}{concerns_html}{actions_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _chip_click(prompt: str) -> None:
+    """on_click callback for quick-prompt chips — populates the textarea."""
+    st.session_state["_input_question"] = prompt
+    state.set_question(prompt)
+
+
+def _get_company_for_chips() -> str:
+    """Best-guess company name to use in chip prompt templates."""
+    result = state.get_result()
+    if result and result.resolved_entities:
+        for _, data in result.resolved_entities.items():
+            if data:
+                return data.get("canonical_name", "")
+    for _, data in state.get_live_entities().items():
+        if data:
+            return data.get("canonical_name", "")
+    return ""
+
+
+# ===========================================================================
 # INVESTIGATE TAB
 # ===========================================================================
 
@@ -1742,24 +2137,49 @@ def render_investigate_tab(components: "AppComponents") -> None:
 
 
 def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
-    """Col 1 of the Investigate tab: question input + resolved entity + risk assessment."""
-    _section_header("🔍 AI Assistant", "Ask a question about any UK company")
+    """Col 1 of the Investigate tab: question input, chips, entity card, risk assessment."""
+    _section_header(
+        "🔍 Company Risk Investigator",
+        "Investigate ownership, control, and risk signals for a UK company",
+    )
 
     question = st.text_area(
         label="Question",
         label_visibility="collapsed",
         value=state.get_question(),
-        height=110,
+        height=100,
         placeholder=(
-            "e.g. Investigate Acme Holdings Ltd for ownership risk\n"
-            "e.g. Who controls Redwood Ventures Ltd?"
+            "e.g. Who owns Vodafone 2 and are there any ownership, "
+            "control, or address risks?"
         ),
         key="_input_question",
     )
-    st.caption("Enter a company name or a free-text compliance question.")
-    _running  = state.get_live_phase() in ("planning", "resolving", "executing")
-    _btn_label = "Running…" if _running else "Run Investigation"
-    submitted = st.button(
+
+    # Quick-prompt chips — populate the textarea via on_click callback
+    company = _get_company_for_chips()
+    _c = f" {company}" if company else " [COMPANY]"
+    _chip_defs = [
+        ("Ownership",       f"Who owns{_c}?"),
+        ("Address",    f"Does{_c} show any address-related risk signals?"),
+        ("Control", f"Does{_c} show any control-related risk signals?"),
+        ("Industry", f"Does{_c} show any industry-related risk signals?"),
+        ("Full analysis",   (
+            f"Who owns{_c} and are there any risks?"
+        )),
+    ]
+    chip_cols = st.columns(5)
+    for col, (label, prompt) in zip(chip_cols, _chip_defs):
+        col.button(
+            label,
+            use_container_width=True,
+            key=f"_chip_{label.replace(' ', '_')}",
+            on_click=_chip_click,
+            args=(prompt,),
+        )
+
+    _running   = state.get_live_phase() in ("planning", "resolving", "executing")
+    _btn_label = "Running…" if _running else "Run Risk Analysis"
+    submitted  = st.button(
         _btn_label,
         type="primary",
         use_container_width=True,
@@ -1771,7 +2191,7 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
         st.session_state["_trigger_run"] = True
         st.rerun()
 
-    # Show resolved entity banner as soon as it is available (before result)
+    # Entity card — shown as soon as entity is resolved (before full result)
     live_entities = state.get_live_entities()
     if live_entities:
         _render_resolved_entity_banner(live_entities)
@@ -1781,49 +2201,50 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
 
 
 def _render_live_risk_assessment(live_dims: dict) -> None:
-    """Assessment Summary for the Investigate tab — staged progressive rendering.
+    """Risk Assessment for the Investigate tab — staged progressive rendering.
 
-    The card schema (Assessment Level / Recommendation / Primary Driver / Summary)
-    is ALWAYS rendered in all states so the layout never shifts:
-
-    1. idle             → skeleton card (placeholders)
-    2. planning         → skeleton card + activity list
-    3. resolving        → skeleton card + activity list
-    4. executing        → skeleton card + activity list + partial signals if known
-    5. done / success   → full card
+    1. idle             → skeleton card (no pending rows)
+    2. planning         → execution progress list + skeleton card
+    3. resolving        → execution progress list + skeleton card
+    4. executing        → execution progress list + skeleton + partial signals
+    5. done / success   → decision-first assessment card
     6. done / failed    → error card
     """
-    _section_header("📊 Assessment Summary")
+    _section_header("📊 Risk Assessment")
 
     live_phase = state.get_live_phase()
     result     = state.get_result()
 
-    # ── Stages 1–4: no result yet — show skeleton card + activity list ──
+    # ── Stages 1–4: no result yet ─────────────────────────────────────
     if result is None:
         if live_phase == "idle":
-            _render_assessment_card_skeleton("Run an investigation to see the assessment.", show_pending_rows=False)
-        elif live_phase in ("planning", "resolving"):
-            _render_assessment_card_skeleton("Preparing investigation…")
-        else:  # executing
-            _render_assessment_card_skeleton("Analysing — assessment will populate shortly.")
-            has_signals = any(v != "UNKNOWN" for v in live_dims.values())
+            _render_assessment_card_skeleton(
+                "Run a risk analysis to see the assessment.",
+                show_pending_rows=False,
+            )
+        else:
+            # Show execution progress above the skeleton card
+            _render_activity_list()
+            _render_assessment_card_skeleton()
+            # If any signals arrived (individual tasks mode), show them
+            has_signals = any(
+                v not in ("UNKNOWN", "NOT RUN") for v in live_dims.values()
+            )
             if has_signals:
                 _label_row("Risk Signals (in progress)")
                 _render_risk_drivers_grid(live_dims)
         return
 
-    # ── Stage 5–6: result ready ───────────────────────────────────────
-    answer = result.final_answer or "Investigation complete — no summary generated."
-
+    # ── Stage 5–6: result ready ────────────────────────────────────────
     if result.success:
-        risk_level = _overall_risk_from_result(result)
-        _render_assessment_summary_card(risk_level, answer)
+        assessment = _build_structured_assessment(result)
+        _render_decision_first_assessment(assessment)
     else:
+        answer = result.final_answer or "The investigation encountered an error."
         _render_assessment_card(
             "Investigation Failed", "🔴", None, answer,
             "#B91C1C", "#FEF2F2", "#FECACA",
         )
-
 
     if not result.success and result.errors:
         for e in result.errors:
@@ -1834,7 +2255,7 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
             for w in result.warnings:
                 st.warning(w)
 
-    # Resolved entity chips (final state; live banner shown above during run)
+    # Compact entity chip row (after run; the full entity card shows during run)
     if result.resolved_entities and not state.get_live_entities():
         pills_html = ""
         for name, data in result.resolved_entities.items():
