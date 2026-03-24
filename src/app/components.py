@@ -1685,11 +1685,10 @@ def _extract_graph_insights(result: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Context Graph — streamlit-agraph data builder
+# Context Graph — intent detection, risk colours, and data builder
 # ---------------------------------------------------------------------------
 
-# Node colour dicts (background / border / highlight) by entity type.
-# Using dicts lets vis-network apply richer selection highlighting.
+# Node colour palettes (background / border / highlight)
 _GRAPH_COLOR_FOCAL: dict = {
     "background": "#1D4ED8", "border": "#1E3A8A",
     "highlight":  {"background": "#3B82F6", "border": "#1E3A8A"},
@@ -1706,34 +1705,104 @@ _GRAPH_COLOR_ADDRESS: dict = {
     "background": "#FEF3C7", "border": "#FCD34D",
     "highlight":  {"background": "#FDE68A", "border": "#F59E0B"},
 }
+_GRAPH_COLOR_ADDRESS_KEY: dict = {  # address node when address intent is active
+    "background": "#FDE68A", "border": "#D97706",
+    "highlight":  {"background": "#FCD34D", "border": "#B45309"},
+}
+_GRAPH_COLOR_NOUBO: dict = {  # "No UBO identified" phantom node
+    "background": "#FFF7ED", "border": "#F97316",
+    "highlight":  {"background": "#FED7AA", "border": "#EA580C"},
+}
+_GRAPH_COLOR_CLUSTER: dict = {  # co-located entity cluster indicator
+    "background": "#F1F5F9", "border": "#94A3B8",
+    "highlight":  {"background": "#E2E8F0", "border": "#64748B"},
+}
 
-# Legend colours (flat hex, for the HTML legend below the graph)
+# Legend colours (flat hex for the HTML legend strip)
 _LEGEND_FOCAL   = "#1D4ED8"
 _LEGEND_COMPANY = "#93C5FD"
 _LEGEND_PERSON  = "#34D399"
 _LEGEND_ADDRESS = "#FCD34D"
 
 _GRAPH_MAX_PATH_DEPTH = 3   # max ownership hops rendered
-_GRAPH_MAX_NODES      = 12  # cap non-focal nodes for readability
+_GRAPH_MAX_NODES      = 12  # cap on non-focal nodes for readability
 
 
-def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
-    """Build Node and Edge lists plus per-node metadata from an investigation result.
+def _detect_graph_intent(question: str) -> str:
+    """Determine the primary visual focus of the graph from the user's question.
 
-    Data sources (in priority order):
-      1. expand_ownership  — ownership paths + UBOs
-      2. company_profile   — direct_owners (fallback), address node
-      3. resolved_entities — focal node always present
-
-    Returns (nodes, edges, node_meta) where node_meta maps each node id to
-    {"full_name", "type", "context"} for the selection panel.
+    Returns one of: 'ownership', 'address', 'control', 'risk'.
     """
-    from streamlit_agraph import Edge, Node  # local import — optional dependency
+    q = question.lower()
+    address_kws  = {"address", "location", "registered at", "where is", "office", "postcode", "postal"}
+    control_kws  = {"control", "psc", "significant control", "director", "signatory"}
+    ownership_kws = {"own", "owner", "owned", "ubo", "beneficial", "parent", "who owns", "holds", "shareholder"}
+
+    has_ownership = any(t in q for t in ownership_kws)
+    has_address   = any(t in q for t in address_kws)
+    has_control   = any(t in q for t in control_kws)
+
+    if has_address and not has_ownership and not has_control:
+        return "address"
+    if has_control and not has_ownership:
+        return "control"
+    if has_ownership:
+        return "ownership"
+    return "risk"  # general / combined
+
+
+def _edge_color_for_risk(risk_level: str) -> str:
+    """Map a risk_level string ('HIGH'/'MEDIUM'/'LOW') to a hex edge colour."""
+    return {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#22C55E"}.get(
+        (risk_level or "").upper(), "#9CA3AF"
+    )
+
+
+def _build_agraph_data(
+    result: Any,
+    intent: str = "risk",
+    risk_findings: dict | None = None,
+    repo: Any = None,
+) -> tuple[list, list, dict]:
+    """Build Node/Edge lists and per-node metadata from an investigation result.
+
+    Parameters
+    ----------
+    result        OrchestratorResult — step_results, resolved_entities.
+    intent        Graph focus derived from _detect_graph_intent().
+    risk_findings {task_name: findings_dict} — used to colour edges by risk level.
+    repo          Optional Neo4jRepository for secondary queries when the
+                  investigation did not produce ownership or address data.
+
+    Key behaviours
+    --------------
+    - Ownership edges on the primary chain are coloured by the relevant risk level
+      and carry pct labels; secondary/non-key edges are grey and unlabelled.
+    - Address node is enlarged and highlighted when intent == 'address'.
+    - A "? No UBO" phantom node is added when corporate_chain_only == True.
+    - Secondary Neo4j queries run (once, scoped) when investigation data is absent.
+
+    Returns (nodes, edges, node_meta) where node_meta maps node_id to
+    {"full_name", "type", "context"}.
+    """
+    from streamlit_agraph import Edge, Node
 
     nodes: list[Node] = []
     edges: list[Edge] = []
     seen:  set[str]   = set()
     node_meta: dict[str, dict] = {}
+
+    rf = risk_findings or {}
+
+    # Determine key-path edge colour from intent + risk findings
+    if intent == "address":
+        key_color = _edge_color_for_risk(rf.get("address_risk_check", {}).get("risk_level", ""))
+    elif intent == "control":
+        key_color = _edge_color_for_risk(rf.get("control_signal_check", {}).get("risk_level", ""))
+    else:  # 'ownership' or 'risk'
+        key_color = _edge_color_for_risk(rf.get("ownership_complexity_check", {}).get("risk_level", ""))
+
+    ownership_is_key = intent in ("ownership", "risk", "control")
 
     def add_node(
         nid: str, label: str, color: dict, size: int,
@@ -1742,17 +1811,21 @@ def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
     ) -> None:
         if nid not in seen:
             seen.add(nid)
-            # title = hover tooltip (full, untruncated name)
             nodes.append(Node(
                 id=nid, label=label, color=color, size=size,
                 title=full_name, borderWidth=border_width,
             ))
             node_meta[nid] = {"full_name": full_name, "type": node_type, "context": context}
 
-    def add_edge(src: str, dst: str, label: str = "", color: str = "#9CA3AF") -> None:
+    def add_edge(
+        src: str, dst: str, label: str = "",
+        color: str = "#9CA3AF", is_key: bool = False,
+    ) -> None:
         edges.append(Edge(
-            source=src, target=dst, label=label, color=color,
-            width=2,
+            source=src, target=dst,
+            label=label if is_key else "",  # pct labels only on key-path edges
+            color=color,
+            width=3 if is_key else 1,
             font={"size": 10, "align": "middle",
                   "strokeWidth": 2, "strokeColor": "#FFFFFF"},
         ))
@@ -1785,6 +1858,7 @@ def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
 
     non_focal: int = 0
     ownership_found = False
+    address_found   = False
 
     # ── Ownership paths from expand_ownership ─────────────────────────────
     for sr in (result.step_results or []):
@@ -1814,7 +1888,9 @@ def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
                      size=22 if is_person else 18,
                      full_name=from_name, node_type=node_type,
                      context=f"Ownership: {pct}" if pct else "Owner")
-            add_edge(from_name, to_name, label=pct, color="#9CA3AF")
+            add_edge(from_name, to_name, label=pct,
+                     color=key_color if ownership_is_key else "#9CA3AF",
+                     is_key=ownership_is_key)
             ownership_found = True
 
         # UBOs not already captured via path rows
@@ -1831,7 +1907,9 @@ def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
                      full_name=name, node_type="Individual / Beneficial Owner",
                      context=f"Ownership: {pct}" if pct else "Beneficial owner")
             if not any(e.source == name and e.target == focal_id for e in edges):
-                add_edge(name, focal_id, color="#34D399")
+                add_edge(name, focal_id,
+                         color=key_color if ownership_is_key else "#34D399",
+                         is_key=ownership_is_key)
             ownership_found = True
         break  # only process the first expand_ownership step
 
@@ -1857,10 +1935,61 @@ def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
                 add_node(name, _short(name), color, size=20,
                          full_name=name, node_type=node_type,
                          context=f"Ownership: {pct}" if pct else "Direct owner")
-                add_edge(name, focal_id, label=pct, color="#9CA3AF")
+                add_edge(name, focal_id, label=pct,
+                         color=key_color if ownership_is_key else "#9CA3AF",
+                         is_key=ownership_is_key)
+                ownership_found = True
             break
 
-    # ── Address node from company_profile ─────────────────────────────────
+    # ── Secondary Neo4j: fetch direct owners when investigation omitted them ─
+    if not ownership_found and repo is not None and intent in ("ownership", "risk"):
+        try:
+            db_owners = repo.get_direct_owners(focal_id)
+            for owner in db_owners[:5]:
+                if non_focal >= _GRAPH_MAX_NODES:
+                    break
+                name = (owner.get("owner_name") or "").strip()
+                if not name:
+                    continue
+                labels    = owner.get("owner_labels") or []
+                is_person = "Person" in labels
+                color     = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
+                node_type = "Individual" if is_person else "Company"
+                pct       = _pct_label(owner.get("ownership_pct_min"), owner.get("ownership_pct_max"))
+                if name not in seen:
+                    non_focal += 1
+                add_node(name, _short(name), color, size=20,
+                         full_name=name, node_type=node_type,
+                         context=f"Ownership: {pct}" if pct else "Direct owner")
+                add_edge(name, focal_id, label=pct,
+                         color=key_color if ownership_is_key else "#9CA3AF",
+                         is_key=ownership_is_key)
+                ownership_found = True
+        except Exception:
+            pass  # DB unavailable — fall through silently
+
+    # ── "No UBO" phantom node — corporate chain only ──────────────────────
+    own_findings = rf.get("ownership_complexity_check", {})
+    if (
+        intent in ("ownership", "risk")
+        and own_findings.get("corporate_chain_only") is True
+        and non_focal < _GRAPH_MAX_NODES
+    ):
+        nid = "__no_ubo__"
+        if nid not in seen:
+            non_focal += 1
+        add_node(nid, "? No UBO", _GRAPH_COLOR_NOUBO, size=14,
+                 full_name="No individual beneficial owner identified",
+                 node_type="Missing UBO",
+                 context="Full ownership chain consists of corporate entities only.",
+                 border_width=2)
+        add_edge(focal_id, nid, color="#F97316", is_key=False)
+
+    # ── Address node ───────────────────────────────────────────────────────
+    address_is_key = intent == "address"
+    addr_color     = _GRAPH_COLOR_ADDRESS_KEY if address_is_key else _GRAPH_COLOR_ADDRESS
+    addr_size      = 22 if address_is_key else 14
+
     for sr in (result.step_results or []):
         if sr.task != "company_profile" or not sr.success:
             continue
@@ -1875,15 +2004,65 @@ def _build_agraph_data(result: Any) -> tuple[list, list, dict]:
                 town,
                 postal,
             ]))
-            addr_id = f"__addr__{focal_id}"
+            addr_id   = f"__addr__{focal_id}"
+            co_total  = rf.get("address_risk_check", {}).get("co_located_total", 0)
+            addr_ctx  = full_addr or addr_label
+            if co_total:
+                addr_ctx  += f" · {co_total} co-located entities"
+                addr_label = f"{addr_label} ({co_total})"
             if addr_id not in seen:
                 non_focal += 1
-            add_node(addr_id, addr_label, _GRAPH_COLOR_ADDRESS, size=14,
+            add_node(addr_id, _short(addr_label, 22), addr_color, size=addr_size,
                      full_name=full_addr or addr_label,
                      node_type="Registered Address",
-                     context=full_addr or addr_label)
-            add_edge(focal_id, addr_id, label="at", color="#F59E0B")
+                     context=addr_ctx)
+            add_edge(focal_id, addr_id, label="at",
+                     color=key_color if address_is_key else "#F59E0B",
+                     is_key=address_is_key)
+            address_found = True
+
+            # Co-located cluster indicator (address intent, high concentration)
+            if address_is_key and co_total > 5 and non_focal < _GRAPH_MAX_NODES:
+                clust_id  = "__colocated__"
+                diss_pct  = round(rf.get("address_risk_check", {}).get("dissolution_rate", 0.0) * 100)
+                clust_lbl = f"+{co_total} entities"
+                clust_ctx = f"{co_total} companies share this address"
+                if diss_pct:
+                    clust_ctx += f" · {diss_pct}% dissolved"
+                if clust_id not in seen:
+                    non_focal += 1
+                add_node(clust_id, clust_lbl, _GRAPH_COLOR_CLUSTER, size=16,
+                         full_name=f"{co_total} co-located companies",
+                         node_type="Co-located Cluster",
+                         context=clust_ctx)
+                add_edge(addr_id, clust_id, color=key_color, is_key=address_is_key)
         break
+
+    # ── Secondary Neo4j: fetch address when company_profile didn't run ─────
+    if not address_found and repo is not None and intent in ("address", "risk"):
+        try:
+            db_addr = repo.get_company_address_context(focal_id)
+            if db_addr and non_focal < _GRAPH_MAX_NODES:
+                postal     = (db_addr.get("post_code") or "").strip()
+                town       = (db_addr.get("post_town") or "").strip()
+                addr_label = postal or town or "Address"
+                full_addr  = ", ".join(filter(None, [
+                    db_addr.get("address_line_1", ""),
+                    town,
+                    postal,
+                ]))
+                addr_id = f"__addr__{focal_id}"
+                if addr_id not in seen:
+                    non_focal += 1
+                add_node(addr_id, addr_label, addr_color, size=addr_size,
+                         full_name=full_addr or addr_label,
+                         node_type="Registered Address",
+                         context=full_addr or addr_label)
+                add_edge(focal_id, addr_id, label="at",
+                         color=key_color if address_is_key else "#F59E0B",
+                         is_key=address_is_key)
+        except Exception:
+            pass  # DB unavailable — fall through silently
 
     return nodes, edges, node_meta
 
@@ -2522,7 +2701,7 @@ def render_investigate_tab(components: "AppComponents") -> None:
         _render_input_column(components, live_dims)
 
     with col2:
-        _render_graph_column()
+        _render_graph_column(components)
 
     with col3:
         _render_insights_column(live_dims)
@@ -2688,7 +2867,7 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
             )
 
 
-def _render_graph_column() -> None:
+def _render_graph_column(components: "AppComponents") -> None:
     """Col 2 of the Investigate tab: hierarchical interactive ownership graph when
     done; live step checklist during execution."""
     _section_header("🕸️ Context Graph", "Entity ownership and relationship map")
@@ -2735,11 +2914,20 @@ def _render_graph_column() -> None:
             st.session_state["_graph_result_trace"] = trace_key
             st.session_state.pop("_graph_selected_node", None)
 
+        question     = state.get_question()
+        intent       = _detect_graph_intent(question)
+        risk_findings = _get_all_risk_findings(result)
+
         node_meta: dict = {}
         try:
             from streamlit_agraph import Config, agraph
 
-            nodes, edges, node_meta = _build_agraph_data(result)
+            nodes, edges, node_meta = _build_agraph_data(
+                result,
+                intent=intent,
+                risk_findings=risk_findings,
+                repo=components.repo,
+            )
             if nodes:
                 config = Config(
                     height=560,
@@ -2785,7 +2973,16 @@ def _render_graph_column() -> None:
         except Exception:
             st.caption("Graph could not be rendered.")
 
-        # Compact colour legend (matches actual node fill colours)
+        # Compact colour legend + intent badge
+        _INTENT_LABELS = {
+            "ownership": ("Ownership view", "#DBEAFE", "#1D4ED8"),
+            "address":   ("Address view",   "#FEF3C7", "#D97706"),
+            "control":   ("Control view",   "#F3E8FF", "#7C3AED"),
+            "risk":      ("Risk overview",  "#F0FDF4", "#15803D"),
+        }
+        intent_lbl, intent_bg, intent_fg = _INTENT_LABELS.get(
+            intent, ("Risk overview", "#F0FDF4", "#15803D")
+        )
         legend_html = (
             f'<span style="margin-right:12px;font-size:0.73em;color:#6B7280">'
             f'<span style="color:{_LEGEND_FOCAL}">■</span> Focal entity</span>'
@@ -2795,6 +2992,9 @@ def _render_graph_column() -> None:
             f'<span style="color:{_LEGEND_PERSON}">■</span> Individual / UBO</span>'
             f'<span style="font-size:0.73em;color:#6B7280">'
             f'<span style="color:{_LEGEND_ADDRESS}">■</span> Address</span>'
+            f'<span style="float:right;font-size:0.72em;font-weight:600;'
+            f'background:{intent_bg};color:{intent_fg};'
+            f'border-radius:4px;padding:1px 7px">{intent_lbl}</span>'
         )
         st.markdown(f'<div style="margin:4px 0 10px">{legend_html}</div>',
                     unsafe_allow_html=True)
