@@ -38,6 +38,7 @@ Replay / Audit tab
 
 from __future__ import annotations
 
+import difflib as _difflib
 import html as _html
 import json as _json
 import re as _re
@@ -227,13 +228,6 @@ _RISK_RECOMMENDATIONS: dict[str, str] = {
     "LOW":    "Standard monitoring applies",
 }
 
-_RISK_ACTION_REQUIRED: dict[str, str] = {
-    "HIGH":    "Enhanced due diligence required before onboarding",
-    "MEDIUM":  "Additional review recommended before proceeding",
-    "LOW":     "Standard monitoring applies",
-    "UNKNOWN": "—",
-}
-
 # Fallback plan description per investigation mode
 _MODE_PLAN_FALLBACK: dict[str, str] = {
     "investigate": (
@@ -255,15 +249,6 @@ _RISK_COLORS: dict[str, tuple[str, str, str]] = {
 }
 
 _RISK_ORDER: dict[str, int] = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
-
-# Headline copy shown in the risk assessment card
-_RISK_HEADLINE: dict[str, tuple[str, str]] = {
-    # risk_level → (headline_text, emoji)
-    "HIGH":    ("High Risk Identified",           "⚠️"),
-    "MEDIUM":  ("Moderate Risk Identified",       "⚡"),
-    "LOW":     ("Low Risk — Standard Profile",    "✅"),
-    "UNKNOWN": ("Assessment in Progress",          "·"),
-}
 
 # Tasks that produce a risk_level in their findings
 _RISK_TASKS = frozenset({
@@ -515,19 +500,6 @@ def _overall_risk_from_result(result: Any) -> str | None:
     return best
 
 
-def _risk_from_summary(summary: str) -> str | None:
-    """Scan free-text summary for the highest risk level mentioned."""
-    text = (summary or "").upper()
-    for lvl in ("HIGH", "MEDIUM", "LOW"):
-        if (
-            f" {lvl} " in text
-            or f" {lvl}." in text
-            or f" {lvl}," in text
-            or text.endswith(lvl)
-            or text.startswith(lvl)
-        ):
-            return lvl
-    return None
 
 
 def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
@@ -581,6 +553,39 @@ def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
                 break
 
     return dims
+
+
+_RISK_TASK_NAMES = {
+    "ownership_complexity_check",
+    "control_signal_check",
+    "address_risk_check",
+    "industry_context_check",
+}
+
+
+def _extract_replay_all_findings(replay_data: dict) -> dict[str, dict]:
+    """Extract full per-task findings dicts from replay trace events.
+
+    Reads data_json from tool_returned events for the 4 risk tasks.
+    Returns {task_name: findings_dict}, mirroring _get_all_risk_findings(result).
+    """
+    out: dict[str, dict] = {}
+    for ev in (replay_data.get("events") or []):
+        if ev.get("event_type") != "tool_returned":
+            continue
+        task = ev.get("tool_name", "")
+        if task not in _RISK_TASK_NAMES:
+            continue
+        raw = ev.get("data_json") or ""
+        if not raw:
+            continue
+        try:
+            data = _json.loads(raw)
+            if isinstance(data, dict):
+                out[task] = data
+        except Exception:
+            pass
+    return out
 
 
 def _extract_replay_graph_insights(events: list) -> dict:
@@ -637,6 +642,77 @@ def _extract_replay_graph_insights(events: list) -> dict:
                 break
         break  # only need the first matching event
     return out
+
+
+def _name_similarity(searched: str, canonical: str) -> int:
+    """Return 0–100 name similarity score using SequenceMatcher ratio."""
+    if not searched or not canonical:
+        return 0
+    return round(
+        _difflib.SequenceMatcher(None, searched.lower(), canonical.lower()).ratio() * 100
+    )
+
+
+def _extract_replay_entity(events: list, query: str) -> dict:
+    """Extract canonical name, company number, and status from trace events.
+
+    Primary path  — agent_reasoning event 'Resolved <query> → <canonical>':
+      1. Try data_json (structured payload).
+      2. Fall back to message parsing for canonical name, then supplement
+         company_number / status from the entity_lookup output_summary.
+
+    Final fallback — entity_lookup output_summary only.
+    """
+    def _from_lookup(events: list) -> tuple[str, str]:
+        """Return (company_number, status) from entity_lookup output_summary."""
+        for ev in events:
+            if ev.get("event_type") != "tool_returned":
+                continue
+            if ev.get("tool_name") != "entity_lookup":
+                continue
+            text = ev.get("output_summary") or ""
+            cn = ""
+            m = _re.search(r"number:\s*([A-Z0-9]+)", text, _re.IGNORECASE)
+            if m:
+                cn = m.group(1)
+            st = ""
+            m2 = _re.search(r"status:\s*(\w+)", text, _re.IGNORECASE)
+            if m2:
+                st = m2.group(1).capitalize()
+            if cn or st:
+                return cn, st
+        return "", ""
+
+    for ev in events:
+        if ev.get("event_type") != "agent_reasoning":
+            continue
+        msg = ev.get("input_summary") or ev.get("message") or ""
+        if not _re.search(
+            rf"Resolved\s+['\"]?{_re.escape(query)}['\"]?", msg, _re.IGNORECASE
+        ):
+            continue
+        # Try structured data_json first (present on newer traces)
+        raw = ev.get("data_json") or ""
+        if raw:
+            try:
+                d = _json.loads(raw)
+                return {
+                    "canonical_name":  d.get("canonical_name") or query,
+                    "company_number":  d.get("company_number") or "",
+                    "status":          d.get("status") or "",
+                    "match_score_pct": d.get("match_score_pct"),
+                }
+            except Exception:  # noqa: BLE001
+                pass
+        # data_json absent — parse canonical name from message, supplement rest
+        m = _re.search(r"→\s*['\"]?(.+?)['\"]?\s*$", msg)
+        canonical = m.group(1).strip() if m else query
+        cn, st = _from_lookup(events)
+        return {"canonical_name": canonical, "company_number": cn, "status": st}
+
+    # No agent_reasoning event found — use lookup data only
+    cn, st = _from_lookup(events)
+    return {"canonical_name": query, "company_number": cn, "status": st}
 
 
 def _extract_replay_company_number(events: list) -> str:
@@ -839,6 +915,25 @@ def _render_assessment_card(
         f'{subheadline_html}'
         f'{rec_html}'
         f'{summary_section}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_overall_risk_badge(overall_risk: "str | None") -> None:
+    """Render a prominent overall risk verdict badge in the Assessment column."""
+    if not overall_risk or overall_risk not in _RISK_COLORS:
+        return
+    tc, bg, border = _RISK_COLORS[overall_risk]
+    st.markdown(
+        f'<div style="margin:6px 0 14px 0">'
+        f'<div style="font-size:0.66em;font-weight:700;color:#6B7280;'
+        f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px">'
+        f'Overall Risk</div>'
+        f'<div style="background:{bg};color:{tc};border:2px solid {border};'
+        f'border-radius:8px;padding:6px 18px;font-size:1.0em;font-weight:800;'
+        f'display:inline-block;letter-spacing:0.05em">'
+        f'{_esc(overall_risk)}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -1297,18 +1392,37 @@ def _render_replay_trace_metadata(replay_data: dict) -> None:
 
 def render_app_header() -> None:
     """Full-width app title and subtitle rendered above the tab layout."""
+    result = state.get_result()
+    overall = _overall_risk_from_result(result) if result else None
+
+    if overall and overall in _RISK_COLORS:
+        tc, bg, border = _RISK_COLORS[overall]
+        badge_html = (
+            f'<div style="display:flex;align-items:center;gap:10px">'
+            f'<span style="font-size:0.7em;font-weight:700;color:#6B7280;'
+            f'text-transform:uppercase;letter-spacing:0.06em;white-space:nowrap">'
+            f'Overall Risk</span>'
+            f'<span style="background:{bg};color:{tc};border:2px solid {border};'
+            f'border-radius:8px;padding:5px 16px;font-size:1.15em;font-weight:800;'
+            f'letter-spacing:0.05em;white-space:nowrap">'
+            f'{_esc(overall)}</span>'
+            f'</div>'
+        )
+    else:
+        badge_html = ''
+
     st.markdown(
-        '<div style="padding:1.2rem 0 1.1rem 0;border-bottom:1px solid #E5E7EB;'
-        'margin-bottom:1.4rem">'
-        '<div style="font-size:1.55rem;font-weight:800;color:#111827;'
-        'letter-spacing:-0.02em;line-height:1.3">'
-        'Entity Risk AI'
-        '</div>'
-        '<div style="font-size:0.875rem;color:#6B7280;margin-top:5px;'
-        'font-weight:400;line-height:1.5">'
-        'Investigate ownership, risk, and traceable decisions'
-        '</div>'
-        '</div>',
+        f'<div style="padding:1.2rem 0 1.1rem 0;border-bottom:1px solid #E5E7EB;'
+        f'margin-bottom:1.4rem;display:flex;justify-content:space-between;align-items:center">'
+        f'<div>'
+        f'<div style="font-size:1.55rem;font-weight:800;color:#111827;'
+        f'letter-spacing:-0.02em;line-height:1.3">Entity Risk AI</div>'
+        f'<div style="font-size:0.875rem;color:#6B7280;margin-top:5px;'
+        f'font-weight:400;line-height:1.5">'
+        f'Investigate ownership, risk, and traceable decisions</div>'
+        f'</div>'
+        f'{badge_html}'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
@@ -1383,9 +1497,8 @@ def _render_resolved_entity_banner(entities: dict) -> None:
         else:
             canonical  = data.get("canonical_name", name)
             company_no = data.get("company_number", "")
-            exact      = data.get("exact_match", True)
             status     = data.get("status", "")
-            confidence = "High — exact match" if exact else "Closest match"
+            score      = data.get("match_score_pct") if data.get("match_score_pct") is not None else _name_similarity(name, canonical)
 
             def _meta_row(label: str, value: str, last: bool = False) -> str:
                 border = "" if last else "border-bottom:1px solid #D1FAE5;"
@@ -1400,10 +1513,9 @@ def _render_resolved_entity_banner(entities: dict) -> None:
             rows = ""
             if company_no:
                 rows += _meta_row("Company No.", company_no)
-            if status:
-                rows += _meta_row("Status", status)
+            rows += _meta_row("Status", status if status else "—")
             rows += _meta_row("Jurisdiction", "UK")
-            rows += _meta_row("Match confidence", confidence, last=True)
+            rows += _meta_row("Match score", f"{score}%", last=True)
 
             st.markdown(
                 f'<div style="background:#F0FDF4;border:1px solid #BBF7D0;'
@@ -1572,123 +1684,6 @@ def _extract_graph_insights(result: Any) -> dict:
     return out
 
 
-# Activity phase buckets used in the left-column live status list
-_ACTIVITY_PHASES: list[tuple[frozenset, str]] = [
-    (frozenset({"entity_lookup", "company_profile"}),
-     "Resolving entity"),
-    (frozenset({"expand_ownership", "sic_context", "shared_address_check"}),
-     "Mapping ownership"),
-    (frozenset({"ownership_complexity_check", "control_signal_check",
-                "address_risk_check", "industry_context_check"}),
-     "Evaluating risk signals"),
-    (frozenset({"summarize_risk_for_company"}),
-     "Generating assessment"),
-]
-
-
-def _render_activity_list() -> None:
-    """Compact activity list shown in the left column during execution.
-
-    Shows 4 high-level phases with ✔ / › / · markers — no warning colours.
-    """
-    live_steps  = state.get_live_steps()
-    live_cur    = state.get_live_current_step()
-    live_phase  = state.get_live_phase()
-
-    completed = {s.get("task") for s in live_steps}
-    current   = (live_cur or {}).get("task") if live_cur else None
-
-    rows_html = ""
-    for task_set, label in _ACTIVITY_PHASES:
-        is_done   = bool(completed & task_set)
-        is_active = bool(current and current in task_set) or (
-            live_phase == "resolving" and not is_done
-            and task_set == _ACTIVITY_PHASES[0][0]
-        )
-        if is_done:
-            icon, color, weight = "✔", "#16A34A", "500"
-        elif is_active:
-            icon, color, weight = "›", "#2563EB", "600"
-        else:
-            icon, color, weight = "·", "#9CA3AF", "400"
-        rows_html += (
-            f'<div style="display:flex;align-items:center;gap:10px;'
-            f'padding:6px 2px;border-bottom:1px solid #F3F4F6">'
-            f'<span style="font-size:0.92em;width:14px;color:{color};font-weight:700">'
-            f'{icon}</span>'
-            f'<span style="font-size:0.85em;color:{color};font-weight:{weight}">'
-            f'{_esc(label)}</span>'
-            f'</div>'
-        )
-    st.markdown(
-        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-        f'border-radius:8px;padding:10px 14px;margin:6px 0">'
-        f'{rows_html}'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-
-
-def _render_assessment_summary_card(
-    risk_level: "str | None",
-    summary: str,
-) -> None:
-    """Render the assessment summary card.
-
-    Shows: Assessment Level, Recommendation, Summary.
-    """
-    key = risk_level.upper() if risk_level else "UNKNOWN"
-    tc, bg, border = _RISK_COLORS.get(key, _RISK_COLORS["UNKNOWN"])
-    headline_text, headline_emoji = _RISK_HEADLINE.get(key, ("Assessment Complete", "✅"))
-    recommendation = _RISK_ACTION_REQUIRED.get(key, "—") or "—"
-    short          = summary.strip() or "—"
-
-    # Use neutral styling for UNKNOWN so it never looks like an error
-    if key == "UNKNOWN":
-        tc, bg, border = "#64748B", "#F8FAFC", "#E2E8F0"
-
-    def _row(label: str, value_html: str) -> str:
-        return (
-            f'<div style="display:flex;align-items:baseline;gap:10px;margin:5px 0">'
-            f'<span style="font-size:0.66em;font-weight:700;color:{tc};opacity:0.75;'
-            f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px;'
-            f'white-space:nowrap">{label}</span>'
-            f'{value_html}'
-            f'</div>'
-        )
-
-    _dash_span  = '<span style="color:#94A3B8;font-size:0.84em">—</span>'
-    level_html = (
-        f'<div style="display:flex;align-items:center;gap:10px;margin:8px 0 6px 0">'
-        f'<span style="font-size:0.66em;font-weight:700;color:{tc};opacity:0.75;'
-        f'text-transform:uppercase;letter-spacing:0.06em;min-width:120px">'
-        f'Assessment Level</span>'
-        f'{_risk_badge(key) if risk_level else _dash_span}'
-        f'</div>'
-    )
-    rec_html    = _row("Recommendation",
-                       f'<span style="font-size:0.84em;color:{tc};font-weight:500;'
-                       f'line-height:1.4">{_esc(recommendation)}</span>')
-    summary_html = (
-        f'<div style="font-size:0.66em;font-weight:700;color:{tc};opacity:0.75;'
-        f'text-transform:uppercase;letter-spacing:0.06em;margin:10px 0 4px 0">'
-        f'Summary</div>'
-        f'<div style="color:#374151;font-size:0.87em;line-height:1.65">'
-        f'{_esc(short)}</div>'
-    )
-
-    st.markdown(
-        f'<div style="background:{bg};border:1px solid {border};'
-        f'border-left:5px solid {tc};border-radius:8px;'
-        f'padding:16px 20px;margin:4px 0 12px 0">'
-        f'<div style="font-size:1.05em;font-weight:800;color:{tc};'
-        f'line-height:1.2;margin-bottom:2px">'
-        f'{headline_emoji} &nbsp;{_esc(headline_text)}</div>'
-        f'{level_html}{rec_html}{summary_html}'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
 
 
 # ===========================================================================
@@ -2039,6 +2034,68 @@ def _render_decision_first_assessment(assessment: dict) -> None:
     )
 
 
+def _build_replay_assessment(replay_data: dict) -> dict:
+    """Build a structured assessment dict from replay trace data.
+
+    Uses the same logic as ``_build_structured_assessment`` by reading the
+    full per-task findings from trace event data_json fields.
+    """
+    dims         = _extract_replay_risk_dimensions(replay_data)
+    all_findings = _extract_replay_all_findings(replay_data)
+    summary      = (replay_data.get("final_summary") or "").strip()
+    query        = replay_data.get("query", "")
+
+    # Overall risk = highest rated dimension
+    key = "UNKNOWN"
+    for v in dims.values():
+        if _RISK_ORDER.get(v, -1) > _RISK_ORDER.get(key, -1):
+            key = v
+
+    # Primary dimension — same priority order as _build_structured_assessment
+    primary_dim  = None
+    primary_risk = "UNKNOWN"
+    for dim in _DIM_PRIORITY:
+        lvl = dims.get(dim, "NOT RUN")
+        if _RISK_ORDER.get(lvl, -1) > _RISK_ORDER.get(primary_risk, -1):
+            primary_risk = lvl
+            primary_dim  = dim
+
+    # Decision title — same logic as _build_structured_assessment
+    any_material = any(v in ("HIGH", "MEDIUM") for v in dims.values())
+    if key in ("LOW", "UNKNOWN") and not any_material:
+        decision_title = "Low Risk — No Material Risk Signals"
+    elif primary_dim and key in ("HIGH", "MEDIUM", "LOW"):
+        level_word     = {"HIGH": "High Risk", "MEDIUM": "Moderate Risk", "LOW": "Low Risk"}[key]
+        decision_title = f"{level_word} — {_DIM_DISPLAY_LABELS.get(primary_dim, primary_dim.title())}"
+    elif key in ("HIGH", "MEDIUM", "LOW"):
+        decision_title = {
+            "HIGH":   "High Risk Identified",
+            "MEDIUM": "Moderate Risk Identified",
+            "LOW":    "Low Risk — Standard Profile",
+        }[key]
+    else:
+        decision_title = "Investigation Complete"
+
+    # Primary driver text — from findings; fall back to final_summary sentences
+    primary_task = _DIM_TASK_MAP.get(primary_dim or "", "")
+    if primary_task and primary_task in all_findings:
+        primary_driver_text = _format_risk_driver_text(
+            primary_task, all_findings[primary_task], query
+        )
+    else:
+        primary_driver_text = _first_sentences(summary, 2) if summary else "—"
+
+    return {
+        "overall_risk":          key,
+        "decision_title":        decision_title,
+        "primary_driver_label":  _DIM_DISPLAY_LABELS.get(primary_dim or "", ""),
+        "primary_driver_text":   primary_driver_text,
+        "secondary_signals":     _build_secondary_signals(all_findings, primary_task),
+        "no_immediate_concerns": _build_no_concerns(dims, all_findings),
+        "recommended_actions":   _build_recommended_actions(dims, all_findings, key),
+    }
+
+
 def _chip_click(prompt: str) -> None:
     """on_click callback for quick-prompt chips — populates the textarea."""
     st.session_state["_input_question"] = prompt
@@ -2056,6 +2113,139 @@ def _get_company_for_chips() -> str:
         if data:
             return data.get("canonical_name", "")
     return ""
+
+
+def _confirm_entity_click(sorted_candidates: list) -> None:
+    """on_click callback for 'Continue with selected entity' button.
+
+    Puts the confirmed candidate into the entity confirmation queue so the
+    blocked orchestrator thread can resume, then resets the selection state.
+    """
+    idx = st.session_state.get("_entity_selection_idx", 0) or 0
+    if 0 <= idx < len(sorted_candidates):
+        confirmed = sorted_candidates[idx]
+        confirm_q = st.session_state.get("entity_confirm_queue")
+        if confirm_q is not None:
+            try:
+                confirm_q.put_nowait(confirmed)
+            except Exception:  # noqa: BLE001
+                pass
+    # Clear modal state; let thread emit entity_resolved which advances phase
+    st.session_state["live_entity_candidates"] = []
+    st.session_state["live_entity_name"] = ""
+    state.set_live_phase("resolving")
+
+
+def _cancel_entity_click() -> None:
+    """on_click callback for entity selection 'Cancel' — resets to idle."""
+    confirm_q = st.session_state.get("entity_confirm_queue")
+    if confirm_q is not None:
+        try:
+            confirm_q.put_nowait(None)
+        except Exception:  # noqa: BLE001
+            pass
+    state.reset_live_state()
+    state.set_live_phase("idle")
+    st.session_state["run_queue"] = None  # discard stale run events
+
+
+def _render_entity_selection_modal(candidates: list, entity_name: str) -> None:
+    """Blocking entity selection panel — shown when multiple matches are found.
+
+    The investigation is paused until the user selects an entity and clicks
+    'Continue'.  Sorted Active-first, then by match score (preserved from
+    resolve_entity ordering which is already score-DESC).
+    """
+    def _pct(c: dict) -> int:
+        return _name_similarity(entity_name, c.get("name") or "")
+
+    sorted_candidates = sorted(candidates, key=lambda c: -_pct(c))
+
+    st.markdown(
+        f'<div style="background:#FFFBEB;border:1px solid #FDE68A;'
+        f'border-left:5px solid #D97706;border-radius:8px;'
+        f'padding:14px 18px;margin:8px 0 12px 0">'
+        f'<div style="font-size:0.72em;font-weight:700;color:#D97706;'
+        f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px">'
+        f'Entity selection required</div>'
+        f'<div style="font-size:0.88em;font-weight:700;color:#78350F;margin-bottom:2px">'
+        f'Multiple companies match &ldquo;{_esc(entity_name)}&rdquo;</div>'
+        f'<div style="font-size:0.80em;color:#92400E">'
+        f'Choose the correct entity to proceed.</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    selected_idx = st.radio(
+        "Select entity",
+        options=list(range(len(sorted_candidates))),
+        format_func=lambda i: (
+            f"{sorted_candidates[i].get('name', '?')}  ·  "
+            f"No. {sorted_candidates[i].get('company_number', '?')}  ·  "
+            f"{sorted_candidates[i].get('status', 'Unknown')}  ·  "
+            f"{_pct(sorted_candidates[i])}% match"
+        ),
+        label_visibility="collapsed",
+        key="_entity_selection_idx",
+    )
+
+    # Detail card for the highlighted selection
+    if selected_idx is not None and 0 <= selected_idx < len(sorted_candidates):
+        c = sorted_candidates[selected_idx]
+        cname  = (c.get("name") or "").upper()
+        cno    = c.get("company_number") or ""
+        cstatus = c.get("status") or ""
+        exact  = (c.get("name") or "").lower() == entity_name.lower()
+        confidence = "High — exact match" if exact else "Closest match"
+
+        def _meta_row(label: str, value: str, last: bool = False) -> str:
+            border = "" if last else "border-bottom:1px solid #FEF3C7;"
+            return (
+                f'<div style="display:flex;justify-content:space-between;padding:4px 0;{border}">'
+                f'<span style="font-size:0.78em;color:#D97706">{_esc(label)}</span>'
+                f'<span style="font-size:0.78em;font-weight:600;color:#78350F">{_esc(value)}</span>'
+                f'</div>'
+            )
+
+        rows = ""
+        if cno:
+            rows += _meta_row("Company No.", cno)
+        if cstatus:
+            rows += _meta_row("Status", cstatus)
+        rows += _meta_row("Match score", f"{_pct(c)}%")
+        rows += _meta_row("Jurisdiction", "UK")
+        rows += _meta_row("Match confidence", confidence, last=True)
+
+        st.markdown(
+            f'<div style="background:#FFFBEB;border:1px solid #FDE68A;'
+            f'border-left:4px solid #D97706;border-radius:6px;'
+            f'padding:10px 14px;margin:4px 0 10px 0">'
+            f'<div style="font-size:0.62em;font-weight:700;color:#D97706;'
+            f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px">'
+            f'Selected Entity</div>'
+            f'<div style="font-size:0.94em;color:#78350F;font-weight:800;'
+            f'margin-bottom:7px">{_esc(cname)}</div>'
+            f'{rows}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        st.button(
+            "Continue with selected entity",
+            type="primary",
+            use_container_width=True,
+            on_click=_confirm_entity_click,
+            args=(sorted_candidates,),
+            disabled=(selected_idx is None),
+        )
+    with btn_col2:
+        st.button(
+            "Cancel",
+            use_container_width=True,
+            on_click=_cancel_entity_click,
+        )
 
 
 # ===========================================================================
@@ -2155,20 +2345,18 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
         key="_input_question",
     )
 
-    # Quick-prompt chips — populate the textarea via on_click callback
+    # Quick-prompt chips — 2-row layout prevents overflow
     company = _get_company_for_chips()
     _c = f" {company}" if company else " [COMPANY]"
     _chip_defs = [
-        ("Ownership",       f"Who owns{_c}?"),
-        ("Address",    f"Does{_c} show any address-related risk signals?"),
-        ("Control", f"Does{_c} show any control-related risk signals?"),
-        ("Industry", f"Does{_c} show any industry-related risk signals?"),
-        ("Full analysis",   (
-            f"Who owns{_c} and are there any risks?"
-        )),
+        ("Ownership",    f"Who owns{_c}?"),
+        ("Address",      f"Does{_c} show any address-related risk signals?"),
+        ("Control",      f"Does{_c} show any control-related risk signals?"),
+        ("Industry",     f"Does{_c} show any industry-related risk signals?"),
+        ("Full Analysis", f"Who owns{_c} and are there any risks?"),
     ]
-    chip_cols = st.columns(5)
-    for col, (label, prompt) in zip(chip_cols, _chip_defs):
+    _chip_row1 = st.columns(4)
+    for col, (label, prompt) in zip(_chip_row1, _chip_defs[:4]):
         col.button(
             label,
             use_container_width=True,
@@ -2176,8 +2364,16 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
             on_click=_chip_click,
             args=(prompt,),
         )
+    st.button(
+        "Full analysis",
+        use_container_width=True,
+        key="_chip_Full_analysis",
+        on_click=_chip_click,
+        args=(_chip_defs[4][1],),
+    )
 
-    _running   = state.get_live_phase() in ("planning", "resolving", "executing")
+    live_phase = state.get_live_phase()
+    _running   = live_phase in ("planning", "resolving", "selecting", "executing")
     _btn_label = "Running…" if _running else "Run Risk Analysis"
     submitted  = st.button(
         _btn_label,
@@ -2190,6 +2386,16 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
         state.reset_all_run_state()
         st.session_state["_trigger_run"] = True
         st.rerun()
+
+    # Entity selection modal — blocking until user confirms (phase == "selecting")
+    if live_phase == "selecting":
+        candidates  = state.get_live_candidates()
+        entity_name = state.get_live_entity_name()
+        if candidates:
+            _render_entity_selection_modal(candidates, entity_name)
+            st.divider()
+            _render_live_risk_assessment(live_dims)
+            return
 
     # Entity card — shown as soon as entity is resolved (before full result)
     live_entities = state.get_live_entities()
@@ -2223,8 +2429,6 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
                 show_pending_rows=False,
             )
         else:
-            # Show execution progress above the skeleton card
-            _render_activity_list()
             _render_assessment_card_skeleton()
             # If any signals arrived (individual tasks mode), show them
             has_signals = any(
@@ -2737,30 +2941,31 @@ def render_replay_tab(components: "AppComponents") -> None:
 def _render_replay_input_column(components: "AppComponents") -> None:
     """Col 1 of the Replay tab: trace loader + entity banner + assessment card.
 
-    Mirrors _render_input_column from the Investigate tab.
+    Reuses _render_resolved_entity_banner and _render_decision_first_assessment
+    to keep identical structure to the Investigate tab.
     """
     replay_status = state.get_replay_status()
     replay_data   = state.get_replay_data()
     replay_error  = state.get_replay_error()
 
-    _section_header("🎬 Replay / Audit", "Load a previous investigation by trace ID")
+    _section_header("🔍 Company Risk Investigator", "Investigate ownership, control, and risk signals for a UK company")
 
     _loading = (replay_status == "loading")
     replay_id = st.text_input(
         label="Trace ID",
         label_visibility="collapsed",
         value=state.get_replay_trace_id() or "",
-        placeholder="Enter a trace ID to replay a past investigation…",
+        placeholder="Enter a trace ID to load a past investigation…",
         key="_input_replay_trace_id",
         disabled=_loading,
     )
 
     if replay_status == "loaded" and replay_data:
-        if st.button("Clear Replay", type="primary", use_container_width=True):
+        if st.button("Clear", type="primary", use_container_width=True):
             st.session_state["_clear_replay"] = True
     else:
         load_clicked = st.button(
-            "Loading…" if _loading else "Load Trace",
+            "Loading…" if _loading else "Load Replay",
             type="primary",
             use_container_width=True,
             disabled=_loading,
@@ -2768,8 +2973,6 @@ def _render_replay_input_column(components: "AppComponents") -> None:
         if load_clicked and replay_id.strip():
             state.set_replay_trace_id(replay_id.strip())
             st.session_state["_trigger_replay"] = True
-
-    st.caption("Enter a trace ID to replay a past investigation.")
 
     if replay_status == "loading":
         st.markdown(
@@ -2790,7 +2993,7 @@ def _render_replay_input_column(components: "AppComponents") -> None:
             unsafe_allow_html=True,
         )
     elif replay_status == "loaded" and replay_data:
-        # Original question — shown first
+        # Original question — secondary priority, shown as a compact card
         question = replay_data.get("question", "")
         if question:
             st.markdown(
@@ -2805,29 +3008,18 @@ def _render_replay_input_column(components: "AppComponents") -> None:
                 f'</div>',
                 unsafe_allow_html=True,
             )
-        # Identified entity banner
+
+        # Identified entity — uses the same card as Investigate tab
         query = replay_data.get("query", "")
         if query:
             events_col1 = replay_data.get("events") or []
-            company_no = _extract_replay_company_number(events_col1)
-            no_str = f". (No. {company_no})" if company_no else ""
-            st.markdown(
-                f'<div style="background:#F0FDF4;border:1px solid #BBF7D0;'
-                f'border-left:4px solid #16A34A;border-radius:6px;'
-                f'padding:10px 14px;margin:8px 0">'
-                f'<div style="font-size:0.66em;font-weight:700;color:#16A34A;'
-                f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:3px">'
-                f'Identified Entity</div>'
-                f'<div style="font-size:0.92em;color:#14532D;font-weight:700">'
-                f'✔ {_esc(query)}{_esc(no_str)}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+            entity_info = _extract_replay_entity(events_col1, query)
+            _render_resolved_entity_banner({query: entity_info})
 
     st.divider()
 
-    # Assessment Summary card
-    _section_header("📊 Assessment Summary")
+    # Risk Assessment card — uses the same component as Investigate tab
+    _section_header("📊 Risk Assessment")
     if replay_status == "idle":
         _render_assessment_card_skeleton("Load a trace to see the assessment.", show_pending_rows=False)
     elif replay_status == "loading":
@@ -2835,17 +3027,14 @@ def _render_replay_input_column(components: "AppComponents") -> None:
     elif replay_status == "error":
         _render_assessment_card_skeleton("Could not load investigation.")
     elif replay_status == "loaded" and replay_data:
-        summary = replay_data.get("final_summary") or ""
-        if summary:
-            # Derive overall risk from per-dimension data (more reliable than text parsing)
-            _replay_dims = _extract_replay_risk_dimensions(replay_data)
-            _RISK_ORDER_LOCAL = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-            risk_level = max(
-                (v for v in _replay_dims.values() if v in _RISK_ORDER_LOCAL),
-                key=lambda v: _RISK_ORDER_LOCAL[v],
-                default=None,
-            ) or _risk_from_summary(summary)
-            _render_assessment_summary_card(risk_level, summary)
+        has_summary = bool(replay_data.get("final_summary"))
+        has_dims    = any(
+            v in ("HIGH", "MEDIUM", "LOW")
+            for v in _extract_replay_risk_dimensions(replay_data).values()
+        )
+        if has_summary or has_dims:
+            assessment = _build_replay_assessment(replay_data)
+            _render_decision_first_assessment(assessment)
         else:
             _render_assessment_card_skeleton("No summary recorded for this investigation.", show_pending_rows=False)
 
@@ -2974,8 +3163,9 @@ def _render_replay_insights_column() -> None:
         unsafe_allow_html=True,
     )
 
-    # Key Risk Drivers
     replay_dims = _extract_replay_risk_dimensions(replay_data)
+
+    # Key Risk Drivers
     if any(v in ("HIGH", "MEDIUM", "LOW") for v in replay_dims.values()):
         _label_row("Key Risk Drivers")
         _render_risk_drivers_grid(replay_dims)

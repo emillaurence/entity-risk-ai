@@ -52,6 +52,9 @@ details { border-radius: 6px !important; }
 /* ── Text area ─────────────────────────────────────── */
 textarea { font-size: 0.9em !important; }
 
+/* ── Quick-prompt chip buttons — no text wrapping ──── */
+button p { white-space: nowrap !important; overflow: hidden; text-overflow: ellipsis; }
+
 /* ── Success / error message containers ───────────── */
 [data-testid="stAlert"] { border-radius: 8px !important; }
 

@@ -53,12 +53,26 @@ _log = get_app_logger()
 def _start_investigation(components: AppComponents, question: str) -> None:
     """Reset live state, start the orchestrator in a background thread, and
     seed the run queue so the UI picks up progress events on each rerun.
+
+    Creates an ``entity_confirm_queue`` so the orchestrator thread can block
+    on entity selection when multiple candidates are returned.  Any prior
+    confirmation queue is signalled with ``None`` first to unblock stale threads.
     """
+    # Unblock any previously blocking orchestrator thread
+    old_cq: "_queue.Queue | None" = st.session_state.get("entity_confirm_queue")
+    if old_cq is not None:
+        try:
+            old_cq.put_nowait(None)
+        except Exception:  # noqa: BLE001
+            pass
+
     state.reset_live_state()
     state.reset_replay_state()   # dismiss replay view when a new run starts
 
     q: _queue.Queue = _queue.Queue()
-    st.session_state["run_queue"] = q
+    confirm_q: _queue.Queue = _queue.Queue()
+    st.session_state["run_queue"]            = q
+    st.session_state["entity_confirm_queue"] = confirm_q
 
     log_event("investigation_started", question=question[:120])
 
@@ -67,7 +81,11 @@ def _start_investigation(components: AppComponents, question: str) -> None:
 
     def thread_func() -> None:
         try:
-            result = components.orchestrator.run(question, on_progress=on_progress)
+            result = components.orchestrator.run(
+                question,
+                on_progress=on_progress,
+                confirmation_queue=confirm_q,
+            )
             q.put({"event": "done", "data": {"result": result}})
         except Exception as exc:  # noqa: BLE001
             _log.error("Investigation thread error: %s", exc)

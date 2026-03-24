@@ -48,7 +48,7 @@ _KEY_STATUS          = "execution_status"
 _KEY_STEPS_REVEALED  = "steps_revealed"
 
 # Live / progressive rendering state
-_KEY_LIVE_PHASE       = "live_phase"         # "idle"|"planning"|"resolving"|"executing"|"done"
+_KEY_LIVE_PHASE       = "live_phase"         # "idle"|"planning"|"resolving"|"selecting"|"executing"|"done"
 _KEY_LIVE_PLAN        = "live_plan"          # dict | None
 _KEY_LIVE_ENTITIES    = "live_entities"      # dict[str, dict | None]
 _KEY_LIVE_STEPS       = "live_steps"         # list[dict] — completed steps (as dicts)
@@ -57,6 +57,8 @@ _KEY_LIVE_TRACE_ID    = "live_trace_id"      # str | None
 _KEY_LIVE_STEP_NUM    = "live_step_num"      # int — 1-based current step, 0 if none
 _KEY_LIVE_STEP_TOTAL  = "live_step_total"    # int — total planned steps, 0 if unknown
 _KEY_LIVE_STEP_LABEL  = "live_step_label"    # str — business-friendly current step label
+_KEY_LIVE_CANDIDATES  = "live_entity_candidates"  # list[dict] — entity candidates awaiting selection
+_KEY_LIVE_ENTITY_NAME = "live_entity_name"         # str — original query name being confirmed
 
 # Replay / audit state
 _KEY_REPLAY_DATA   = "replay_data"    # dict from trace_repo.load_trace() | None
@@ -79,6 +81,8 @@ _DEFAULTS: dict[str, Any] = {
     _KEY_LIVE_STEP_NUM:   0,
     _KEY_LIVE_STEP_TOTAL: 0,
     _KEY_LIVE_STEP_LABEL: "",
+    _KEY_LIVE_CANDIDATES:  [],
+    _KEY_LIVE_ENTITY_NAME: "",
     _KEY_REPLAY_DATA:     None,
     _KEY_REPLAY_STATUS:   "idle",
     _KEY_REPLAY_ERROR:    None,
@@ -302,6 +306,16 @@ def get_live_step_label() -> str:
     return st.session_state.get(_KEY_LIVE_STEP_LABEL, "")
 
 
+def get_live_candidates() -> list:
+    """Return entity candidates awaiting user selection (empty when not in 'selecting' phase)."""
+    return st.session_state.get(_KEY_LIVE_CANDIDATES, [])
+
+
+def get_live_entity_name() -> str:
+    """Return the original query entity name awaiting confirmation."""
+    return st.session_state.get(_KEY_LIVE_ENTITY_NAME, "")
+
+
 def reset_all_run_state() -> None:
     """Clear every piece of state that carries over from a previous run.
 
@@ -329,6 +343,8 @@ def reset_live_state() -> None:
     st.session_state[_KEY_LIVE_STEP_NUM]    = 0
     st.session_state[_KEY_LIVE_STEP_TOTAL]  = 0
     st.session_state[_KEY_LIVE_STEP_LABEL]  = ""
+    st.session_state[_KEY_LIVE_CANDIDATES]  = []
+    st.session_state[_KEY_LIVE_ENTITY_NAME] = ""
     # Clear previous result/trace so placeholders show correctly
     st.session_state[_KEY_RESULT]           = None
     st.session_state[_KEY_TRACE_ID]         = None
@@ -392,11 +408,18 @@ def drain_run_queue() -> tuple[int, bool]:
             elif etype == "trace_created":
                 st.session_state[_KEY_LIVE_TRACE_ID] = data.get("trace_id")
 
+            elif etype == "entity_candidates":
+                st.session_state[_KEY_LIVE_CANDIDATES]  = data.get("candidates", [])
+                st.session_state[_KEY_LIVE_ENTITY_NAME] = data.get("name", "")
+                st.session_state[_KEY_LIVE_PHASE]       = "selecting"
+
             elif etype == "entity_resolved":
                 entities = dict(st.session_state.get(_KEY_LIVE_ENTITIES) or {})
                 entities.update(data)
                 st.session_state[_KEY_LIVE_ENTITIES] = entities
-                st.session_state[_KEY_LIVE_PHASE]    = "executing"
+                # Only advance phase if we're past the selecting step
+                if st.session_state.get(_KEY_LIVE_PHASE) not in ("selecting",):
+                    st.session_state[_KEY_LIVE_PHASE] = "executing"
 
             elif etype == "step_starting":
                 st.session_state[_KEY_LIVE_CURRENT] = data

@@ -36,7 +36,10 @@ Trace queries skip entity resolution entirely. trace-agent steps run uncondition
 
 from __future__ import annotations
 
+import difflib as _difflib
+import json as _json
 import logging
+import queue as _queue_mod
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -256,7 +259,13 @@ class Orchestrator:
     # Public interface
     # ------------------------------------------------------------------
 
-    def run(self, query: str, user_id: str = "system", on_progress: Any = None) -> OrchestratorResult:
+    def run(
+        self,
+        query: str,
+        user_id: str = "system",
+        on_progress: Any = None,
+        confirmation_queue: "_queue_mod.Queue | None" = None,
+    ) -> OrchestratorResult:
         """
         Execute a full investigation from a natural-language query.
 
@@ -360,10 +369,96 @@ class Orchestrator:
 
                 res = self._mcp.call_tool("resolve_entity", {"name": entity.name})
                 if res.success and (res.data or {}).get("canonical_name"):
-                    resolved[entity.name] = {**res.data, "resolved": True}
-                    canonical    = res.data["canonical_name"]
-                    company_no   = res.data.get("company_number", "")
-                    exact_match  = res.data.get("exact_match", True)
+                    all_matches = (res.data or {}).get("all_matches", [])
+                    match_count = (res.data or {}).get("match_count", 1)
+
+                    # Compute max score for later score_pct calculation
+                    _raw_scores = [float(c.get("score") or 0) for c in all_matches]
+                    _max_score  = max(_raw_scores) if _raw_scores else 1.0
+                    # "Perfect" = candidate name is an exact match for the searched name
+                    _perfect = [
+                        c for c in all_matches
+                        if (c.get("name") or "").lower().strip() == entity.name.lower().strip()
+                    ]
+
+                    confirmed: dict | None = None
+                    _modal_shown = False
+
+                    if len(_perfect) == 1:
+                        # Single perfect match — auto-select without prompting
+                        confirmed = _perfect[0]
+                    elif confirmation_queue is not None and match_count > 1:
+                        # Multiple candidates → show modal
+                        # Only perfect matches if any; otherwise top 5 by score
+                        modal_candidates = _perfect if _perfect else sorted(
+                            all_matches,
+                            key=lambda c: -round(
+                                _difflib.SequenceMatcher(
+                                    None, entity.name.lower(), (c.get("name") or "").lower()
+                                ).ratio() * 100
+                            ),
+                        )[:5]
+                        _modal_shown = True
+                        if on_progress:
+                            on_progress("entity_candidates", {
+                                "name": entity.name,
+                                "candidates": modal_candidates,
+                                "match_count": len(modal_candidates),
+                            })
+                        try:
+                            confirmed = confirmation_queue.get(timeout=300)
+                        except _queue_mod.Empty:
+                            confirmed = None
+
+                    if _modal_shown and confirmed is None:
+                        _log.info(
+                            "[%s] Entity selection cancelled for '%s'",
+                            _short, entity.name,
+                        )
+                        if on_progress:
+                            on_progress("error", {"error": "Investigation cancelled."})
+                        return OrchestratorResult(
+                            mode=plan.mode,
+                            query=query,
+                            trace_id=trace.request_id,
+                            success=False,
+                            planner_output=plan.to_dict(),
+                            resolved_entities={},
+                            step_results=[],
+                            final_answer="Investigation was cancelled during entity selection.",
+                            warnings=warnings,
+                            errors=["Investigation cancelled."],
+                        )
+
+                    if confirmed is not None:
+                        # Use the auto-selected or user-confirmed candidate
+                        confirmed_name = confirmed.get("name") or confirmed.get("canonical_name", entity.name)
+                        _score_pct = round(
+                            _difflib.SequenceMatcher(
+                                None, entity.name.lower(), confirmed_name.lower()
+                            ).ratio() * 100
+                        )
+                        resolved[entity.name] = {
+                            "canonical_name":  confirmed_name,
+                            "company_number":  confirmed.get("company_number"),
+                            "status":          confirmed.get("status"),
+                            "exact_match":     confirmed_name.lower() == entity.name.lower(),
+                            "match_count":     match_count,
+                            "match_score_pct": _score_pct,
+                            "resolved":        True,
+                        }
+                    else:
+                        _best_name = (res.data or {}).get("canonical_name", entity.name)
+                        _score_pct = round(
+                            _difflib.SequenceMatcher(
+                                None, entity.name.lower(), _best_name.lower()
+                            ).ratio() * 100
+                        )
+                        resolved[entity.name] = {**res.data, "resolved": True, "match_score_pct": _score_pct}
+
+                    canonical   = resolved[entity.name]["canonical_name"]
+                    company_no  = resolved[entity.name].get("company_number", "")
+                    exact_match = resolved[entity.name].get("exact_match", True)
                     _log.info(
                         "[%s] Entity resolved: '%s' → '%s' (number=%s exact=%s)",
                         _short, entity.name, canonical, company_no, exact_match,
@@ -375,7 +470,15 @@ class Orchestrator:
                         TraceEvent(
                             event_type=EventType.AGENT_REASONING,
                             message=f"Resolved '{entity.name}' → '{canonical}'",
-                            payload=res.data,
+                            payload={
+                                **(res.data or {}),
+                                "data_json": _json.dumps({
+                                    "canonical_name":  resolved[entity.name].get("canonical_name"),
+                                    "company_number":  resolved[entity.name].get("company_number"),
+                                    "status":          resolved[entity.name].get("status"),
+                                    "match_score_pct": resolved[entity.name].get("match_score_pct"),
+                                }),
+                            },
                         ),
                         entity_refs=[{"label": "Company", "name": canonical}],
                     )
