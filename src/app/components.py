@@ -2067,6 +2067,150 @@ def _build_agraph_data(
     return nodes, edges, node_meta
 
 
+# ---------------------------------------------------------------------------
+# Interactive node detail panel
+# ---------------------------------------------------------------------------
+
+_RISK_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "HIGH":    ("#B91C1C", "#FEF2F2"),
+    "MEDIUM":  ("#92400E", "#FFFBEB"),
+    "LOW":     ("#14532D", "#F0FDF4"),
+}
+
+_STATUS_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "Active":   ("#14532D", "#F0FDF4"),
+    "Dissolved": ("#6B7280", "#F3F4F6"),
+}
+
+_DIM_LABEL_MAP: dict[str, str] = {
+    "ownership": "Ownership",
+    "address":   "Address",
+    "control":   "Control",
+    "industry":  "Industry",
+}
+
+
+def _render_node_detail_panel(
+    selected_id: str,
+    node_meta: dict[str, dict],
+    edge_meta: dict[str, dict],
+) -> None:
+    """Render a concise, human-readable detail panel for the selected node.
+
+    Shows: full name, type, why it is in the graph, company number/status when
+    available, a risk badge, and a compact list of direct connections.
+    """
+    meta = node_meta.get(selected_id)
+    if not meta:
+        return
+
+    _label_row("Selected Node")
+    with st.container(border=True):
+        # Full name + type header
+        st.markdown(
+            f'<div style="font-weight:600;font-size:0.9em;color:#111827;'
+            f'margin-bottom:2px">{_esc(meta["full_name"])}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Type + dimension badge on same row
+        dim_label = _DIM_LABEL_MAP.get(meta.get("dimension", ""), "")
+        badge_html = ""
+        _NODE_DIM_BADGE: dict[str, tuple[str, str]] = {
+            "ownership": ("#DBEAFE", "#1D4ED8"),
+            "address":   ("#FEF3C7", "#D97706"),
+            "control":   ("#F3E8FF", "#7C3AED"),
+            "industry":  ("#F0FDF4", "#15803D"),
+        }
+        if dim_label:
+            bg, fg = _NODE_DIM_BADGE.get(meta.get("dimension", ""), ("#F3F4F6", "#374151"))
+            badge_html = (
+                f'<span style="font-size:0.7em;font-weight:600;'
+                f'background:{bg};color:{fg};border-radius:3px;padding:1px 5px;'
+                f'margin-left:6px">{_esc(dim_label)}</span>'
+            )
+        st.markdown(
+            f'<div style="font-size:0.8em;color:#6B7280;margin-bottom:4px">'
+            f'{_esc(meta.get("type", ""))}{badge_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Why in graph
+        if meta.get("why_in_graph"):
+            st.markdown(
+                f'<div style="font-size:0.78em;color:#4B5563;margin-bottom:4px">'
+                f'{_esc(meta["why_in_graph"])}</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Company number + status (when available)
+        detail_parts: list[str] = []
+        if meta.get("company_number"):
+            detail_parts.append(f'No. {_esc(meta["company_number"])}')
+        if meta.get("status"):
+            sc, sb = _STATUS_BADGE_STYLE.get(meta["status"], ("#374151", "#F9FAFB"))
+            detail_parts.append(
+                f'<span style="background:{sb};color:{sc};border-radius:3px;'
+                f'padding:0 4px;font-size:0.85em">{_esc(meta["status"])}</span>'
+            )
+        if meta.get("address_count"):
+            detail_parts.append(f'{meta["address_count"]} co-located')
+        if detail_parts:
+            st.markdown(
+                f'<div style="font-size:0.78em;color:#6B7280;margin-bottom:4px">'
+                + " &nbsp;·&nbsp; ".join(detail_parts) + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        # Risk relevance badge
+        risk = (meta.get("risk_relevance") or "").upper()
+        if risk in _RISK_BADGE_STYLE:
+            rc, rb = _RISK_BADGE_STYLE[risk]
+            st.markdown(
+                f'<div style="font-size:0.75em;font-weight:600;'
+                f'background:{rb};color:{rc};border-radius:3px;'
+                f'padding:2px 7px;display:inline-block;margin-bottom:4px">'
+                f'{risk} RISK</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Connected edges — compact list
+    connected = [
+        em for em in edge_meta.values()
+        if em.get("source") == selected_id or em.get("target") == selected_id
+    ]
+    if connected:
+        _label_row("Connections")
+        rows_html = ""
+        for em in connected[:5]:
+            other = em["target"] if em["source"] == selected_id else em["source"]
+            other_meta = node_meta.get(other, {})
+            other_name = _esc(other_meta.get("full_name") or other)
+            edge_type  = _esc(em.get("type") or "—")
+            pct        = em.get("ownership_pct") or ""
+            pct_part   = f" <span style='color:#9CA3AF'>({_esc(pct)})</span>" if pct else ""
+            direction  = "→" if em["source"] == selected_id else "←"
+            rows_html += (
+                f'<div style="display:flex;align-items:center;gap:6px;'
+                f'padding:3px 0;border-bottom:1px solid #F3F4F6;font-size:0.78em">'
+                f'<span style="color:#9CA3AF;flex-shrink:0">{direction}</span>'
+                f'<span style="color:#374151;font-weight:500">{other_name}</span>'
+                f'<span style="color:#9CA3AF;font-size:0.9em">{edge_type}{pct_part}</span>'
+                f'</div>'
+            )
+        if len(connected) > 5:
+            rows_html += (
+                f'<div style="font-size:0.75em;color:#9CA3AF;padding:3px 0">'
+                f'+{len(connected) - 5} more connections</div>'
+            )
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-radius:6px;padding:6px 10px;margin:4px 0">'
+            f'{rows_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 # ===========================================================================
 # STRUCTURED ASSESSMENT — decision-first rendering
 # ===========================================================================
@@ -2914,47 +3058,27 @@ def _render_graph_column(components: "AppComponents") -> None:
             st.session_state["_graph_result_trace"] = trace_key
             st.session_state.pop("_graph_selected_node", None)
 
-        question     = state.get_question()
-        intent       = _detect_graph_intent(question)
-        risk_findings = _get_all_risk_findings(result)
+        question = state.get_question()
 
-        node_meta: dict = {}
+        payload = None
         try:
+            from src.app.contextual_graph import build_contextual_graph_model
             from streamlit_agraph import Config, agraph
 
-            nodes, edges, node_meta = _build_agraph_data(
-                result,
-                intent=intent,
-                risk_findings=risk_findings,
-                repo=components.repo,
-            )
-            if nodes:
+            payload = build_contextual_graph_model(question, result, repo=components.repo)
+            if payload.nodes:
                 config = Config(
                     height=560,
                     directed=True,
-                    physics=False,
-                    hierarchical=True,
+                    physics=True,
                     **{
-                        "layout": {
-                            "hierarchical": {
-                                "enabled":             True,
-                                "direction":           "LR",
-                                "sortMethod":          "directed",
-                                "levelSeparation":     220,
-                                "nodeSpacing":         130,
-                                "treeSpacing":         150,
-                                "blockShifting":       True,
-                                "edgeMinimization":    True,
-                                "parentCentralization": False,
-                            }
-                        },
                         "interaction": {
                             "hover":                True,
                             "tooltipDelay":         100,
                             "selectConnectedEdges": True,
                         },
                         "edges": {
-                            "smooth":  {"enabled": False},
+                            "smooth":  {"enabled": True},
                             "arrows":  {"to": {"enabled": True, "scaleFactor": 0.7}},
                             "font":    {"size": 10, "align": "middle",
                                         "strokeWidth": 2, "strokeColor": "#F8FAFC"},
@@ -2964,7 +3088,7 @@ def _render_graph_column(components: "AppComponents") -> None:
                         },
                     },
                 )
-                raw_selection = agraph(nodes=nodes, edges=edges, config=config)
+                raw_selection = agraph(nodes=payload.nodes, edges=payload.edges, config=config)
                 # Persist the last non-None selection across reruns
                 if raw_selection is not None:
                     st.session_state["_graph_selected_node"] = raw_selection
@@ -2973,72 +3097,83 @@ def _render_graph_column(components: "AppComponents") -> None:
         except Exception:
             st.caption("Graph could not be rendered.")
 
-        # Compact colour legend + intent badge
-        _INTENT_LABELS = {
-            "ownership": ("Ownership view", "#DBEAFE", "#1D4ED8"),
-            "address":   ("Address view",   "#FEF3C7", "#D97706"),
-            "control":   ("Control view",   "#F3E8FF", "#7C3AED"),
-            "risk":      ("Risk overview",  "#F0FDF4", "#15803D"),
-        }
-        intent_lbl, intent_bg, intent_fg = _INTENT_LABELS.get(
-            intent, ("Risk overview", "#F0FDF4", "#15803D")
-        )
-        legend_html = (
-            f'<span style="margin-right:12px;font-size:0.73em;color:#6B7280">'
-            f'<span style="color:{_LEGEND_FOCAL}">■</span> Focal entity</span>'
-            f'<span style="margin-right:12px;font-size:0.73em;color:#6B7280">'
-            f'<span style="color:{_LEGEND_COMPANY}">■</span> Company</span>'
-            f'<span style="margin-right:12px;font-size:0.73em;color:#6B7280">'
-            f'<span style="color:{_LEGEND_PERSON}">■</span> Individual / UBO</span>'
-            f'<span style="font-size:0.73em;color:#6B7280">'
-            f'<span style="color:{_LEGEND_ADDRESS}">■</span> Address</span>'
-            f'<span style="float:right;font-size:0.72em;font-weight:600;'
-            f'background:{intent_bg};color:{intent_fg};'
-            f'border-radius:4px;padding:1px 7px">{intent_lbl}</span>'
-        )
-        st.markdown(f'<div style="margin:4px 0 10px">{legend_html}</div>',
-                    unsafe_allow_html=True)
+        if payload is not None:
+            # Compact colour legend + mixed-dimension view badge
+            _DIM_BADGE_COLORS: dict[str, tuple[str, str]] = {
+                "ownership": ("#DBEAFE", "#1D4ED8"),
+                "address":   ("#FEF3C7", "#D97706"),
+                "control":   ("#F3E8FF", "#7C3AED"),
+                "industry":  ("#F0FDF4", "#15803D"),
+            }
+            LEGEND_FOCAL   = "#1D4ED8"
+            LEGEND_COMPANY = "#93C5FD"
+            LEGEND_PERSON  = "#34D399"
+            LEGEND_ADDRESS = "#FCD34D"
+            LEGEND_COLOC   = "#EAB308"
+            intent_bg, intent_fg = _DIM_BADGE_COLORS.get(
+                payload.primary_driver, ("#F0FDF4", "#15803D")
+            )
+            intent_lbl = payload.view_label
 
-        # Selected node detail panel (shown only after a node is clicked)
-        selected_id = st.session_state.get("_graph_selected_node")
-        if selected_id and selected_id in node_meta:
-            meta = node_meta[selected_id]
-            _label_row("Selected Node")
-            with st.container(border=True):
-                st.markdown(
-                    f'<div style="font-weight:600;font-size:0.9em;color:#111827;'
-                    f'margin-bottom:2px">{_esc(meta["full_name"])}</div>',
-                    unsafe_allow_html=True,
+            _show_coloc    = "address"  in payload.rendered_dimensions
+            _show_industry = "industry" in payload.rendered_dimensions
+            LEGEND_SIC     = "#8B5CF6"
+            legend_html = (
+                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+                f'<span style="color:{LEGEND_FOCAL}">■</span> Focal entity</span>'
+                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+                f'<span style="color:{LEGEND_COMPANY}">■</span> Company</span>'
+                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+                f'<span style="color:{LEGEND_PERSON}">■</span> Individual / UBO</span>'
+                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+                f'<span style="color:{LEGEND_ADDRESS}">■</span> Address</span>'
+                + (
+                    f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+                    f'<span style="color:{LEGEND_COLOC}">■</span> Co-located</span>'
+                    if _show_coloc else ""
                 )
-                st.caption(meta["type"])
-                if meta.get("context"):
-                    st.caption(meta["context"])
+                + (
+                    f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+                    f'<span style="color:{LEGEND_SIC}">■</span> Industry</span>'
+                    if _show_industry else ""
+                ) +
+                f'<span style="float:right;font-size:0.72em;font-weight:600;'
+                f'background:{intent_bg};color:{intent_fg};'
+                f'border-radius:4px;padding:1px 7px">{_esc(intent_lbl)}</span>'
+            )
+            st.markdown(f'<div style="margin:4px 0 10px">{legend_html}</div>',
+                        unsafe_allow_html=True)
 
-        # Graph Insights — derived from ownership analysis
-        insights = _extract_graph_insights(result)
-        _label_row("Graph Insights")
-        gi_rows = (
-            f'<div style="display:flex;justify-content:space-between;'
-            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-            f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
-            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-            f'{_esc(insights["ownership_depth"])}</span></div>'
-            f'<div style="display:flex;justify-content:space-between;'
-            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-            f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
-            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-            f'{_esc(insights["beneficial_owner"])}</span></div>'
-            f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
-            f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
-            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-            f'{_esc(insights["structure_complexity"])}</span></div>'
-        )
-        st.markdown(
-            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-            f'border-radius:8px;padding:10px 14px;margin:6px 0">'
-            f'{gi_rows}</div>',
-            unsafe_allow_html=True,
-        )
+            # Selected node detail panel (shown only after a node is clicked)
+            selected_id = st.session_state.get("_graph_selected_node")
+            if selected_id and selected_id in payload.node_meta:
+                _render_node_detail_panel(selected_id, payload.node_meta, payload.edge_meta)
+
+            # Graph Insights — sourced from the graph payload
+            insights = payload.insights
+            _label_row("Graph Insights")
+            gi_rows = (
+                f'<div style="display:flex;justify-content:space-between;'
+                f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+                f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
+                f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+                f'{_esc(insights["ownership_depth"])}</span></div>'
+                f'<div style="display:flex;justify-content:space-between;'
+                f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+                f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
+                f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+                f'{_esc(insights["beneficial_owner"])}</span></div>'
+                f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
+                f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
+                f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+                f'{_esc(insights["structure_complexity"])}</span></div>'
+            )
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+                f'{gi_rows}</div>',
+                unsafe_allow_html=True,
+            )
         return
 
     if live_phase == "idle" and result is None:

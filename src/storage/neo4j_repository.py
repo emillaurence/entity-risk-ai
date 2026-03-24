@@ -1,16 +1,11 @@
-import logging
-
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError, ServiceUnavailable
-
-_log = logging.getLogger(__name__)
 
 
 class Neo4jRepository:
     def __init__(self, uri: str, username: str, password: str, database: str) -> None:
         self._database = database
         self._driver = GraphDatabase.driver(uri, auth=(username, password))
-        _log.info("Neo4j driver initialised: uri=%s database=%s", uri, database)
 
     def close(self) -> None:
         self._driver.close()
@@ -23,13 +18,10 @@ class Neo4jRepository:
     def test_connection(self) -> bool:
         try:
             self._driver.verify_connectivity()
-            _log.info("Neo4j connection verified")
             return True
         except ServiceUnavailable as e:
-            _log.error("Neo4j unreachable: %s", e)
             raise ConnectionError(f"Neo4j is unreachable: {e}") from e
         except Neo4jError as e:
-            _log.error("Neo4j connection failed: %s", e)
             raise ConnectionError(f"Neo4j connection failed: {e}") from e
 
     # --- Schema inspection ---
@@ -107,20 +99,14 @@ class Neo4jRepository:
         special = r'+-&|!(){}[]^"~*?:\/'
         return "".join(f"\\{ch}" if ch in special else ch for ch in term)
 
-    def find_company_by_name(
-        self, name: str, limit: int = 10, min_score: float = 1.0
-    ) -> list[dict]:
+    def find_company_by_name(self, name: str, limit: int = 10) -> list[dict]:
         query = (
             "CALL db.index.fulltext.queryNodes('company_name_ft', $name) "
             "YIELD node AS c, score "
-            "WHERE score > $min_score "
             + self._COMPANY_RETURN
             + ", score ORDER BY score DESC LIMIT $limit"
         )
-        return self.run_query(
-            query,
-            {"name": self._escape_fulltext(name), "limit": limit, "min_score": min_score},
-        )
+        return self.run_query(query, {"name": self._escape_fulltext(name), "limit": limit})
 
     def get_company_by_exact_name(self, name: str) -> dict | None:
         query = (
@@ -190,9 +176,7 @@ class Neo4jRepository:
             ORDER BY length(path)
             WITH owner, collect(path)[0] AS shortest_path
             RETURN
-                coalesce(owner.name,
-                    trim(coalesce(owner.forename, '') + ' ' + coalesce(owner.surname, ''))
-                )                                                   AS owner_name,
+                owner.name                                          AS owner_name,
                 labels(owner)                                       AS owner_labels,
                 length(shortest_path)                               AS chain_depth,
                 relationships(shortest_path)[0].ownership_pct_min   AS ownership_pct_min,
@@ -211,9 +195,9 @@ class Neo4jRepository:
             RETURN
                 a.address_line_1    AS address_line_1,
                 a.address_line_2    AS address_line_2,
-                a.post_town         AS post_town,
-                a.county            AS county,
-                a.post_code         AS post_code,
+                a.locality          AS locality,
+                a.region            AS region,
+                a.postal_code       AS postal_code,
                 a.country           AS country
         """
         rows = self.run_query(query, {"name": company_name})
@@ -234,7 +218,7 @@ class Neo4jRepository:
                 other.name              AS company_name,
                 other.company_number    AS company_number,
                 other.status            AS status,
-                a.post_code             AS post_code,
+                a.postal_code           AS postal_code,
                 a.address_line_1        AS address_line_1
             ORDER BY other.name
             LIMIT $limit
@@ -248,9 +232,9 @@ class Neo4jRepository:
         query = """
             MATCH (c:Company {name: $name})-[:HAS_SIC]->(s:SIC)
             RETURN
-                s.sic_code      AS sic_code,
+                s.code          AS sic_code,
                 s.description   AS sic_description
-            ORDER BY s.sic_code
+            ORDER BY s.code
         """
         return self.run_query(query, {"name": company_name})
 
@@ -265,7 +249,7 @@ class Neo4jRepository:
             MATCH (c:Company {name: $name})-[:HAS_SIC]->(s:SIC)
                   <-[:HAS_SIC]-(other:Company)
             WHERE other.name <> $name
-            WITH other, collect(s.sic_code) AS shared_sic_codes,
+            WITH other, collect(s.code) AS shared_sic_codes,
                         collect(s.description) AS shared_sic_descriptions
             RETURN
                 other.name              AS company_name,

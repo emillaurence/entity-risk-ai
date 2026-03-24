@@ -81,7 +81,7 @@ class InvestigationRequest:
     context: UserContext
     request_id: str = ""
     focus_areas: list[str] = field(default_factory=list)
-    max_depth: int = 5
+    max_depth: int = 20
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 

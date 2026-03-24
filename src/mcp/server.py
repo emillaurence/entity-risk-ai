@@ -20,15 +20,7 @@ without a Neo4j connection until a tool is actually invoked.
 from __future__ import annotations
 
 import dataclasses
-import sys
-from pathlib import Path
 from typing import Any
-
-# Ensure the project root is on sys.path when the file is loaded directly
-# (e.g. via `mcp dev` / `mcp run`), not just when run as a package module.
-_project_root = Path(__file__).resolve().parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
 
 from mcp.server.fastmcp import FastMCP
 
@@ -304,24 +296,6 @@ def list_recent_traces(limit: int = 20) -> dict:
     """
     _, _, trace, _ = _get_tools()
     return _serialise(trace.list_recent_traces(limit=limit))
-
-
-# ---------------------------------------------------------------------------
-# Lifecycle helpers
-# ---------------------------------------------------------------------------
-
-
-def close() -> None:
-    """
-    Close the Neo4j connection opened by the lazy tool initialiser.
-
-    Call this when the server is no longer needed (e.g. at notebook teardown
-    or when MCPToolClient.close() is called).  Safe to call multiple times.
-    """
-    global _graph_tools, _risk_tools, _trace_tools, _shared_tools, _repo
-    if _repo is not None:
-        _repo.close()
-    _repo = _graph_tools = _risk_tools = _trace_tools = _shared_tools = None
 
 
 # ---------------------------------------------------------------------------

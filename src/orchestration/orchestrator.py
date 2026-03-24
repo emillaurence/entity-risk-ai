@@ -607,9 +607,10 @@ class Orchestrator:
                     if on_progress:
                         on_progress("step_complete", step_results[-1].to_dict())
                 if remaining:
+                    error_detail = f": {result.error}" if result.error else ""
                     warnings.append(
-                        f"Execution halted after '{step.step_id}' ({step.task}) failed. "
-                        f"{len(remaining)} step(s) skipped."
+                        f"Execution halted after '{step.step_id}' ({step.task}) "
+                        f"failed{error_detail}. {len(remaining)} step(s) skipped."
                     )
                 break
 
