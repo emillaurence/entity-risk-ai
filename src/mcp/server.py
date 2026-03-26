@@ -312,6 +312,8 @@ if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 0))
     if port:
-        mcp.run(transport="http", host="0.0.0.0", port=port)
+        mcp.settings.host = "0.0.0.0"
+        mcp.settings.port = port
+        mcp.run(transport="streamable-http")
     else:
         mcp.run()  # stdio — unchanged for local use
