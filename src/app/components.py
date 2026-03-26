@@ -2066,7 +2066,36 @@ def _build_agraph_data(
                 add_edge(addr_id, clust_id, color=key_color, is_key=address_is_key)
         break
 
-    # ── Secondary Neo4j: fetch address when company_profile didn't run ─────
+    # ── shared_address_check findings (same address dict structure) ─────────
+    if not address_found:
+        for sr in (result.step_results or []):
+            if sr.task != "shared_address_check" or not sr.success:
+                continue
+            sac     = (sr.findings or {}).get("shared_address_check") or {}
+            address = sac.get("address") or {}
+            if address and non_focal < _GRAPH_MAX_NODES:
+                postal     = (address.get("post_code") or "").strip()
+                town       = (address.get("post_town") or "").strip()
+                addr_label = postal or town or "Address"
+                full_addr  = ", ".join(filter(None, [
+                    address.get("address_line_1", ""),
+                    town,
+                    postal,
+                ]))
+                addr_id = f"__addr__{focal_id}"
+                if addr_id not in seen:
+                    non_focal += 1
+                add_node(addr_id, _short(addr_label, 22), addr_color, size=addr_size,
+                         full_name=full_addr or addr_label,
+                         node_type="Registered Address",
+                         context=full_addr or addr_label)
+                add_edge(focal_id, addr_id, label="at",
+                         color=key_color if address_is_key else "#F59E0B",
+                         is_key=address_is_key)
+                address_found = True
+            break
+
+    # ── Secondary Neo4j: fetch address when no step result has it ──────────
     if not address_found and repo is not None and intent in ("address", "risk"):
         try:
             db_addr = repo.get_company_address_context(focal_id)
