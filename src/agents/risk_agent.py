@@ -446,7 +446,7 @@ class RiskAgent(BaseAgent):
         context: dict[str, Any],
     ):
         """Call the matching MCP risk tool and return its ToolResult."""
-        max_depth = int(context.get("max_depth", 5))
+        max_depth = int(context.get("max_depth", 20))
 
         if task == "ownership_complexity_check":
             return self._mcp.call_tool(

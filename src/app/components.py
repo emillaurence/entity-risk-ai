@@ -644,6 +644,34 @@ def _extract_replay_graph_insights(events: list) -> dict:
     return out
 
 
+def _load_replay_artifact(replay_data: dict) -> dict | None:
+    """Load the persisted investigation artifact for a replay trace.
+
+    Resolution order:
+    1. Session-state cache (populated by the Investigate tab in the same rerun).
+    2. investigation_artifact_json persisted in Neo4j (loaded via load_trace).
+
+    Returns None for legacy traces that pre-date this feature; callers fall back
+    to event-based inference in that case.
+    """
+    trace_id = replay_data.get("trace_id", "")
+    # 1. Session cache — set by _render_graph_column in the same rerun
+    cached = st.session_state.get(f"_investigation_artifact_cache_{trace_id}")
+    if cached:
+        try:
+            return _json.loads(cached)
+        except Exception:
+            pass
+    # 2. Persisted JSON from Neo4j
+    raw = replay_data.get("investigation_artifact_json")
+    if raw:
+        try:
+            return _json.loads(raw)
+        except Exception:
+            pass
+    return None
+
+
 def _name_similarity(searched: str, canonical: str) -> int:
     """Return 0–100 name similarity score using SequenceMatcher ratio."""
     if not searched or not canonical:
@@ -1684,6 +1712,531 @@ def _extract_graph_insights(result: Any) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Context Graph — intent detection, risk colours, and data builder
+# ---------------------------------------------------------------------------
+
+# Node colour palettes (background / border / highlight)
+_GRAPH_COLOR_FOCAL: dict = {
+    "background": "#1D4ED8", "border": "#1E3A8A",
+    "highlight":  {"background": "#3B82F6", "border": "#1E3A8A"},
+}
+_GRAPH_COLOR_COMPANY: dict = {
+    "background": "#DBEAFE", "border": "#93C5FD",
+    "highlight":  {"background": "#BFDBFE", "border": "#60A5FA"},
+}
+_GRAPH_COLOR_PERSON: dict = {
+    "background": "#D1FAE5", "border": "#34D399",
+    "highlight":  {"background": "#A7F3D0", "border": "#10B981"},
+}
+_GRAPH_COLOR_ADDRESS: dict = {
+    "background": "#FEF3C7", "border": "#FCD34D",
+    "highlight":  {"background": "#FDE68A", "border": "#F59E0B"},
+}
+_GRAPH_COLOR_ADDRESS_KEY: dict = {  # address node when address intent is active
+    "background": "#FDE68A", "border": "#D97706",
+    "highlight":  {"background": "#FCD34D", "border": "#B45309"},
+}
+_GRAPH_COLOR_NOUBO: dict = {  # "No UBO identified" phantom node
+    "background": "#FFF7ED", "border": "#F97316",
+    "highlight":  {"background": "#FED7AA", "border": "#EA580C"},
+}
+_GRAPH_COLOR_CLUSTER: dict = {  # co-located entity cluster indicator
+    "background": "#F1F5F9", "border": "#94A3B8",
+    "highlight":  {"background": "#E2E8F0", "border": "#64748B"},
+}
+
+# Legend colours (flat hex for the HTML legend strip)
+_LEGEND_FOCAL   = "#1D4ED8"
+_LEGEND_COMPANY = "#93C5FD"
+_LEGEND_PERSON  = "#34D399"
+_LEGEND_ADDRESS = "#FCD34D"
+
+_GRAPH_MAX_PATH_DEPTH = 3   # max ownership hops rendered
+_GRAPH_MAX_NODES      = 12  # cap on non-focal nodes for readability
+
+
+def _detect_graph_intent(question: str) -> str:
+    """Determine the primary visual focus of the graph from the user's question.
+
+    Returns one of: 'ownership', 'address', 'control', 'risk'.
+    """
+    q = question.lower()
+    address_kws  = {"address", "location", "registered at", "where is", "office", "postcode", "postal"}
+    control_kws  = {"control", "psc", "significant control", "director", "signatory"}
+    ownership_kws = {"own", "owner", "owned", "ubo", "beneficial", "parent", "who owns", "holds", "shareholder"}
+
+    has_ownership = any(t in q for t in ownership_kws)
+    has_address   = any(t in q for t in address_kws)
+    has_control   = any(t in q for t in control_kws)
+
+    if has_address and not has_ownership and not has_control:
+        return "address"
+    if has_control and not has_ownership:
+        return "control"
+    if has_ownership:
+        return "ownership"
+    return "risk"  # general / combined
+
+
+def _edge_color_for_risk(risk_level: str) -> str:
+    """Map a risk_level string ('HIGH'/'MEDIUM'/'LOW') to a hex edge colour."""
+    return {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#22C55E"}.get(
+        (risk_level or "").upper(), "#9CA3AF"
+    )
+
+
+def _build_agraph_data(
+    result: Any,
+    intent: str = "risk",
+    risk_findings: dict | None = None,
+    repo: Any = None,
+) -> tuple[list, list, dict]:
+    """Build Node/Edge lists and per-node metadata from an investigation result.
+
+    Parameters
+    ----------
+    result        OrchestratorResult — step_results, resolved_entities.
+    intent        Graph focus derived from _detect_graph_intent().
+    risk_findings {task_name: findings_dict} — used to colour edges by risk level.
+    repo          Optional Neo4jRepository for secondary queries when the
+                  investigation did not produce ownership or address data.
+
+    Key behaviours
+    --------------
+    - Ownership edges on the primary chain are coloured by the relevant risk level
+      and carry pct labels; secondary/non-key edges are grey and unlabelled.
+    - Address node is enlarged and highlighted when intent == 'address'.
+    - A "? No UBO" phantom node is added when corporate_chain_only == True.
+    - Secondary Neo4j queries run (once, scoped) when investigation data is absent.
+
+    Returns (nodes, edges, node_meta) where node_meta maps node_id to
+    {"full_name", "type", "context"}.
+    """
+    from streamlit_agraph import Edge, Node
+
+    nodes: list[Node] = []
+    edges: list[Edge] = []
+    seen:  set[str]   = set()
+    node_meta: dict[str, dict] = {}
+
+    rf = risk_findings or {}
+
+    # Determine key-path edge colour from intent + risk findings
+    if intent == "address":
+        key_color = _edge_color_for_risk(rf.get("address_risk_check", {}).get("risk_level", ""))
+    elif intent == "control":
+        key_color = _edge_color_for_risk(rf.get("control_signal_check", {}).get("risk_level", ""))
+    else:  # 'ownership' or 'risk'
+        key_color = _edge_color_for_risk(rf.get("ownership_complexity_check", {}).get("risk_level", ""))
+
+    ownership_is_key = intent in ("ownership", "risk", "control")
+
+    def add_node(
+        nid: str, label: str, color: dict, size: int,
+        full_name: str, node_type: str, context: str = "",
+        border_width: int = 1,
+    ) -> None:
+        if nid not in seen:
+            seen.add(nid)
+            nodes.append(Node(
+                id=nid, label=label, color=color, size=size,
+                title=full_name, borderWidth=border_width,
+            ))
+            node_meta[nid] = {"full_name": full_name, "type": node_type, "context": context}
+
+    def add_edge(
+        src: str, dst: str, label: str = "",
+        color: str = "#9CA3AF", is_key: bool = False,
+    ) -> None:
+        edges.append(Edge(
+            source=src, target=dst,
+            label=label if is_key else "",  # pct labels only on key-path edges
+            color=color,
+            width=3 if is_key else 1,
+            font={"size": 10, "align": "middle",
+                  "strokeWidth": 2, "strokeColor": "#FFFFFF"},
+        ))
+
+    def _short(name: str, n: int = 22) -> str:
+        return name if len(name) <= n else name[: n - 1] + "\u2026"
+
+    def _pct_label(lo: Any, hi: Any) -> str:
+        if lo is None:
+            return ""
+        lo_i = int(lo)
+        hi_i = int(hi) if hi is not None else lo_i
+        return f"{lo_i}%" if lo_i == hi_i else f"{lo_i}\u2013{hi_i}%"
+
+    # ── Focal entity ──────────────────────────────────────────────────────
+    focal_id = ""
+    focal_number = ""
+    for _, edata in (result.resolved_entities or {}).items():
+        if edata:
+            focal_id     = edata.get("canonical_name", "")
+            focal_number = edata.get("company_number", "")
+            break
+    if not focal_id:
+        focal_id = result.query or "Entity"
+
+    focal_ctx = f"Company No. {focal_number}" if focal_number else "Investigated entity"
+    add_node(focal_id, _short(focal_id, 24), _GRAPH_COLOR_FOCAL, size=34,
+             full_name=focal_id, node_type="Focal Company",
+             context=focal_ctx, border_width=3)
+
+    non_focal: int = 0
+    ownership_found = False
+    address_found   = False
+
+    # ── Ownership paths from expand_ownership ─────────────────────────────
+    for sr in (result.step_results or []):
+        if sr.task != "expand_ownership" or not sr.success:
+            continue
+        eo    = (sr.findings or {}).get("expand_ownership") or {}
+        paths = eo.get("paths") or []
+        ubos  = eo.get("ultimate_owners") or []
+
+        for row in paths:
+            if non_focal >= _GRAPH_MAX_NODES:
+                break
+            if (row.get("path_depth") or 0) > _GRAPH_MAX_PATH_DEPTH:
+                continue
+            from_name = (row.get("from_name") or "").strip()
+            to_name   = (row.get("to_name") or "").strip()
+            if not from_name or not to_name:
+                continue
+            from_labels = row.get("from_labels") or []
+            is_person   = "Person" in from_labels
+            color       = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
+            node_type   = "Individual" if is_person else "Company"
+            pct         = _pct_label(row.get("ownership_pct_min"), row.get("ownership_pct_max"))
+            if from_name not in seen:
+                non_focal += 1
+            add_node(from_name, _short(from_name), color,
+                     size=22 if is_person else 18,
+                     full_name=from_name, node_type=node_type,
+                     context=f"Ownership: {pct}" if pct else "Owner")
+            add_edge(from_name, to_name, label=pct,
+                     color=key_color if ownership_is_key else "#9CA3AF",
+                     is_key=ownership_is_key)
+            ownership_found = True
+
+        # UBOs not already captured via path rows
+        for ubo in ubos:
+            if non_focal >= _GRAPH_MAX_NODES:
+                break
+            name = (ubo.get("owner_name") or "").strip()
+            if not name:
+                continue
+            pct = _pct_label(ubo.get("ownership_pct_min"), ubo.get("ownership_pct_max"))
+            if name not in seen:
+                non_focal += 1
+            add_node(name, _short(name), _GRAPH_COLOR_PERSON, size=26,
+                     full_name=name, node_type="Individual / Beneficial Owner",
+                     context=f"Ownership: {pct}" if pct else "Beneficial owner")
+            if not any(e.source == name and e.target == focal_id for e in edges):
+                add_edge(name, focal_id,
+                         color=key_color if ownership_is_key else "#34D399",
+                         is_key=ownership_is_key)
+            ownership_found = True
+        break  # only process the first expand_ownership step
+
+    # ── Fallback: direct owners from company_profile ──────────────────────
+    if not ownership_found:
+        for sr in (result.step_results or []):
+            if sr.task != "company_profile" or not sr.success:
+                continue
+            cp = (sr.findings or {}).get("company_profile") or {}
+            for owner in (cp.get("direct_owners") or []):
+                if non_focal >= _GRAPH_MAX_NODES:
+                    break
+                name = (owner.get("owner_name") or "").strip()
+                if not name:
+                    continue
+                labels    = owner.get("owner_labels") or []
+                is_person = "Person" in labels
+                color     = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
+                node_type = "Individual" if is_person else "Company"
+                pct       = _pct_label(owner.get("ownership_pct_min"), owner.get("ownership_pct_max"))
+                if name not in seen:
+                    non_focal += 1
+                add_node(name, _short(name), color, size=20,
+                         full_name=name, node_type=node_type,
+                         context=f"Ownership: {pct}" if pct else "Direct owner")
+                add_edge(name, focal_id, label=pct,
+                         color=key_color if ownership_is_key else "#9CA3AF",
+                         is_key=ownership_is_key)
+                ownership_found = True
+            break
+
+    # ── Secondary Neo4j: fetch direct owners when investigation omitted them ─
+    if not ownership_found and repo is not None and intent in ("ownership", "risk"):
+        try:
+            db_owners = repo.get_direct_owners(focal_id)
+            for owner in db_owners[:5]:
+                if non_focal >= _GRAPH_MAX_NODES:
+                    break
+                name = (owner.get("owner_name") or "").strip()
+                if not name:
+                    continue
+                labels    = owner.get("owner_labels") or []
+                is_person = "Person" in labels
+                color     = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
+                node_type = "Individual" if is_person else "Company"
+                pct       = _pct_label(owner.get("ownership_pct_min"), owner.get("ownership_pct_max"))
+                if name not in seen:
+                    non_focal += 1
+                add_node(name, _short(name), color, size=20,
+                         full_name=name, node_type=node_type,
+                         context=f"Ownership: {pct}" if pct else "Direct owner")
+                add_edge(name, focal_id, label=pct,
+                         color=key_color if ownership_is_key else "#9CA3AF",
+                         is_key=ownership_is_key)
+                ownership_found = True
+        except Exception:
+            pass  # DB unavailable — fall through silently
+
+    # ── "No UBO" phantom node — corporate chain only ──────────────────────
+    own_findings = rf.get("ownership_complexity_check", {})
+    if (
+        intent in ("ownership", "risk")
+        and own_findings.get("corporate_chain_only") is True
+        and non_focal < _GRAPH_MAX_NODES
+    ):
+        nid = "__no_ubo__"
+        if nid not in seen:
+            non_focal += 1
+        add_node(nid, "? No UBO", _GRAPH_COLOR_NOUBO, size=14,
+                 full_name="No individual beneficial owner identified",
+                 node_type="Missing UBO",
+                 context="Full ownership chain consists of corporate entities only.",
+                 border_width=2)
+        add_edge(focal_id, nid, color="#F97316", is_key=False)
+
+    # ── Address node ───────────────────────────────────────────────────────
+    address_is_key = intent == "address"
+    addr_color     = _GRAPH_COLOR_ADDRESS_KEY if address_is_key else _GRAPH_COLOR_ADDRESS
+    addr_size      = 22 if address_is_key else 14
+
+    for sr in (result.step_results or []):
+        if sr.task != "company_profile" or not sr.success:
+            continue
+        cp      = (sr.findings or {}).get("company_profile") or {}
+        address = cp.get("address") or {}
+        if address and non_focal < _GRAPH_MAX_NODES:
+            postal     = (address.get("postal_code") or "").strip()
+            town       = (address.get("post_town") or "").strip()
+            addr_label = postal or town or "Address"
+            full_addr  = ", ".join(filter(None, [
+                address.get("address_line_1", ""),
+                town,
+                postal,
+            ]))
+            addr_id   = f"__addr__{focal_id}"
+            co_total  = rf.get("address_risk_check", {}).get("co_located_total", 0)
+            addr_ctx  = full_addr or addr_label
+            if co_total:
+                addr_ctx  += f" · {co_total} co-located entities"
+                addr_label = f"{addr_label} ({co_total})"
+            if addr_id not in seen:
+                non_focal += 1
+            add_node(addr_id, _short(addr_label, 22), addr_color, size=addr_size,
+                     full_name=full_addr or addr_label,
+                     node_type="Registered Address",
+                     context=addr_ctx)
+            add_edge(focal_id, addr_id, label="at",
+                     color=key_color if address_is_key else "#F59E0B",
+                     is_key=address_is_key)
+            address_found = True
+
+            # Co-located cluster indicator (address intent, high concentration)
+            if address_is_key and co_total > 5 and non_focal < _GRAPH_MAX_NODES:
+                clust_id  = "__colocated__"
+                diss_pct  = round(rf.get("address_risk_check", {}).get("dissolution_rate", 0.0) * 100)
+                clust_lbl = f"+{co_total} entities"
+                clust_ctx = f"{co_total} companies share this address"
+                if diss_pct:
+                    clust_ctx += f" · {diss_pct}% dissolved"
+                if clust_id not in seen:
+                    non_focal += 1
+                add_node(clust_id, clust_lbl, _GRAPH_COLOR_CLUSTER, size=16,
+                         full_name=f"{co_total} co-located companies",
+                         node_type="Co-located Cluster",
+                         context=clust_ctx)
+                add_edge(addr_id, clust_id, color=key_color, is_key=address_is_key)
+        break
+
+    # ── Secondary Neo4j: fetch address when company_profile didn't run ─────
+    if not address_found and repo is not None and intent in ("address", "risk"):
+        try:
+            db_addr = repo.get_company_address_context(focal_id)
+            if db_addr and non_focal < _GRAPH_MAX_NODES:
+                postal     = (db_addr.get("post_code") or "").strip()
+                town       = (db_addr.get("post_town") or "").strip()
+                addr_label = postal or town or "Address"
+                full_addr  = ", ".join(filter(None, [
+                    db_addr.get("address_line_1", ""),
+                    town,
+                    postal,
+                ]))
+                addr_id = f"__addr__{focal_id}"
+                if addr_id not in seen:
+                    non_focal += 1
+                add_node(addr_id, addr_label, addr_color, size=addr_size,
+                         full_name=full_addr or addr_label,
+                         node_type="Registered Address",
+                         context=full_addr or addr_label)
+                add_edge(focal_id, addr_id, label="at",
+                         color=key_color if address_is_key else "#F59E0B",
+                         is_key=address_is_key)
+        except Exception:
+            pass  # DB unavailable — fall through silently
+
+    return nodes, edges, node_meta
+
+
+# ---------------------------------------------------------------------------
+# Interactive node detail panel
+# ---------------------------------------------------------------------------
+
+_RISK_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "HIGH":    ("#B91C1C", "#FEF2F2"),
+    "MEDIUM":  ("#92400E", "#FFFBEB"),
+    "LOW":     ("#14532D", "#F0FDF4"),
+}
+
+_STATUS_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "Active":   ("#14532D", "#F0FDF4"),
+    "Dissolved": ("#6B7280", "#F3F4F6"),
+}
+
+_DIM_LABEL_MAP: dict[str, str] = {
+    "ownership": "Ownership",
+    "address":   "Address",
+    "control":   "Control",
+    "industry":  "Industry",
+}
+
+
+def _render_node_detail_panel(
+    selected_id: str,
+    node_meta: dict[str, dict],
+    edge_meta: dict[str, dict],
+) -> None:
+    """Render a concise, human-readable detail panel for the selected node.
+
+    Shows: full name, type, why it is in the graph, company number/status when
+    available, a risk badge, and a compact list of direct connections.
+    """
+    meta = node_meta.get(selected_id)
+    if not meta:
+        return
+
+    _label_row("Selected Node")
+    with st.container(border=True):
+        # Full name + type header
+        st.markdown(
+            f'<div style="font-weight:600;font-size:0.9em;color:#111827;'
+            f'margin-bottom:2px">{_esc(meta["full_name"])}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Type + dimension badge on same row
+        dim_label = _DIM_LABEL_MAP.get(meta.get("dimension", ""), "")
+        badge_html = ""
+        _NODE_DIM_BADGE: dict[str, tuple[str, str]] = {
+            "ownership": ("#DBEAFE", "#1D4ED8"),
+            "address":   ("#FEF3C7", "#D97706"),
+            "control":   ("#F3E8FF", "#7C3AED"),
+            "industry":  ("#F0FDF4", "#15803D"),
+        }
+        if dim_label:
+            bg, fg = _NODE_DIM_BADGE.get(meta.get("dimension", ""), ("#F3F4F6", "#374151"))
+            badge_html = (
+                f'<span style="font-size:0.7em;font-weight:600;'
+                f'background:{bg};color:{fg};border-radius:3px;padding:1px 5px;'
+                f'margin-left:6px">{_esc(dim_label)}</span>'
+            )
+        st.markdown(
+            f'<div style="font-size:0.8em;color:#6B7280;margin-bottom:4px">'
+            f'{_esc(meta.get("type", ""))}{badge_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Why in graph
+        if meta.get("why_in_graph"):
+            st.markdown(
+                f'<div style="font-size:0.78em;color:#4B5563;margin-bottom:4px">'
+                f'{_esc(meta["why_in_graph"])}</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Company number + status (when available)
+        detail_parts: list[str] = []
+        if meta.get("company_number"):
+            detail_parts.append(f'No. {_esc(meta["company_number"])}')
+        if meta.get("status"):
+            sc, sb = _STATUS_BADGE_STYLE.get(meta["status"], ("#374151", "#F9FAFB"))
+            detail_parts.append(
+                f'<span style="background:{sb};color:{sc};border-radius:3px;'
+                f'padding:0 4px;font-size:0.85em">{_esc(meta["status"])}</span>'
+            )
+        if meta.get("address_count"):
+            detail_parts.append(f'{meta["address_count"]} co-located')
+        if detail_parts:
+            st.markdown(
+                f'<div style="font-size:0.78em;color:#6B7280;margin-bottom:4px">'
+                + " &nbsp;·&nbsp; ".join(detail_parts) + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        # Risk relevance badge
+        risk = (meta.get("risk_relevance") or "").upper()
+        if risk in _RISK_BADGE_STYLE:
+            rc, rb = _RISK_BADGE_STYLE[risk]
+            st.markdown(
+                f'<div style="font-size:0.75em;font-weight:600;'
+                f'background:{rb};color:{rc};border-radius:3px;'
+                f'padding:2px 7px;display:inline-block;margin-bottom:4px">'
+                f'{risk} RISK</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Connected edges — compact list
+    connected = [
+        em for em in edge_meta.values()
+        if em.get("source") == selected_id or em.get("target") == selected_id
+    ]
+    if connected:
+        _label_row("Connections")
+        rows_html = ""
+        for em in connected[:5]:
+            other = em["target"] if em["source"] == selected_id else em["source"]
+            other_meta = node_meta.get(other, {})
+            other_name = _esc(other_meta.get("full_name") or other)
+            edge_type  = _esc(em.get("type") or "—")
+            pct        = em.get("ownership_pct") or ""
+            pct_part   = f" <span style='color:#9CA3AF'>({_esc(pct)})</span>" if pct else ""
+            direction  = "→" if em["source"] == selected_id else "←"
+            rows_html += (
+                f'<div style="display:flex;align-items:center;gap:6px;'
+                f'padding:3px 0;border-bottom:1px solid #F3F4F6;font-size:0.78em">'
+                f'<span style="color:#9CA3AF;flex-shrink:0">{direction}</span>'
+                f'<span style="color:#374151;font-weight:500">{other_name}</span>'
+                f'<span style="color:#9CA3AF;font-size:0.9em">{edge_type}{pct_part}</span>'
+                f'</div>'
+            )
+        if len(connected) > 5:
+            rows_html += (
+                f'<div style="font-size:0.75em;color:#9CA3AF;padding:3px 0">'
+                f'+{len(connected) - 5} more connections</div>'
+            )
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-radius:6px;padding:6px 10px;margin:4px 0">'
+            f'{rows_html}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ===========================================================================
@@ -2096,6 +2649,59 @@ def _build_replay_assessment(replay_data: dict) -> dict:
     }
 
 
+def _build_investigation_artifact(result: Any, question: str) -> dict:
+    """Build a serializable artifact capturing all state needed to render the Investigate tab.
+
+    Called once after investigation completes; persisted alongside graph_payload_json.
+    Audit loads this artifact directly rather than reconstructing from event inference.
+    """
+    # Resolved entity (first confirmed entity)
+    resolved_entity: dict = {}
+    for _, data in (result.resolved_entities or {}).items():
+        if data:
+            resolved_entity = {
+                "canonical_name":  data.get("canonical_name", ""),
+                "company_number":  data.get("company_number", ""),
+                "status":          data.get("status", ""),
+                "jurisdiction":    data.get("jurisdiction", "UK"),
+                "match_score_pct": data.get("match_score_pct"),
+            }
+            break
+
+    # Assessment dict — identical contract consumed by _render_decision_first_assessment
+    assessment = _build_structured_assessment(result)
+
+    # Risk dimensions — {dim_key: risk_level}
+    dims = _collect_risk_dims(result)
+
+    # Plan metadata
+    plan = result.planner_output or {}
+    plan_reason = plan.get("reason", "")
+    investigation_type = _MODE_DISPLAY.get(plan.get("mode", ""), "")
+
+    # Step results summary (task, agent, status for each step)
+    step_summaries = [
+        {
+            "task":    s.task,
+            "agent":   s.agent,
+            "status":  s.status,   # "success" | "failed" | "skipped"
+            "skipped": s.skipped,
+        }
+        for s in (result.step_results or [])
+    ]
+
+    return {
+        "artifact_version":   1,
+        "question":           question,
+        "resolved_entity":    resolved_entity,
+        "assessment":         assessment,
+        "risk_dimensions":    dims,
+        "investigation_type": investigation_type,
+        "plan_reason":        plan_reason,
+        "step_results":       step_summaries,
+    }
+
+
 def _chip_click(prompt: str) -> None:
     """on_click callback for quick-prompt chips — populates the textarea."""
     st.session_state["_input_question"] = prompt
@@ -2320,7 +2926,7 @@ def render_investigate_tab(components: "AppComponents") -> None:
         _render_input_column(components, live_dims)
 
     with col2:
-        _render_graph_column()
+        _render_graph_column(components)
 
     with col3:
         _render_insights_column(live_dims)
@@ -2486,22 +3092,128 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
             )
 
 
-def _render_graph_column() -> None:
-    """Col 2 of the Investigate tab: live step checklist + entity panels when done."""
-    _section_header("🕸️ Context Graph", "Entity ownership and relationship map")
+def _render_shared_graph_panel(payload: Any, session_node_key: str) -> None:
+    """Render the interactive graph canvas, legend, node detail panel, and insights.
 
-    legend_items = [
-        ("🔵", "Company"),
-        ("🟢", "Beneficial Owner"),
-        ("🟡", "Address"),
-        ("🔗", "Ownership Link"),
-    ]
-    legend_html = "".join(
-        f'<span style="margin-right:12px;font-size:0.78em;color:#6B7280">'
-        f'{icon} {_esc(label)}</span>'
-        for icon, label in legend_items
+    Shared by both Investigate (_render_graph_column) and Replay (_render_replay_graph_column).
+    ``session_node_key`` isolates selected-node state between the two tabs.
+    """
+    import json as _json
+    from streamlit_agraph import Config, _agraph
+
+    if payload.nodes:
+        config = Config(
+            height=560,
+            directed=True,
+            physics=True,
+            **{
+                "interaction": {
+                    "hover":                True,
+                    "tooltipDelay":         100,
+                    "selectConnectedEdges": True,
+                },
+                "edges": {
+                    "smooth":  {"enabled": True},
+                    "arrows":  {"to": {"enabled": True, "scaleFactor": 0.7}},
+                    "font":    {"size": 10, "align": "middle",
+                                "strokeWidth": 2, "strokeColor": "#F8FAFC"},
+                },
+                "nodes": {
+                    "font": {"size": 13},
+                },
+            },
+        )
+        _data_json = _json.dumps({
+            "nodes": [n.to_dict() for n in payload.nodes],
+            "edges": [e.to_dict() for e in payload.edges],
+        })
+        raw_selection = _agraph(data=_data_json, config=_json.dumps(config.__dict__), key=session_node_key)
+        if raw_selection is not None:
+            st.session_state[session_node_key] = raw_selection
+    else:
+        st.caption("No graph data available for this entity.")
+
+    # Compact colour legend + mixed-dimension view badge
+    _DIM_BADGE_COLORS: dict[str, tuple[str, str]] = {
+        "ownership": ("#DBEAFE", "#1D4ED8"),
+        "address":   ("#FEF3C7", "#D97706"),
+        "control":   ("#F3E8FF", "#7C3AED"),
+        "industry":  ("#F0FDF4", "#15803D"),
+    }
+    LEGEND_FOCAL   = "#1D4ED8"
+    LEGEND_COMPANY = "#93C5FD"
+    LEGEND_PERSON  = "#34D399"
+    LEGEND_ADDRESS = "#FCD34D"
+    LEGEND_COLOC   = "#EAB308"
+    LEGEND_SIC     = "#8B5CF6"
+    intent_bg, intent_fg = _DIM_BADGE_COLORS.get(
+        payload.primary_driver, ("#F0FDF4", "#15803D")
     )
-    st.markdown(f'<div style="margin-bottom:12px">{legend_html}</div>', unsafe_allow_html=True)
+    intent_lbl     = payload.view_label
+    _show_coloc    = "address"  in payload.rendered_dimensions
+    _show_industry = "industry" in payload.rendered_dimensions
+    legend_html = (
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_FOCAL}">■</span> Focal entity</span>'
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_COMPANY}">■</span> Company</span>'
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_PERSON}">■</span> Individual / UBO</span>'
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_ADDRESS}">■</span> Address</span>'
+        + (
+            f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{LEGEND_COLOC}">■</span> Co-located</span>'
+            if _show_coloc else ""
+        )
+        + (
+            f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{LEGEND_SIC}">■</span> Industry</span>'
+            if _show_industry else ""
+        ) +
+        f'<span style="float:right;font-size:0.72em;font-weight:600;'
+        f'background:{intent_bg};color:{intent_fg};'
+        f'border-radius:4px;padding:1px 7px">{_esc(intent_lbl)}</span>'
+    )
+    st.markdown(f'<div style="margin:4px 0 10px">{legend_html}</div>',
+                unsafe_allow_html=True)
+
+    # Selected node detail panel (shown only after a node is clicked)
+    selected_id = st.session_state.get(session_node_key)
+    if selected_id and selected_id in payload.node_meta:
+        _render_node_detail_panel(selected_id, payload.node_meta, payload.edge_meta)
+
+    # Graph Insights — sourced from the graph payload
+    insights = payload.insights
+    _label_row("Graph Insights")
+    gi_rows = (
+        f'<div style="display:flex;justify-content:space-between;'
+        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+        f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["ownership_depth"])}</span></div>'
+        f'<div style="display:flex;justify-content:space-between;'
+        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+        f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["beneficial_owner"])}</span></div>'
+        f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
+        f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["structure_complexity"])}</span></div>'
+    )
+    st.markdown(
+        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+        f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+        f'{gi_rows}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_graph_column(components: "AppComponents") -> None:
+    """Col 2 of the Investigate tab: hierarchical interactive ownership graph when
+    done; live step checklist during execution."""
+    _section_header("🕸️ Context Graph", "Entity ownership and relationship map")
 
     live_phase    = state.get_live_phase()
     live_entities = state.get_live_entities()
@@ -2537,52 +3249,70 @@ def _render_graph_column() -> None:
         _render_live_step_checklist()
         return
 
-    # Done: show entity detail panels + graph insights
+    # Done: render interactive hierarchical graph
     if result is not None and result.resolved_entities:
-        _label_row("Entity Details")
-        for name, data in result.resolved_entities.items():
-            if data is None:
-                continue
-            with st.container(border=True):
-                canonical  = data.get("canonical_name", name)
-                company_no = data.get("company_number", "")
-                exact      = data.get("exact_match", True)
-                st.markdown(
-                    f'<div style="font-weight:600;color:#111827;font-size:0.92em;'
-                    f'margin-bottom:4px">🔵 {_esc(canonical)}</div>',
-                    unsafe_allow_html=True,
-                )
-                meta = []
-                if company_no:
-                    meta.append(f"No. {company_no}")
-                meta.append("exact match" if exact else "closest match")
-                st.caption("  ·  ".join(meta))
+        # Clear node selection when a new investigation result arrives
+        trace_key = getattr(result, "trace_id", None) or id(result)
+        if st.session_state.get("_graph_result_trace") != trace_key:
+            st.session_state["_graph_result_trace"] = trace_key
+            st.session_state.pop("_graph_selected_node", None)
 
-        # Graph Insights — derived from ownership analysis, aligned with risk drivers
-        insights = _extract_graph_insights(result)
-        _label_row("Graph Insights")
-        gi_rows = (
-            f'<div style="display:flex;justify-content:space-between;'
-            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-            f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
-            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-            f'{_esc(insights["ownership_depth"])}</span></div>'
-            f'<div style="display:flex;justify-content:space-between;'
-            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-            f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
-            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-            f'{_esc(insights["beneficial_owner"])}</span></div>'
-            f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
-            f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
-            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-            f'{_esc(insights["structure_complexity"])}</span></div>'
-        )
-        st.markdown(
-            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-            f'border-radius:8px;padding:10px 14px;margin:6px 0">'
-            f'{gi_rows}</div>',
-            unsafe_allow_html=True,
-        )
+        question = state.get_question()
+
+        payload = None
+        try:
+            from src.app.contextual_graph import build_contextual_graph_model
+            payload = build_contextual_graph_model(question, result, repo=components.repo)
+        except Exception:
+            st.caption("Graph could not be rendered.")
+
+        # Persist graph payload to trace once per trace (enables Replay tab parity).
+        # Also cache in session state so the Replay tab can load it in the same
+        # rerun without a race against the Neo4j write (load_trace runs before
+        # tabs render in layout.py, so graph_payload_json isn't in replay_data yet).
+        if payload is not None:
+            import logging as _glog
+            _logger = _glog.getLogger(__name__)
+
+            _tid = getattr(result, "trace_id", None) or state.get_trace_id()
+            _logger.info(
+                "[graph_write] trace_id=%r  view_label=%r  nodes=%d",
+                _tid, getattr(payload, "view_label", "?"), len(payload.nodes),
+            )
+            if _tid:
+                from src.app.contextual_graph import serialize_graph_payload
+                _serialized = serialize_graph_payload(payload)
+                # Always keep the session-state cache fresh (free, in-process)
+                st.session_state[f"_graph_payload_cache_{_tid}"] = _serialized
+                _logger.info("[graph_write] session_cache written  key=_graph_payload_cache_%s", _tid)
+
+                # Always persist graph_payload_json to Neo4j — no once-per-session guard.
+                # set_graph_payload_json is an idempotent SET; always writing ensures the
+                # latest full payload survives cross-session replay.
+                if components.trace_repo:
+                    try:
+                        components.trace_repo.set_graph_payload_json(_tid, _serialized)
+                        _logger.info("[graph_write] neo4j write OK  trace_id=%s  len=%d", _tid, len(_serialized))
+                    except Exception as _e:
+                        _logger.warning("[graph_write] neo4j write FAILED  trace_id=%s  err=%s", _tid, _e)
+
+                # Persist investigation artifact once per trace (enables Audit rehydration)
+                _artifact_save_key = f"_investigation_artifact_saved_{_tid}"
+                if not st.session_state.get(_artifact_save_key) and components.trace_repo:
+                    try:
+                        _artifact = _build_investigation_artifact(result, question)
+                        _artifact_json = _json.dumps(_artifact)
+                        st.session_state[f"_investigation_artifact_cache_{_tid}"] = _artifact_json
+                        components.trace_repo.set_investigation_artifact_json(_tid, _artifact_json)
+                        st.session_state[_artifact_save_key] = True
+                        _logger.info("[graph_write] artifact written  trace_id=%s", _tid)
+                    except Exception as _ae:
+                        _logger.warning("[graph_write] artifact write FAILED  trace_id=%s  err=%s", _tid, _ae)
+            else:
+                _logger.warning("[graph_write] _tid is falsy — skipping all writes")
+
+        if payload is not None:
+            _render_shared_graph_panel(payload, "_graph_selected_node")
         return
 
     if live_phase == "idle" and result is None:
@@ -2932,7 +3662,7 @@ def render_replay_tab(components: "AppComponents") -> None:
         _render_replay_input_column(components)
 
     with col2:
-        _render_replay_graph_column()
+        _render_replay_graph_column(components)
 
     with col3:
         _render_replay_insights_column()
@@ -3009,12 +3739,18 @@ def _render_replay_input_column(components: "AppComponents") -> None:
                 unsafe_allow_html=True,
             )
 
-        # Identified entity — uses the same card as Investigate tab
+        # Identified entity — prefer persisted artifact; fall back to event extraction
         query = replay_data.get("query", "")
         if query:
-            events_col1 = replay_data.get("events") or []
-            entity_info = _extract_replay_entity(events_col1, query)
-            _render_resolved_entity_banner({query: entity_info})
+            artifact = _load_replay_artifact(replay_data)
+            if artifact and artifact.get("resolved_entity"):
+                entity_info = artifact["resolved_entity"]
+                canonical   = entity_info.get("canonical_name") or query
+                _render_resolved_entity_banner({canonical: entity_info})
+            else:
+                events_col1 = replay_data.get("events") or []
+                entity_info = _extract_replay_entity(events_col1, query)
+                _render_resolved_entity_banner({query: entity_info})
 
     st.divider()
 
@@ -3027,40 +3763,34 @@ def _render_replay_input_column(components: "AppComponents") -> None:
     elif replay_status == "error":
         _render_assessment_card_skeleton("Could not load investigation.")
     elif replay_status == "loaded" and replay_data:
-        has_summary = bool(replay_data.get("final_summary"))
-        has_dims    = any(
-            v in ("HIGH", "MEDIUM", "LOW")
-            for v in _extract_replay_risk_dimensions(replay_data).values()
-        )
-        if has_summary or has_dims:
-            assessment = _build_replay_assessment(replay_data)
-            _render_decision_first_assessment(assessment)
+        artifact = _load_replay_artifact(replay_data)
+        if artifact and artifact.get("assessment"):
+            # New traces: render directly from persisted artifact
+            _render_decision_first_assessment(artifact["assessment"])
         else:
-            _render_assessment_card_skeleton("No summary recorded for this investigation.", show_pending_rows=False)
+            # Legacy traces: reconstruct from event inference
+            has_summary = bool(replay_data.get("final_summary"))
+            has_dims    = any(
+                v in ("HIGH", "MEDIUM", "LOW")
+                for v in _extract_replay_risk_dimensions(replay_data).values()
+            )
+            if has_summary or has_dims:
+                _render_decision_first_assessment(_build_replay_assessment(replay_data))
+            else:
+                _render_assessment_card_skeleton("No summary recorded for this investigation.", show_pending_rows=False)
 
 
-def _render_replay_graph_column() -> None:
-    """Col 2 of the Replay tab: entity context panel.
+def _render_replay_graph_column(components: "AppComponents") -> None:
+    """Col 2 of the Replay tab: Context Graph panel.
 
-    Mirrors _render_graph_column from the Investigate tab.
+    Mirrors _render_graph_column from the Investigate tab by using the same
+    _render_shared_graph_panel renderer. Graph data is reconstructed from
+    trace events via build_contextual_graph_from_trace.
     """
     replay_status = state.get_replay_status()
     replay_data   = state.get_replay_data()
 
     _section_header("🕸️ Context Graph", "Entity ownership and relationship map")
-
-    legend_items = [
-        ("🔵", "Company"),
-        ("🟢", "Beneficial Owner"),
-        ("🟡", "Address"),
-        ("🔗", "Ownership Link"),
-    ]
-    legend_html = "".join(
-        f'<span style="margin-right:12px;font-size:0.78em;color:#6B7280">'
-        f'{icon} {_esc(label)}</span>'
-        for icon, label in legend_items
-    )
-    st.markdown(f'<div style="margin-bottom:12px">{legend_html}</div>', unsafe_allow_html=True)
 
     if replay_status != "loaded" or not replay_data:
         st.markdown(
@@ -3073,46 +3803,101 @@ def _render_replay_graph_column() -> None:
         )
         return
 
-    # Entity details box
-    query = replay_data.get("query", "")
-    events_col2 = replay_data.get("events") or []
-    company_no_col2 = _extract_replay_company_number(events_col2)
-    no_str_col2 = f". (No. {company_no_col2})" if company_no_col2 else ""
-    _label_row("Entity Details")
-    with st.container(border=True):
+    # Clear node selection when a different trace is loaded
+    trace_id = replay_data.get("trace_id") or id(replay_data)
+    if st.session_state.get("_replay_graph_trace") != trace_id:
+        st.session_state["_replay_graph_trace"] = trace_id
+        st.session_state.pop("_replay_graph_selected_node", None)
+
+    from src.app.contextual_graph import (
+        deserialize_graph_payload,
+        build_contextual_graph_from_trace,
+    )
+
+    import logging as _glog
+    _logger = _glog.getLogger(__name__)
+    _logger.info("[graph_read] trace_id=%r", trace_id)
+
+    payload = None
+
+    # Tier 1 — Session-state cache (same-session, before any Neo4j round-trip).
+    # _render_graph_column runs before this function on every rerun and
+    # unconditionally writes _graph_payload_cache_{tid}. Avoids the load_trace
+    # timing race where replay_data is populated before _render_graph_column
+    # writes graph_payload_json to Neo4j.
+    _cached_json = st.session_state.get(f"_graph_payload_cache_{trace_id}")
+    _logger.info("[graph_read] tier1 cache_found=%s  len=%s", bool(_cached_json), len(_cached_json) if _cached_json else 0)
+    if _cached_json:
+        try:
+            payload = deserialize_graph_payload(_cached_json)
+            _logger.info("[graph_read] tier1 OK  view_label=%r  nodes=%d", getattr(payload, "view_label", "?"), len(payload.nodes) if payload else 0)
+        except Exception as _e:
+            _logger.warning("[graph_read] tier1 deserialize FAILED: %s", _e)
+            payload = None
+
+    # Tier 2 — Neo4j stored payload (cross-session primary source).
+    # graph_payload_json is written by _render_graph_column on first render after
+    # each investigation. Use it unconditionally — no discriminator needed.
+    if payload is None or not payload.nodes:
+        _stored_json = replay_data.get("graph_payload_json")
+        _logger.info("[graph_read] tier2 graph_payload_json_in_replay=%s  len=%s", bool(_stored_json), len(_stored_json) if _stored_json else 0)
+        if _stored_json:
+            try:
+                payload = deserialize_graph_payload(_stored_json)
+                _logger.info("[graph_read] tier2 OK  view_label=%r  nodes=%d", getattr(payload, "view_label", "?"), len(payload.nodes) if payload else 0)
+            except Exception as _e:
+                _logger.warning("[graph_read] tier2 deserialize FAILED: %s", _e)
+                payload = None
+
+    # Tier 3 — Reconstruction (last resort for traces predating graph_payload_json).
+    if payload is None or not payload.nodes:
+        _logger.info("[graph_read] tier3 falling back to reconstruction")
+        try:
+            payload = build_contextual_graph_from_trace(replay_data, repo=components.repo)
+            _logger.info("[graph_read] tier3 OK  view_label=%r  nodes=%d", getattr(payload, "view_label", "?"), len(payload.nodes) if payload else 0)
+        except Exception as _e:
+            _logger.warning("[graph_read] tier3 reconstruction FAILED: %s", _e)
+            payload = None
+
+    _logger.info("[graph_read] final  payload_ok=%s  view_label=%r", payload is not None and bool(payload.nodes), getattr(payload, "view_label", None) if payload else None)
+
+    if payload is not None and payload.nodes:
+        _render_shared_graph_panel(payload, "_replay_graph_selected_node")
+    else:
+        # Graceful fallback: graph insights derived from trace events
         st.markdown(
-            f'<div style="font-weight:600;color:#111827;font-size:0.92em;'
-            f'margin-bottom:4px">🔵 {_esc(query)}{_esc(no_str_col2)}</div>',
+            '<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            'border-radius:8px;padding:20px;text-align:center;'
+            'color:#94A3B8;font-size:0.83em;margin-bottom:10px">'
+            'Graph could not be reconstructed from this trace.'
+            '</div>',
             unsafe_allow_html=True,
         )
-        st.caption("loaded from trace")
-
-    # Graph insights derived from events
-    events  = replay_data.get("events") or []
-    insights = _extract_replay_graph_insights(events)
-    _label_row("Graph Insights")
-    gi_rows = (
-        f'<div style="display:flex;justify-content:space-between;'
-        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-        f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
-        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-        f'{_esc(insights["ownership_depth"])}</span></div>'
-        f'<div style="display:flex;justify-content:space-between;'
-        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-        f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
-        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-        f'{_esc(insights["beneficial_owner"])}</span></div>'
-        f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
-        f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
-        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-        f'{_esc(insights["structure_complexity"])}</span></div>'
-    )
-    st.markdown(
-        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-        f'border-radius:8px;padding:10px 14px;margin:6px 0">'
-        f'{gi_rows}</div>',
-        unsafe_allow_html=True,
-    )
+        events   = replay_data.get("events") or []
+        insights = _extract_replay_graph_insights(events)
+        _label_row("Graph Insights")
+        gi_rows = (
+            f'<div style="display:flex;justify-content:space-between;'
+            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["ownership_depth"])}</span></div>'
+            f'<div style="display:flex;justify-content:space-between;'
+            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["beneficial_owner"])}</span></div>'
+            f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
+            f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["structure_complexity"])}</span></div>'
+        )
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+            f'{gi_rows}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def _render_replay_insights_column() -> None:
@@ -3134,12 +3919,17 @@ def _render_replay_insights_column() -> None:
         )
         return
 
-    events       = replay_data.get("events") or []
-    mode         = replay_data.get("mode", "")
-    mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "")
-    trace_id     = replay_data.get("trace_id", "")
+    events    = replay_data.get("events") or []
+    trace_id  = replay_data.get("trace_id", "")
+    artifact  = _load_replay_artifact(replay_data)
 
-    # Investigation Type
+    # Investigation Type — prefer artifact; fall back to mode field
+    if artifact:
+        mode_display = artifact.get("investigation_type", "")
+    else:
+        mode         = replay_data.get("mode", "")
+        mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "")
+
     if mode_display:
         st.markdown(
             f'<div style="font-size:0.72em;font-weight:700;color:#6B7280;'
@@ -3163,22 +3953,29 @@ def _render_replay_insights_column() -> None:
         unsafe_allow_html=True,
     )
 
-    replay_dims = _extract_replay_risk_dimensions(replay_data)
+    # Key Risk Drivers — prefer artifact; fall back to event extraction
+    if artifact:
+        replay_dims = artifact.get("risk_dimensions") or {}
+    else:
+        replay_dims = _extract_replay_risk_dimensions(replay_data)
 
-    # Key Risk Drivers
     if any(v in ("HIGH", "MEDIUM", "LOW") for v in replay_dims.values()):
         _label_row("Key Risk Drivers")
         _render_risk_drivers_grid(replay_dims)
 
-    # Assessment Summary (plan reason)
-    plan_reason = ""
-    for ev in events:
-        if ev.get("event_type") == "plan_created":
-            raw = ev.get("input_summary", "") or ""
-            m = _re.search(r"reason:\s*(.+)$", raw, _re.IGNORECASE | _re.DOTALL)
-            if m:
-                plan_reason = m.group(1).strip()
-            break
+    # Assessment Summary — prefer artifact; fall back to regex on plan_created event
+    if artifact:
+        plan_reason = artifact.get("plan_reason", "")
+    else:
+        plan_reason = ""
+        for ev in events:
+            if ev.get("event_type") == "plan_created":
+                raw = ev.get("input_summary", "") or ""
+                m = _re.search(r"reason:\s*(.+)$", raw, _re.IGNORECASE | _re.DOTALL)
+                if m:
+                    plan_reason = m.group(1).strip()
+                break
+
     if plan_reason:
         _label_row("Assessment Summary")
         st.markdown(
@@ -3191,35 +3988,62 @@ def _render_replay_insights_column() -> None:
 
     st.divider()
 
-    # Details
+    # Details — prefer artifact step_results; fall back to _replay_plan_steps
     _label_row("Details")
-    replay_steps = _replay_plan_steps(events)
-    n = len(replay_steps)
-    st.metric("Steps", f"{n}/{n}")
-    for s in replay_steps:
-        color = "#16A34A" if s["success"] else "#DC2626"
-        st.markdown(
-            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-            f'border-radius:6px;padding:6px 10px;margin:3px 0;'
-            f'display:flex;justify-content:space-between;align-items:center">'
-            f'<div style="display:flex;align-items:center;gap:8px">'
-            f'<span style="color:{color};font-size:0.70em">●</span>'
-            f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
-            f'{_esc(_task_label(s["task"]))}</span>'
-            f'</div>'
-            f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
-            f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
-            f'white-space:nowrap">'
-            f'{_esc(_agent_display(s["agent"]))}</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    agents_run = sorted({
-        _AGENT_LABELS.get(ev.get("agent_name", ""), ev.get("agent_name", ""))
-        for ev in events
-        if ev.get("agent_name")
-    } - {""})
+    if artifact and artifact.get("step_results") is not None:
+        step_list = artifact["step_results"]
+        n = len(step_list)
+        st.metric("Steps", f"{n}/{n}")
+        for s in step_list:
+            color = "#16A34A" if s.get("status") == "success" else "#DC2626"
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                f'border-radius:6px;padding:6px 10px;margin:3px 0;'
+                f'display:flex;justify-content:space-between;align-items:center">'
+                f'<div style="display:flex;align-items:center;gap:8px">'
+                f'<span style="color:{color};font-size:0.70em">●</span>'
+                f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
+                f'{_esc(_task_label(s["task"]))}</span>'
+                f'</div>'
+                f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
+                f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
+                f'white-space:nowrap">'
+                f'{_esc(_agent_display(s["agent"]))}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        agents_run = sorted({
+            _AGENT_LABELS.get(s["agent"], s["agent"])
+            for s in step_list
+            if s.get("agent")
+        } - {""})
+    else:
+        replay_steps = _replay_plan_steps(events)
+        n = len(replay_steps)
+        st.metric("Steps", f"{n}/{n}")
+        for s in replay_steps:
+            color = "#16A34A" if s["success"] else "#DC2626"
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                f'border-radius:6px;padding:6px 10px;margin:3px 0;'
+                f'display:flex;justify-content:space-between;align-items:center">'
+                f'<div style="display:flex;align-items:center;gap:8px">'
+                f'<span style="color:{color};font-size:0.70em">●</span>'
+                f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
+                f'{_esc(_task_label(s["task"]))}</span>'
+                f'</div>'
+                f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
+                f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
+                f'white-space:nowrap">'
+                f'{_esc(_agent_display(s["agent"]))}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        agents_run = sorted({
+            _AGENT_LABELS.get(ev.get("agent_name", ""), ev.get("agent_name", ""))
+            for ev in events
+            if ev.get("agent_name")
+        } - {""})
     if agents_run:
         st.markdown(
             f'<div style="font-size:0.78em;color:#374151;margin:6px 0">'

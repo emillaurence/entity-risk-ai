@@ -239,7 +239,7 @@ PLANNING RULES:
 1. Company queries: always start with graph-agent entity_lookup (step_1) to
    resolve the canonical company name before running any other step.
 2. Ownership queries: add graph-agent expand_ownership after entity_lookup.
-   Default max_depth to 5 unless the query specifies otherwise.
+   Default max_depth to 20 unless the query specifies otherwise.
 3. Generic risk queries (no specific dimension named — e.g. "is it risky?",
    "risk assessment", "any red flags?"): add risk-agent
    summarize_risk_for_company. This covers all four dimensions in one step —
@@ -275,10 +275,10 @@ PLANNING RULES:
 EXAMPLES:
 
 Query: "who owns ACME Holdings?"
-{"mode":"investigate","reason":"Ownership query for a company. Resolving canonical name first, then walking the full ownership chain.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":5}}],"stop_conditions":[]}
+{"mode":"investigate","reason":"Ownership query for a company. Resolving canonical name first, then walking the full ownership chain.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":20}}],"stop_conditions":[]}
 
 Query: "who owns ACME Holdings and is it risky?"
-{"mode":"investigate","reason":"Combined ownership and risk query. Walking the ownership chain, then synthesising all four risk signals.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":5}},{"step_id":"step_3","agent":"risk-agent","task":"summarize_risk_for_company","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}
+{"mode":"investigate","reason":"Combined ownership and risk query. Walking the ownership chain, then synthesising all four risk signals.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":20}},{"step_id":"step_3","agent":"risk-agent","task":"summarize_risk_for_company","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}
 
 Query: "who owns ACME Holdings and is it risky address and control?"
 {"mode":"investigate","reason":"Combined ownership query with specific risk dimensions: address and control only.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":5}},{"step_id":"step_3","agent":"risk-agent","task":"address_risk_check","parameters":{"company_name":"ACME Holdings"}},{"step_id":"step_4","agent":"risk-agent","task":"control_signal_check","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}

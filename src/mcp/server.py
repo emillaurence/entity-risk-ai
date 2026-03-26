@@ -9,9 +9,9 @@ Start the server (stdio transport, for Claude Desktop / MCP clients):
 
     python -m src.mcp.server
 
-Or via the MCP CLI:
+Or via the MCP CLI (dev inspector):
 
-    mcp run src/mcp/server.py
+    mcp dev src/mcp/server.py
 
 The tool layer is lazy-initialised on the first call so the server starts
 without a Neo4j connection until a tool is actually invoked.
@@ -19,16 +19,14 @@ without a Neo4j connection until a tool is actually invoked.
 
 from __future__ import annotations
 
-import dataclasses
 import sys
 from pathlib import Path
-from typing import Any
 
-# Ensure the project root is on sys.path when the file is loaded directly
-# (e.g. via `mcp dev` / `mcp run`), not just when run as a package module.
-_project_root = Path(__file__).resolve().parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
+# Ensure project root is on sys.path when invoked via `mcp dev`
+sys.path.insert(0, str(Path(__file__).parents[2]))
+
+import dataclasses
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -307,26 +305,13 @@ def list_recent_traces(limit: int = 20) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle helpers
-# ---------------------------------------------------------------------------
-
-
-def close() -> None:
-    """
-    Close the Neo4j connection opened by the lazy tool initialiser.
-
-    Call this when the server is no longer needed (e.g. at notebook teardown
-    or when MCPToolClient.close() is called).  Safe to call multiple times.
-    """
-    global _graph_tools, _risk_tools, _trace_tools, _shared_tools, _repo
-    if _repo is not None:
-        _repo.close()
-    _repo = _graph_tools = _risk_tools = _trace_tools = _shared_tools = None
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    import os
+    port = int(os.environ.get("PORT", 0))
+    if port:
+        mcp.run(transport="http", host="0.0.0.0", port=port)
+    else:
+        mcp.run()  # stdio — unchanged for local use

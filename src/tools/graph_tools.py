@@ -119,7 +119,7 @@ class GraphTools:
             data = {"paths": paths, "ultimate_owners": ubos}
 
             depths = sorted({r["path_depth"] for r in paths}) if paths else []
-            ubo_names = [u["owner_name"] for u in ubos]
+            ubo_names = [u.get("owner_name") or "?" for u in ubos]
 
             if not paths:
                 summary = f"No ownership paths found for '{company_name}'."

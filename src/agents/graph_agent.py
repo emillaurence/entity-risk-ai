@@ -206,7 +206,7 @@ class GraphAgent(BaseAgent):
             )
 
         if task == "expand_ownership":
-            max_depth = int(context.get("max_depth", 5))
+            max_depth = int(context.get("max_depth", 20))
             return (
                 self._mcp.call_tool(
                     "expand_ownership",
