@@ -1,4 +1,4 @@
-# entity-risk-ai
+# Company Ownership Risk Investigator
 A traceable multi-agent AI system for UK Companies House ownership and risk investigation. It combines a Neo4j graph database, three specialist AI agents, an LLM-based orchestrator, a Streamlit UI, and an MCP server that exposes all investigation tools to any MCP-compatible client.
 
 ## Setup
