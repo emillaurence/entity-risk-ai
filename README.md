@@ -63,6 +63,67 @@ Token spend is tracked per AI call and surfaced in the trace event log.
 The trace subgraph can be selectively deleted by trace ID, entity name,
 or wiped entirely without affecting the underlying business graph.
 
+## MCP Server
+
+The investigation tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.io) so any MCP-compatible client (Claude Desktop, Claude Code) can call them directly.
+
+### Run locally (stdio — for Claude Desktop / MCP Inspector)
+
+```bash
+mcp dev src/mcp/server.py
+```
+
+### Run locally (HTTP — for testing the hosted transport)
+
+```bash
+PORT=8000 python -m src.mcp.server
+```
+
+Test with curl:
+
+```bash
+# Initialise session and capture the session ID
+curl -sv -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}' \
+  2>&1 | grep -i "mcp-session"
+
+# Use the session ID to call a tool
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: <session-id>" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"entity_lookup","arguments":{"name":"ACME"}},"id":2}'
+```
+
+### Run via Docker
+
+```bash
+# Build
+docker build -t entity-risk-ai .
+
+# Run (requires Colima or Docker Desktop on macOS)
+docker run --rm -p 8000:8000 --env-file .env -e PORT=8000 entity-risk-ai
+```
+
+Then test with the curl commands above against `http://localhost:8000/mcp`.
+
+### Connect Claude Code to a hosted instance
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "entity-risk-ai": {
+      "type": "http",
+      "url": "https://<your-deployment-url>/mcp"
+    }
+  }
+}
+```
+
 ## Project Structure
 
 ```
