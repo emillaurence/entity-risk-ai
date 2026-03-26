@@ -121,13 +121,18 @@ _DIM_ORDER: list[str] = ["ownership", "address", "control", "industry"]
 def extract_requested_dimensions(question: str) -> list[str]:
     """Return an ordered list of dimensions requested by the question.
 
-    Returns ["generic_risk"] when no specific dimension keyword is matched,
-    covering pure risk questions ("is it risky?") and generic queries.
-    Specific dimension keywords always win over generic risk keywords.
+    Returns ["generic_risk"] when:
+    - no specific dimension keyword is matched (pure risk / generic query), OR
+    - any risk keyword is present (e.g. "risky", "suspicious") — risk co-occurrence
+      means the user wants the full picture, not just the one dimension they named.
+
+    Example: "Who owns X? And is it risky?" → generic_risk (not ownership-only)
+    Example: "Who owns X?" → ["ownership"]
     """
     q = question.lower()
     found = [d for d in _DIM_ORDER if any(kw in q for kw in _DIM_KEYWORDS[d])]
-    if not found:
+    has_risk = any(kw in q for kw in _RISK_KEYWORDS)
+    if not found or has_risk:
         return [_GENERIC_RISK_DIM]
     return found
 
@@ -339,21 +344,13 @@ def _resolve_generic_risk_dims(
     assessed_dims: list[str],
     evidence: dict,
 ) -> list[str]:
-    """Resolve generic_risk to concrete active dimensions based on evidence.
+    """Return all evidence-backed dimensions when in generic_risk mode.
 
-    Prefers dimensions with positive risk signals (HIGH/MEDIUM/LOW).
-    Falls back to all assessed dims, then to ["ownership"] as last resort.
+    Previously filtered to only dims with an explicit risk_level signal, which
+    dropped repo-enriched dims (address, industry from synthetic injection) that
+    have data but no risk_level set. The full assessed_dims set is always correct.
     """
-    _RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
-    risky = [
-        d for d in assessed_dims
-        if _RANK.get((evidence.get(d, {}).get("risk_level") or "").upper(), 0) > 0
-    ]
-    if risky:
-        return risky
-    if assessed_dims:
-        return assessed_dims
-    return ["ownership"]
+    return assessed_dims or ["ownership"]
 
 
 def enrich_graph_evidence_from_repo_if_needed(
@@ -1144,6 +1141,212 @@ def build_contextual_graph_model(
         insights             = insights,
         default_selection    = None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Trace-based graph reconstruction (Replay / Audit tab)
+# ---------------------------------------------------------------------------
+
+
+def build_contextual_graph_from_trace(
+    replay_data: dict,
+    repo: Any = None,
+) -> "GraphPayload | None":
+    """Build a GraphPayload from a loaded trace dict (Replay / Audit tab).
+
+    Reconstructs a pseudo OrchestratorResult from trace events so the same
+    build_contextual_graph_model pipeline can be reused without duplication.
+    Returns None if trace data is missing or reconstruction fails.
+    """
+    import json as _json_local
+    import re as _re_local
+    from types import SimpleNamespace
+
+    events   = replay_data.get("events") or []
+    question = replay_data.get("question") or replay_data.get("query") or ""
+    query    = replay_data.get("query") or ""
+
+    if not query:
+        return None
+
+    # --- Reconstruct step_results from tool_returned events ---
+    step_results = []
+    for ev in events:
+        if ev.get("event_type") != "tool_returned":
+            continue
+        tool_name = ev.get("tool_name", "")
+        if not tool_name:
+            continue
+        raw = ev.get("data_json") or ""
+        findings: dict = {}
+        if raw:
+            try:
+                data = _json_local.loads(raw)
+                if isinstance(data, dict):
+                    findings = {tool_name: data}
+            except Exception:
+                pass
+        step_results.append(SimpleNamespace(
+            task=tool_name,
+            success=True,
+            findings=findings,
+        ))
+
+    # --- Reconstruct resolved_entities ---
+    canonical_name = query
+    company_number = ""
+    status         = ""
+    for ev in events:
+        if ev.get("event_type") != "agent_reasoning":
+            continue
+        msg = ev.get("input_summary") or ev.get("message") or ""
+        if not _re_local.search(
+            rf"Resolved\s+['\"]?{_re_local.escape(query)}['\"]?", msg, _re_local.IGNORECASE
+        ):
+            continue
+        raw = ev.get("data_json") or ""
+        if raw:
+            try:
+                d = _json_local.loads(raw)
+                canonical_name = d.get("canonical_name") or query
+                company_number = d.get("company_number") or ""
+                status         = d.get("status") or ""
+                break
+            except Exception:
+                pass
+        m = _re_local.search(r"→\s*['\"]?(.+?)['\"]?\s*$", msg)
+        if m:
+            canonical_name = m.group(1).strip()
+        break
+
+    resolved_entities = {
+        canonical_name: {
+            "canonical_name": canonical_name,
+            "company_number": company_number,
+            "status":         status,
+        }
+    }
+
+    # Inject a synthetic company_profile step so address + SIC evidence is always
+    # populated when a repo is available. Trace events often lack this data because
+    # collect_graph_evidence requires it to be present for those dims to enter
+    # assessed_dims → active_dims → _add_address_layer / _add_industry_layer.
+    if repo is not None:
+        try:
+            _address = repo.get_company_address_context(canonical_name)
+            _sics    = repo.get_company_sic_context(canonical_name)
+            _owners  = repo.get_direct_owners(canonical_name)
+            _company = repo.get_company_by_exact_name(canonical_name)
+            if _address or _sics:
+                # Prepend so real trace events can still override via setdefault
+                step_results.insert(0, SimpleNamespace(
+                    task="company_profile",
+                    success=True,
+                    findings={
+                        "company_profile": {
+                            "company":       _company or {},
+                            "address":       _address or {},
+                            "sic_codes":     _sics    or [],
+                            "direct_owners": _owners  or [],
+                        }
+                    },
+                ))
+        except Exception:
+            pass
+
+    # Do NOT inject a synthetic summarize_risk_for_company step here.
+    # Same-session traces are served from the session-state cache (exact fidelity).
+    # Reconstruction is only reached for truly old traces; for those, the graph
+    # reflects what the question's requested dimensions cover — no overreach.
+
+    pseudo_result = SimpleNamespace(
+        step_results=step_results,
+        resolved_entities=resolved_entities,
+        query=query,
+    )
+
+    try:
+        return build_contextual_graph_model(question or query, pseudo_result, repo=repo)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GraphPayload serialization helpers (for trace persistence)
+# ---------------------------------------------------------------------------
+
+
+def serialize_graph_payload(payload: GraphPayload) -> str:
+    """Convert a GraphPayload to a JSON string for storage in a trace record.
+
+    Nodes and edges are serialized via their own ``to_dict()`` method — the
+    exact same call made by ``_render_shared_graph_panel`` when building the
+    agraph data payload.  This guarantees byte-for-byte replay fidelity:
+    whatever was rendered in the Investigate tab is stored verbatim.
+    """
+    import json as _j
+    return _j.dumps(
+        {
+            "view_label":           payload.view_label,
+            "primary_driver":       payload.primary_driver,
+            "requested_dimensions": payload.requested_dimensions,
+            "assessed_dimensions":  payload.assessed_dimensions,
+            "rendered_dimensions":  payload.rendered_dimensions,
+            "nodes":                [n.to_dict() for n in payload.nodes],
+            "edges":                [e.to_dict() for e in payload.edges],
+            "node_meta":            payload.node_meta,
+            "edge_meta":            payload.edge_meta,
+            "insights":             payload.insights,
+            "default_selection":    payload.default_selection,
+        },
+        default=str,
+    )
+
+
+class _DictProxy:
+    """Minimal proxy for a stored node/edge dict.
+
+    ``_render_shared_graph_panel`` only ever calls ``.to_dict()`` on the
+    objects in ``GraphPayload.nodes`` / ``GraphPayload.edges``.  By wrapping
+    the stored dict in this proxy we replay the exact bytes that were
+    originally passed to the agraph renderer — no reconstruction drift.
+    """
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d: dict) -> None:
+        self._d = d
+
+    def to_dict(self) -> dict:
+        return self._d
+
+
+def deserialize_graph_payload(json_str: str) -> "GraphPayload | None":
+    """Reconstruct a GraphPayload from a JSON string persisted in a trace record."""
+    import json as _j
+    try:
+        d = _j.loads(json_str)
+        nodes = [_DictProxy(n) for n in d.get("nodes", [])]
+        edges = [_DictProxy(e) for e in d.get("edges", [])]
+        return GraphPayload(
+            view_label=d.get("view_label", ""),
+            primary_driver=d.get("primary_driver", ""),
+            requested_dimensions=d.get("requested_dimensions", []),
+            assessed_dimensions=d.get("assessed_dimensions", []),
+            rendered_dimensions=d.get("rendered_dimensions", []),
+            nodes=nodes,
+            edges=edges,
+            node_meta=d.get("node_meta", {}),
+            edge_meta=d.get("edge_meta", {}),
+            insights=d.get("insights", {
+                "ownership_depth":      "—",
+                "beneficial_owner":     "—",
+                "structure_complexity": "—",
+            }),
+            default_selection=d.get("default_selection"),
+        )
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------

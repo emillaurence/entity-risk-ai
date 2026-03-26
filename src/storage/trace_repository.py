@@ -155,6 +155,22 @@ class TraceRepository:
             },
         )
 
+    def set_graph_payload_json(self, trace_id: str, graph_json: str) -> None:
+        """Persist the serialized graph payload on an existing InvestigationTrace node."""
+        self._repo.run_query(
+            "MATCH (t:InvestigationTrace {trace_id: $trace_id}) "
+            "SET t.graph_payload_json = $graph_json",
+            {"trace_id": trace_id, "graph_json": graph_json},
+        )
+
+    def set_investigation_artifact_json(self, trace_id: str, artifact_json: str) -> None:
+        """Persist the serialized investigation artifact on an existing InvestigationTrace node."""
+        self._repo.run_query(
+            "MATCH (t:InvestigationTrace {trace_id: $trace_id}) "
+            "SET t.investigation_artifact_json = $artifact_json",
+            {"trace_id": trace_id, "artifact_json": artifact_json},
+        )
+
     # ------------------------------------------------------------------
     # Read operations
     # ------------------------------------------------------------------
@@ -171,14 +187,16 @@ class TraceRepository:
             """
             MATCH (t:InvestigationTrace {trace_id: $trace_id})
             RETURN
-                t.trace_id       AS trace_id,
-                t.query          AS query,
-                t.question       AS question,
-                t.user_id        AS user_id,
-                t.mode           AS mode,
-                t.started_at     AS started_at,
-                t.ended_at       AS ended_at,
-                t.final_summary  AS final_summary
+                t.trace_id            AS trace_id,
+                t.query               AS query,
+                t.question            AS question,
+                t.user_id             AS user_id,
+                t.mode                AS mode,
+                t.started_at          AS started_at,
+                t.ended_at            AS ended_at,
+                t.final_summary       AS final_summary,
+                t.graph_payload_json           AS graph_payload_json,
+                t.investigation_artifact_json  AS investigation_artifact_json
             """,
             {"trace_id": trace_id},
         )

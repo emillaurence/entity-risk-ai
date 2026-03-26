@@ -644,6 +644,34 @@ def _extract_replay_graph_insights(events: list) -> dict:
     return out
 
 
+def _load_replay_artifact(replay_data: dict) -> dict | None:
+    """Load the persisted investigation artifact for a replay trace.
+
+    Resolution order:
+    1. Session-state cache (populated by the Investigate tab in the same rerun).
+    2. investigation_artifact_json persisted in Neo4j (loaded via load_trace).
+
+    Returns None for legacy traces that pre-date this feature; callers fall back
+    to event-based inference in that case.
+    """
+    trace_id = replay_data.get("trace_id", "")
+    # 1. Session cache — set by _render_graph_column in the same rerun
+    cached = st.session_state.get(f"_investigation_artifact_cache_{trace_id}")
+    if cached:
+        try:
+            return _json.loads(cached)
+        except Exception:
+            pass
+    # 2. Persisted JSON from Neo4j
+    raw = replay_data.get("investigation_artifact_json")
+    if raw:
+        try:
+            return _json.loads(raw)
+        except Exception:
+            pass
+    return None
+
+
 def _name_similarity(searched: str, canonical: str) -> int:
     """Return 0–100 name similarity score using SequenceMatcher ratio."""
     if not searched or not canonical:
@@ -2621,6 +2649,59 @@ def _build_replay_assessment(replay_data: dict) -> dict:
     }
 
 
+def _build_investigation_artifact(result: Any, question: str) -> dict:
+    """Build a serializable artifact capturing all state needed to render the Investigate tab.
+
+    Called once after investigation completes; persisted alongside graph_payload_json.
+    Audit loads this artifact directly rather than reconstructing from event inference.
+    """
+    # Resolved entity (first confirmed entity)
+    resolved_entity: dict = {}
+    for _, data in (result.resolved_entities or {}).items():
+        if data:
+            resolved_entity = {
+                "canonical_name":  data.get("canonical_name", ""),
+                "company_number":  data.get("company_number", ""),
+                "status":          data.get("status", ""),
+                "jurisdiction":    data.get("jurisdiction", "UK"),
+                "match_score_pct": data.get("match_score_pct"),
+            }
+            break
+
+    # Assessment dict — identical contract consumed by _render_decision_first_assessment
+    assessment = _build_structured_assessment(result)
+
+    # Risk dimensions — {dim_key: risk_level}
+    dims = _collect_risk_dims(result)
+
+    # Plan metadata
+    plan = result.planner_output or {}
+    plan_reason = plan.get("reason", "")
+    investigation_type = _MODE_DISPLAY.get(plan.get("mode", ""), "")
+
+    # Step results summary (task, agent, status for each step)
+    step_summaries = [
+        {
+            "task":    s.task,
+            "agent":   s.agent,
+            "status":  s.status,   # "success" | "failed" | "skipped"
+            "skipped": s.skipped,
+        }
+        for s in (result.step_results or [])
+    ]
+
+    return {
+        "artifact_version":   1,
+        "question":           question,
+        "resolved_entity":    resolved_entity,
+        "assessment":         assessment,
+        "risk_dimensions":    dims,
+        "investigation_type": investigation_type,
+        "plan_reason":        plan_reason,
+        "step_results":       step_summaries,
+    }
+
+
 def _chip_click(prompt: str) -> None:
     """on_click callback for quick-prompt chips — populates the textarea."""
     st.session_state["_input_question"] = prompt
@@ -3011,6 +3092,124 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
             )
 
 
+def _render_shared_graph_panel(payload: Any, session_node_key: str) -> None:
+    """Render the interactive graph canvas, legend, node detail panel, and insights.
+
+    Shared by both Investigate (_render_graph_column) and Replay (_render_replay_graph_column).
+    ``session_node_key`` isolates selected-node state between the two tabs.
+    """
+    import json as _json
+    from streamlit_agraph import Config, _agraph
+
+    if payload.nodes:
+        config = Config(
+            height=560,
+            directed=True,
+            physics=True,
+            **{
+                "interaction": {
+                    "hover":                True,
+                    "tooltipDelay":         100,
+                    "selectConnectedEdges": True,
+                },
+                "edges": {
+                    "smooth":  {"enabled": True},
+                    "arrows":  {"to": {"enabled": True, "scaleFactor": 0.7}},
+                    "font":    {"size": 10, "align": "middle",
+                                "strokeWidth": 2, "strokeColor": "#F8FAFC"},
+                },
+                "nodes": {
+                    "font": {"size": 13},
+                },
+            },
+        )
+        _data_json = _json.dumps({
+            "nodes": [n.to_dict() for n in payload.nodes],
+            "edges": [e.to_dict() for e in payload.edges],
+        })
+        raw_selection = _agraph(data=_data_json, config=_json.dumps(config.__dict__), key=session_node_key)
+        if raw_selection is not None:
+            st.session_state[session_node_key] = raw_selection
+    else:
+        st.caption("No graph data available for this entity.")
+
+    # Compact colour legend + mixed-dimension view badge
+    _DIM_BADGE_COLORS: dict[str, tuple[str, str]] = {
+        "ownership": ("#DBEAFE", "#1D4ED8"),
+        "address":   ("#FEF3C7", "#D97706"),
+        "control":   ("#F3E8FF", "#7C3AED"),
+        "industry":  ("#F0FDF4", "#15803D"),
+    }
+    LEGEND_FOCAL   = "#1D4ED8"
+    LEGEND_COMPANY = "#93C5FD"
+    LEGEND_PERSON  = "#34D399"
+    LEGEND_ADDRESS = "#FCD34D"
+    LEGEND_COLOC   = "#EAB308"
+    LEGEND_SIC     = "#8B5CF6"
+    intent_bg, intent_fg = _DIM_BADGE_COLORS.get(
+        payload.primary_driver, ("#F0FDF4", "#15803D")
+    )
+    intent_lbl     = payload.view_label
+    _show_coloc    = "address"  in payload.rendered_dimensions
+    _show_industry = "industry" in payload.rendered_dimensions
+    legend_html = (
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_FOCAL}">■</span> Focal entity</span>'
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_COMPANY}">■</span> Company</span>'
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_PERSON}">■</span> Individual / UBO</span>'
+        f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+        f'<span style="color:{LEGEND_ADDRESS}">■</span> Address</span>'
+        + (
+            f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{LEGEND_COLOC}">■</span> Co-located</span>'
+            if _show_coloc else ""
+        )
+        + (
+            f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
+            f'<span style="color:{LEGEND_SIC}">■</span> Industry</span>'
+            if _show_industry else ""
+        ) +
+        f'<span style="float:right;font-size:0.72em;font-weight:600;'
+        f'background:{intent_bg};color:{intent_fg};'
+        f'border-radius:4px;padding:1px 7px">{_esc(intent_lbl)}</span>'
+    )
+    st.markdown(f'<div style="margin:4px 0 10px">{legend_html}</div>',
+                unsafe_allow_html=True)
+
+    # Selected node detail panel (shown only after a node is clicked)
+    selected_id = st.session_state.get(session_node_key)
+    if selected_id and selected_id in payload.node_meta:
+        _render_node_detail_panel(selected_id, payload.node_meta, payload.edge_meta)
+
+    # Graph Insights — sourced from the graph payload
+    insights = payload.insights
+    _label_row("Graph Insights")
+    gi_rows = (
+        f'<div style="display:flex;justify-content:space-between;'
+        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+        f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["ownership_depth"])}</span></div>'
+        f'<div style="display:flex;justify-content:space-between;'
+        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+        f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["beneficial_owner"])}</span></div>'
+        f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
+        f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
+        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+        f'{_esc(insights["structure_complexity"])}</span></div>'
+    )
+    st.markdown(
+        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+        f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+        f'{gi_rows}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def _render_graph_column(components: "AppComponents") -> None:
     """Col 2 of the Investigate tab: hierarchical interactive ownership graph when
     done; live step checklist during execution."""
@@ -3063,117 +3262,57 @@ def _render_graph_column(components: "AppComponents") -> None:
         payload = None
         try:
             from src.app.contextual_graph import build_contextual_graph_model
-            from streamlit_agraph import Config, agraph
-
             payload = build_contextual_graph_model(question, result, repo=components.repo)
-            if payload.nodes:
-                config = Config(
-                    height=560,
-                    directed=True,
-                    physics=True,
-                    **{
-                        "interaction": {
-                            "hover":                True,
-                            "tooltipDelay":         100,
-                            "selectConnectedEdges": True,
-                        },
-                        "edges": {
-                            "smooth":  {"enabled": True},
-                            "arrows":  {"to": {"enabled": True, "scaleFactor": 0.7}},
-                            "font":    {"size": 10, "align": "middle",
-                                        "strokeWidth": 2, "strokeColor": "#F8FAFC"},
-                        },
-                        "nodes": {
-                            "font": {"size": 13},
-                        },
-                    },
-                )
-                raw_selection = agraph(nodes=payload.nodes, edges=payload.edges, config=config)
-                # Persist the last non-None selection across reruns
-                if raw_selection is not None:
-                    st.session_state["_graph_selected_node"] = raw_selection
-            else:
-                st.caption("No graph data available for this entity.")
         except Exception:
             st.caption("Graph could not be rendered.")
 
+        # Persist graph payload to trace once per trace (enables Replay tab parity).
+        # Also cache in session state so the Replay tab can load it in the same
+        # rerun without a race against the Neo4j write (load_trace runs before
+        # tabs render in layout.py, so graph_payload_json isn't in replay_data yet).
         if payload is not None:
-            # Compact colour legend + mixed-dimension view badge
-            _DIM_BADGE_COLORS: dict[str, tuple[str, str]] = {
-                "ownership": ("#DBEAFE", "#1D4ED8"),
-                "address":   ("#FEF3C7", "#D97706"),
-                "control":   ("#F3E8FF", "#7C3AED"),
-                "industry":  ("#F0FDF4", "#15803D"),
-            }
-            LEGEND_FOCAL   = "#1D4ED8"
-            LEGEND_COMPANY = "#93C5FD"
-            LEGEND_PERSON  = "#34D399"
-            LEGEND_ADDRESS = "#FCD34D"
-            LEGEND_COLOC   = "#EAB308"
-            intent_bg, intent_fg = _DIM_BADGE_COLORS.get(
-                payload.primary_driver, ("#F0FDF4", "#15803D")
-            )
-            intent_lbl = payload.view_label
+            import logging as _glog
+            _logger = _glog.getLogger(__name__)
 
-            _show_coloc    = "address"  in payload.rendered_dimensions
-            _show_industry = "industry" in payload.rendered_dimensions
-            LEGEND_SIC     = "#8B5CF6"
-            legend_html = (
-                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
-                f'<span style="color:{LEGEND_FOCAL}">■</span> Focal entity</span>'
-                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
-                f'<span style="color:{LEGEND_COMPANY}">■</span> Company</span>'
-                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
-                f'<span style="color:{LEGEND_PERSON}">■</span> Individual / UBO</span>'
-                f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
-                f'<span style="color:{LEGEND_ADDRESS}">■</span> Address</span>'
-                + (
-                    f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
-                    f'<span style="color:{LEGEND_COLOC}">■</span> Co-located</span>'
-                    if _show_coloc else ""
-                )
-                + (
-                    f'<span style="margin-right:10px;font-size:0.73em;color:#6B7280">'
-                    f'<span style="color:{LEGEND_SIC}">■</span> Industry</span>'
-                    if _show_industry else ""
-                ) +
-                f'<span style="float:right;font-size:0.72em;font-weight:600;'
-                f'background:{intent_bg};color:{intent_fg};'
-                f'border-radius:4px;padding:1px 7px">{_esc(intent_lbl)}</span>'
+            _tid = getattr(result, "trace_id", None) or state.get_trace_id()
+            _logger.info(
+                "[graph_write] trace_id=%r  view_label=%r  nodes=%d",
+                _tid, getattr(payload, "view_label", "?"), len(payload.nodes),
             )
-            st.markdown(f'<div style="margin:4px 0 10px">{legend_html}</div>',
-                        unsafe_allow_html=True)
+            if _tid:
+                from src.app.contextual_graph import serialize_graph_payload
+                _serialized = serialize_graph_payload(payload)
+                # Always keep the session-state cache fresh (free, in-process)
+                st.session_state[f"_graph_payload_cache_{_tid}"] = _serialized
+                _logger.info("[graph_write] session_cache written  key=_graph_payload_cache_%s", _tid)
 
-            # Selected node detail panel (shown only after a node is clicked)
-            selected_id = st.session_state.get("_graph_selected_node")
-            if selected_id and selected_id in payload.node_meta:
-                _render_node_detail_panel(selected_id, payload.node_meta, payload.edge_meta)
+                # Always persist graph_payload_json to Neo4j — no once-per-session guard.
+                # set_graph_payload_json is an idempotent SET; always writing ensures the
+                # latest full payload survives cross-session replay.
+                if components.trace_repo:
+                    try:
+                        components.trace_repo.set_graph_payload_json(_tid, _serialized)
+                        _logger.info("[graph_write] neo4j write OK  trace_id=%s  len=%d", _tid, len(_serialized))
+                    except Exception as _e:
+                        _logger.warning("[graph_write] neo4j write FAILED  trace_id=%s  err=%s", _tid, _e)
 
-            # Graph Insights — sourced from the graph payload
-            insights = payload.insights
-            _label_row("Graph Insights")
-            gi_rows = (
-                f'<div style="display:flex;justify-content:space-between;'
-                f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-                f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
-                f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-                f'{_esc(insights["ownership_depth"])}</span></div>'
-                f'<div style="display:flex;justify-content:space-between;'
-                f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-                f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
-                f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-                f'{_esc(insights["beneficial_owner"])}</span></div>'
-                f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
-                f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
-                f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-                f'{_esc(insights["structure_complexity"])}</span></div>'
-            )
-            st.markdown(
-                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-                f'border-radius:8px;padding:10px 14px;margin:6px 0">'
-                f'{gi_rows}</div>',
-                unsafe_allow_html=True,
-            )
+                # Persist investigation artifact once per trace (enables Audit rehydration)
+                _artifact_save_key = f"_investigation_artifact_saved_{_tid}"
+                if not st.session_state.get(_artifact_save_key) and components.trace_repo:
+                    try:
+                        _artifact = _build_investigation_artifact(result, question)
+                        _artifact_json = _json.dumps(_artifact)
+                        st.session_state[f"_investigation_artifact_cache_{_tid}"] = _artifact_json
+                        components.trace_repo.set_investigation_artifact_json(_tid, _artifact_json)
+                        st.session_state[_artifact_save_key] = True
+                        _logger.info("[graph_write] artifact written  trace_id=%s", _tid)
+                    except Exception as _ae:
+                        _logger.warning("[graph_write] artifact write FAILED  trace_id=%s  err=%s", _tid, _ae)
+            else:
+                _logger.warning("[graph_write] _tid is falsy — skipping all writes")
+
+        if payload is not None:
+            _render_shared_graph_panel(payload, "_graph_selected_node")
         return
 
     if live_phase == "idle" and result is None:
@@ -3523,7 +3662,7 @@ def render_replay_tab(components: "AppComponents") -> None:
         _render_replay_input_column(components)
 
     with col2:
-        _render_replay_graph_column()
+        _render_replay_graph_column(components)
 
     with col3:
         _render_replay_insights_column()
@@ -3600,12 +3739,18 @@ def _render_replay_input_column(components: "AppComponents") -> None:
                 unsafe_allow_html=True,
             )
 
-        # Identified entity — uses the same card as Investigate tab
+        # Identified entity — prefer persisted artifact; fall back to event extraction
         query = replay_data.get("query", "")
         if query:
-            events_col1 = replay_data.get("events") or []
-            entity_info = _extract_replay_entity(events_col1, query)
-            _render_resolved_entity_banner({query: entity_info})
+            artifact = _load_replay_artifact(replay_data)
+            if artifact and artifact.get("resolved_entity"):
+                entity_info = artifact["resolved_entity"]
+                canonical   = entity_info.get("canonical_name") or query
+                _render_resolved_entity_banner({canonical: entity_info})
+            else:
+                events_col1 = replay_data.get("events") or []
+                entity_info = _extract_replay_entity(events_col1, query)
+                _render_resolved_entity_banner({query: entity_info})
 
     st.divider()
 
@@ -3618,40 +3763,34 @@ def _render_replay_input_column(components: "AppComponents") -> None:
     elif replay_status == "error":
         _render_assessment_card_skeleton("Could not load investigation.")
     elif replay_status == "loaded" and replay_data:
-        has_summary = bool(replay_data.get("final_summary"))
-        has_dims    = any(
-            v in ("HIGH", "MEDIUM", "LOW")
-            for v in _extract_replay_risk_dimensions(replay_data).values()
-        )
-        if has_summary or has_dims:
-            assessment = _build_replay_assessment(replay_data)
-            _render_decision_first_assessment(assessment)
+        artifact = _load_replay_artifact(replay_data)
+        if artifact and artifact.get("assessment"):
+            # New traces: render directly from persisted artifact
+            _render_decision_first_assessment(artifact["assessment"])
         else:
-            _render_assessment_card_skeleton("No summary recorded for this investigation.", show_pending_rows=False)
+            # Legacy traces: reconstruct from event inference
+            has_summary = bool(replay_data.get("final_summary"))
+            has_dims    = any(
+                v in ("HIGH", "MEDIUM", "LOW")
+                for v in _extract_replay_risk_dimensions(replay_data).values()
+            )
+            if has_summary or has_dims:
+                _render_decision_first_assessment(_build_replay_assessment(replay_data))
+            else:
+                _render_assessment_card_skeleton("No summary recorded for this investigation.", show_pending_rows=False)
 
 
-def _render_replay_graph_column() -> None:
-    """Col 2 of the Replay tab: entity context panel.
+def _render_replay_graph_column(components: "AppComponents") -> None:
+    """Col 2 of the Replay tab: Context Graph panel.
 
-    Mirrors _render_graph_column from the Investigate tab.
+    Mirrors _render_graph_column from the Investigate tab by using the same
+    _render_shared_graph_panel renderer. Graph data is reconstructed from
+    trace events via build_contextual_graph_from_trace.
     """
     replay_status = state.get_replay_status()
     replay_data   = state.get_replay_data()
 
     _section_header("🕸️ Context Graph", "Entity ownership and relationship map")
-
-    legend_items = [
-        ("🔵", "Company"),
-        ("🟢", "Beneficial Owner"),
-        ("🟡", "Address"),
-        ("🔗", "Ownership Link"),
-    ]
-    legend_html = "".join(
-        f'<span style="margin-right:12px;font-size:0.78em;color:#6B7280">'
-        f'{icon} {_esc(label)}</span>'
-        for icon, label in legend_items
-    )
-    st.markdown(f'<div style="margin-bottom:12px">{legend_html}</div>', unsafe_allow_html=True)
 
     if replay_status != "loaded" or not replay_data:
         st.markdown(
@@ -3664,46 +3803,101 @@ def _render_replay_graph_column() -> None:
         )
         return
 
-    # Entity details box
-    query = replay_data.get("query", "")
-    events_col2 = replay_data.get("events") or []
-    company_no_col2 = _extract_replay_company_number(events_col2)
-    no_str_col2 = f". (No. {company_no_col2})" if company_no_col2 else ""
-    _label_row("Entity Details")
-    with st.container(border=True):
+    # Clear node selection when a different trace is loaded
+    trace_id = replay_data.get("trace_id") or id(replay_data)
+    if st.session_state.get("_replay_graph_trace") != trace_id:
+        st.session_state["_replay_graph_trace"] = trace_id
+        st.session_state.pop("_replay_graph_selected_node", None)
+
+    from src.app.contextual_graph import (
+        deserialize_graph_payload,
+        build_contextual_graph_from_trace,
+    )
+
+    import logging as _glog
+    _logger = _glog.getLogger(__name__)
+    _logger.info("[graph_read] trace_id=%r", trace_id)
+
+    payload = None
+
+    # Tier 1 — Session-state cache (same-session, before any Neo4j round-trip).
+    # _render_graph_column runs before this function on every rerun and
+    # unconditionally writes _graph_payload_cache_{tid}. Avoids the load_trace
+    # timing race where replay_data is populated before _render_graph_column
+    # writes graph_payload_json to Neo4j.
+    _cached_json = st.session_state.get(f"_graph_payload_cache_{trace_id}")
+    _logger.info("[graph_read] tier1 cache_found=%s  len=%s", bool(_cached_json), len(_cached_json) if _cached_json else 0)
+    if _cached_json:
+        try:
+            payload = deserialize_graph_payload(_cached_json)
+            _logger.info("[graph_read] tier1 OK  view_label=%r  nodes=%d", getattr(payload, "view_label", "?"), len(payload.nodes) if payload else 0)
+        except Exception as _e:
+            _logger.warning("[graph_read] tier1 deserialize FAILED: %s", _e)
+            payload = None
+
+    # Tier 2 — Neo4j stored payload (cross-session primary source).
+    # graph_payload_json is written by _render_graph_column on first render after
+    # each investigation. Use it unconditionally — no discriminator needed.
+    if payload is None or not payload.nodes:
+        _stored_json = replay_data.get("graph_payload_json")
+        _logger.info("[graph_read] tier2 graph_payload_json_in_replay=%s  len=%s", bool(_stored_json), len(_stored_json) if _stored_json else 0)
+        if _stored_json:
+            try:
+                payload = deserialize_graph_payload(_stored_json)
+                _logger.info("[graph_read] tier2 OK  view_label=%r  nodes=%d", getattr(payload, "view_label", "?"), len(payload.nodes) if payload else 0)
+            except Exception as _e:
+                _logger.warning("[graph_read] tier2 deserialize FAILED: %s", _e)
+                payload = None
+
+    # Tier 3 — Reconstruction (last resort for traces predating graph_payload_json).
+    if payload is None or not payload.nodes:
+        _logger.info("[graph_read] tier3 falling back to reconstruction")
+        try:
+            payload = build_contextual_graph_from_trace(replay_data, repo=components.repo)
+            _logger.info("[graph_read] tier3 OK  view_label=%r  nodes=%d", getattr(payload, "view_label", "?"), len(payload.nodes) if payload else 0)
+        except Exception as _e:
+            _logger.warning("[graph_read] tier3 reconstruction FAILED: %s", _e)
+            payload = None
+
+    _logger.info("[graph_read] final  payload_ok=%s  view_label=%r", payload is not None and bool(payload.nodes), getattr(payload, "view_label", None) if payload else None)
+
+    if payload is not None and payload.nodes:
+        _render_shared_graph_panel(payload, "_replay_graph_selected_node")
+    else:
+        # Graceful fallback: graph insights derived from trace events
         st.markdown(
-            f'<div style="font-weight:600;color:#111827;font-size:0.92em;'
-            f'margin-bottom:4px">🔵 {_esc(query)}{_esc(no_str_col2)}</div>',
+            '<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            'border-radius:8px;padding:20px;text-align:center;'
+            'color:#94A3B8;font-size:0.83em;margin-bottom:10px">'
+            'Graph could not be reconstructed from this trace.'
+            '</div>',
             unsafe_allow_html=True,
         )
-        st.caption("loaded from trace")
-
-    # Graph insights derived from events
-    events  = replay_data.get("events") or []
-    insights = _extract_replay_graph_insights(events)
-    _label_row("Graph Insights")
-    gi_rows = (
-        f'<div style="display:flex;justify-content:space-between;'
-        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-        f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
-        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-        f'{_esc(insights["ownership_depth"])}</span></div>'
-        f'<div style="display:flex;justify-content:space-between;'
-        f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
-        f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
-        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-        f'{_esc(insights["beneficial_owner"])}</span></div>'
-        f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
-        f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
-        f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
-        f'{_esc(insights["structure_complexity"])}</span></div>'
-    )
-    st.markdown(
-        f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-        f'border-radius:8px;padding:10px 14px;margin:6px 0">'
-        f'{gi_rows}</div>',
-        unsafe_allow_html=True,
-    )
+        events   = replay_data.get("events") or []
+        insights = _extract_replay_graph_insights(events)
+        _label_row("Graph Insights")
+        gi_rows = (
+            f'<div style="display:flex;justify-content:space-between;'
+            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.82em;color:#6B7280">Ownership Depth</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["ownership_depth"])}</span></div>'
+            f'<div style="display:flex;justify-content:space-between;'
+            f'padding:5px 0;border-bottom:1px solid #F3F4F6">'
+            f'<span style="font-size:0.82em;color:#6B7280">Beneficial Owner Identified</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["beneficial_owner"])}</span></div>'
+            f'<div style="display:flex;justify-content:space-between;padding:5px 0">'
+            f'<span style="font-size:0.82em;color:#6B7280">Structure Complexity</span>'
+            f'<span style="font-size:0.82em;font-weight:600;color:#111827">'
+            f'{_esc(insights["structure_complexity"])}</span></div>'
+        )
+        st.markdown(
+            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+            f'border-radius:8px;padding:10px 14px;margin:6px 0">'
+            f'{gi_rows}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def _render_replay_insights_column() -> None:
@@ -3725,12 +3919,17 @@ def _render_replay_insights_column() -> None:
         )
         return
 
-    events       = replay_data.get("events") or []
-    mode         = replay_data.get("mode", "")
-    mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "")
-    trace_id     = replay_data.get("trace_id", "")
+    events    = replay_data.get("events") or []
+    trace_id  = replay_data.get("trace_id", "")
+    artifact  = _load_replay_artifact(replay_data)
 
-    # Investigation Type
+    # Investigation Type — prefer artifact; fall back to mode field
+    if artifact:
+        mode_display = artifact.get("investigation_type", "")
+    else:
+        mode         = replay_data.get("mode", "")
+        mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "")
+
     if mode_display:
         st.markdown(
             f'<div style="font-size:0.72em;font-weight:700;color:#6B7280;'
@@ -3754,22 +3953,29 @@ def _render_replay_insights_column() -> None:
         unsafe_allow_html=True,
     )
 
-    replay_dims = _extract_replay_risk_dimensions(replay_data)
+    # Key Risk Drivers — prefer artifact; fall back to event extraction
+    if artifact:
+        replay_dims = artifact.get("risk_dimensions") or {}
+    else:
+        replay_dims = _extract_replay_risk_dimensions(replay_data)
 
-    # Key Risk Drivers
     if any(v in ("HIGH", "MEDIUM", "LOW") for v in replay_dims.values()):
         _label_row("Key Risk Drivers")
         _render_risk_drivers_grid(replay_dims)
 
-    # Assessment Summary (plan reason)
-    plan_reason = ""
-    for ev in events:
-        if ev.get("event_type") == "plan_created":
-            raw = ev.get("input_summary", "") or ""
-            m = _re.search(r"reason:\s*(.+)$", raw, _re.IGNORECASE | _re.DOTALL)
-            if m:
-                plan_reason = m.group(1).strip()
-            break
+    # Assessment Summary — prefer artifact; fall back to regex on plan_created event
+    if artifact:
+        plan_reason = artifact.get("plan_reason", "")
+    else:
+        plan_reason = ""
+        for ev in events:
+            if ev.get("event_type") == "plan_created":
+                raw = ev.get("input_summary", "") or ""
+                m = _re.search(r"reason:\s*(.+)$", raw, _re.IGNORECASE | _re.DOTALL)
+                if m:
+                    plan_reason = m.group(1).strip()
+                break
+
     if plan_reason:
         _label_row("Assessment Summary")
         st.markdown(
@@ -3782,35 +3988,62 @@ def _render_replay_insights_column() -> None:
 
     st.divider()
 
-    # Details
+    # Details — prefer artifact step_results; fall back to _replay_plan_steps
     _label_row("Details")
-    replay_steps = _replay_plan_steps(events)
-    n = len(replay_steps)
-    st.metric("Steps", f"{n}/{n}")
-    for s in replay_steps:
-        color = "#16A34A" if s["success"] else "#DC2626"
-        st.markdown(
-            f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
-            f'border-radius:6px;padding:6px 10px;margin:3px 0;'
-            f'display:flex;justify-content:space-between;align-items:center">'
-            f'<div style="display:flex;align-items:center;gap:8px">'
-            f'<span style="color:{color};font-size:0.70em">●</span>'
-            f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
-            f'{_esc(_task_label(s["task"]))}</span>'
-            f'</div>'
-            f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
-            f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
-            f'white-space:nowrap">'
-            f'{_esc(_agent_display(s["agent"]))}</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-    agents_run = sorted({
-        _AGENT_LABELS.get(ev.get("agent_name", ""), ev.get("agent_name", ""))
-        for ev in events
-        if ev.get("agent_name")
-    } - {""})
+    if artifact and artifact.get("step_results") is not None:
+        step_list = artifact["step_results"]
+        n = len(step_list)
+        st.metric("Steps", f"{n}/{n}")
+        for s in step_list:
+            color = "#16A34A" if s.get("status") == "success" else "#DC2626"
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                f'border-radius:6px;padding:6px 10px;margin:3px 0;'
+                f'display:flex;justify-content:space-between;align-items:center">'
+                f'<div style="display:flex;align-items:center;gap:8px">'
+                f'<span style="color:{color};font-size:0.70em">●</span>'
+                f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
+                f'{_esc(_task_label(s["task"]))}</span>'
+                f'</div>'
+                f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
+                f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
+                f'white-space:nowrap">'
+                f'{_esc(_agent_display(s["agent"]))}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        agents_run = sorted({
+            _AGENT_LABELS.get(s["agent"], s["agent"])
+            for s in step_list
+            if s.get("agent")
+        } - {""})
+    else:
+        replay_steps = _replay_plan_steps(events)
+        n = len(replay_steps)
+        st.metric("Steps", f"{n}/{n}")
+        for s in replay_steps:
+            color = "#16A34A" if s["success"] else "#DC2626"
+            st.markdown(
+                f'<div style="background:#F8FAFC;border:1px solid #E2E8F0;'
+                f'border-radius:6px;padding:6px 10px;margin:3px 0;'
+                f'display:flex;justify-content:space-between;align-items:center">'
+                f'<div style="display:flex;align-items:center;gap:8px">'
+                f'<span style="color:{color};font-size:0.70em">●</span>'
+                f'<span style="font-size:0.82em;color:#1F2937;font-weight:500">'
+                f'{_esc(_task_label(s["task"]))}</span>'
+                f'</div>'
+                f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
+                f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
+                f'white-space:nowrap">'
+                f'{_esc(_agent_display(s["agent"]))}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        agents_run = sorted({
+            _AGENT_LABELS.get(ev.get("agent_name", ""), ev.get("agent_name", ""))
+            for ev in events
+            if ev.get("agent_name")
+        } - {""})
     if agents_run:
         st.markdown(
             f'<div style="font-size:0.78em;color:#374151;margin:6px 0">'
