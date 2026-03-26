@@ -1,5 +1,5 @@
 # entity-risk-ai
-A Traceable Multi-Agent AI System for Ownership and Risk Investigation
+A traceable multi-agent AI system for UK Companies House ownership and risk investigation. It combines a Neo4j graph database, three specialist AI agents, an LLM-based orchestrator, a Streamlit UI, and an MCP server that exposes all investigation tools to any MCP-compatible client.
 
 ## Setup
 
@@ -11,69 +11,44 @@ pip install -r requirements.txt
 **Configure environment**
 ```bash
 cp .env.example .env
-# Edit .env and fill in your Neo4j and Anthropic credentials
+# Edit .env — fill in Neo4j and Anthropic credentials
 ```
 
-**Run Jupyter**
+**Run the Streamlit app**
 ```bash
-jupyter notebook
+streamlit run app.py
 ```
 
-## Notebooks
-
-Add the project root to `sys.path` at the top of each notebook so `src` imports work:
-
-```python
-import sys
-sys.path.insert(0, "..")  # from notebooks/
+**Run notebooks** (exploration and development)
+```bash
+jupyter notebook notebooks/
 ```
 
-| Notebook | Purpose |
+## Agents
+
+Three specialist agents handle all investigation work:
+
+| Agent | Tasks |
 |---|---|
-| `201_domain_models` | All dataclasses and enums |
-| `202_ai_client` | AnthropicClient — text, JSON, token tracking |
-| `203_graph_tools` | GraphTools — entity lookup, ownership, address, SIC |
-| `204_risk_tools` | RiskTools — 4 deterministic risk signal checks |
-| `205_trace_repository_and_trace_tools` | TraceRepository CRUD + TraceTools retrieval |
-| `206_trace_service` | TraceService — structured event lifecycle |
-| `207_base_agent` | BaseAgent helpers — logging, AI summaries |
-| `208_graph_agent` | GraphAgent — graph exploration with optional AI enrichment |
-| `209_risk_agent` | RiskAgent — risk signals + Haiku/Sonnet synthesis |
-| `210_trace_agent` | TraceAgent — audit trail retrieval with recursion guard |
-| `211_trace_cleanup` | Safe deletion of trace data (business graph untouched) |
+| `GraphAgent` | `entity_lookup`, `company_profile`, `expand_ownership`, `shared_address_check`, `sic_context` |
+| `RiskAgent` | `ownership_complexity_check`, `control_signal_check`, `address_risk_check`, `industry_context_check`, `summarize_risk_for_company` |
+| `TraceAgent` | `retrieve_trace`, `find_traces_by_entity`, `retrieve_and_summarize_trace`, `retrieve_latest_for_entity` |
 
-## Phase 2 — AI Agent Layer
+An `InvestigationPlanner` (LLM-based) generates a step-by-step execution plan from a free-text query. The `Orchestrator` runs the plan, resolves entity names, dispatches steps to the right agent, evaluates stop conditions after each risk signal, and persists a full audit trail in Neo4j.
 
-The investigation system ships three specialist agents backed by a Neo4j
-business graph and an Anthropic AI client.
-
-| Agent | Purpose | Tasks |
-|---|---|---|
-| `GraphAgent` | Graph exploration | `entity_lookup`, `company_profile`, `expand_ownership`, `shared_address_check`, `sic_context` |
-| `RiskAgent` | Risk signal interpretation | `ownership_complexity_check`, `control_signal_check`, `address_risk_check`, `industry_context_check`, `summarize_risk_for_company` |
-| `TraceAgent` | Audit trail retrieval | `retrieve_trace`, `find_traces_by_entity`, `summarize_trace`, `retrieve_and_summarize_trace` |
-
-Every agent call is logged as a structured event in Neo4j
-(`InvestigationTrace → TraceEvent → business node`), giving a full
-audit trail with entity linkage. AI enrichment (Haiku by default,
-Sonnet on request) is optional on every agent — the system degrades
-gracefully to deterministic summaries when no API key is present.
-
-Token spend is tracked per AI call and surfaced in the trace event log.
-The trace subgraph can be selectively deleted by trace ID, entity name,
-or wiped entirely without affecting the underlying business graph.
+Every agent call and AI enrichment is logged as a structured `TraceEvent` in Neo4j, linked to the business nodes it touched. Traces can be retrieved, summarised, or deleted without affecting the business graph.
 
 ## MCP Server
 
-The investigation tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.io) so any MCP-compatible client (Claude Desktop, Claude Code) can call them directly.
+All investigation tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.io) so any MCP-compatible client (Claude Desktop, Claude Code, MCP Inspector) can call them directly. See [docs/tools.md](docs/tools.md) for the full tool reference.
 
-### Run locally (stdio — for Claude Desktop / MCP Inspector)
+### Run locally — stdio (for Claude Desktop / MCP Inspector)
 
 ```bash
 mcp dev src/mcp/server.py
 ```
 
-### Run locally (HTTP — for testing the hosted transport)
+### Run locally — HTTP (for testing the hosted transport)
 
 ```bash
 PORT=8000 python -m src.mcp.server
@@ -100,14 +75,9 @@ curl -s -X POST http://localhost:8000/mcp \
 ### Run via Docker
 
 ```bash
-# Build
 docker build -t entity-risk-ai .
-
-# Run (requires Colima or Docker Desktop on macOS)
 docker run --rm -p 8000:8000 --env-file .env -e PORT=8000 entity-risk-ai
 ```
-
-Then test with the curl commands above against `http://localhost:8000/mcp`.
 
 ### Connect Claude Code to a hosted instance
 
@@ -124,33 +94,77 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
+## Notebooks
+
+Notebooks live in `notebooks/` and are the primary surface for exploration and development. Each notebook adds `sys.path.insert(0, "..")` in its first cell so `src` imports work from the `notebooks/` directory. See [docs/notebooks.md](docs/notebooks.md) for details.
+
+| Notebook | Purpose |
+|---|---|
+| `101_connection_and_schema_check` | Verify Neo4j connectivity, inspect labels / rel types / counts |
+| `102_sample_entity_lookup` | Partial and exact company name search |
+| `103_ownership_path_exploration` | Direct owners, full paths, UBO identification |
+| `104_address_and_sic_exploration` | Address clustering, SIC peer grouping |
+| `201_domain_models` | All dataclasses and enums |
+| `202_ai_client` | AnthropicClient — text, JSON, token tracking |
+| `203_graph_tools` | GraphTools — entity lookup, ownership, address, SIC |
+| `204_risk_tools` | RiskTools — 4 deterministic risk signal checks |
+| `205_trace_repository_and_trace_tools` | TraceRepository CRUD + TraceTools retrieval |
+| `206_trace_service` | TraceService — structured event lifecycle |
+| `207_base_agent` | BaseAgent helpers — logging, AI summaries |
+| `208_graph_agent` | GraphAgent — graph exploration with optional AI enrichment |
+| `209_risk_agent` | RiskAgent — risk signals + Haiku/Sonnet synthesis |
+| `210_trace_agent` | TraceAgent — audit trail retrieval with recursion guard |
+| `211_trace_cleanup` | Safe deletion of trace data (business graph untouched) |
+| `301_mcp_server_and_tools` | FastMCP server setup and tool registration |
+| `302_mcp_client_and_agents` | MCPToolClient + agent integration |
+| `303_llm_planner` | InvestigationPlanner — LLM-based plan generation |
+| `304_orchestrator` | Multi-agent orchestrator — end-to-end investigation |
+| `401_step_result_contract_check` | Data contract validation for step results |
+
 ## Project Structure
 
 ```
 entity-risk-ai/
-├── notebooks/                    # Jupyter notebooks (201–211)
-├── src/
-│   ├── config.py                 # Neo4jSettings, AnthropicSettings
-│   ├── domain/
-│   │   └── models.py             # ToolResult, AgentResult, InvestigationTrace, ...
-│   ├── clients/
-│   │   ├── ai_client.py          # AIClient ABC
-│   │   └── anthropic_client.py   # Haiku/Sonnet implementation
-│   ├── storage/
-│   │   ├── neo4j_repository.py   # Raw Cypher execution
-│   │   └── trace_repository.py   # Trace persistence + cleanup
-│   ├── tracing/
-│   │   └── trace_service.py      # Single write surface for trace events
-│   ├── tools/
-│   │   ├── graph_tools.py        # Deterministic graph queries
-│   │   ├── risk_tools.py         # Risk signal heuristics
-│   │   └── trace_tools.py        # Trace retrieval tools
-│   └── agents/
-│       ├── base.py               # BaseAgent ABC
-│       ├── graph_agent.py
-│       ├── risk_agent.py
-│       └── trace_agent.py
-├── .env.example
+├── app.py                        # Streamlit entry point
+├── Dockerfile                    # MCP server container
 ├── requirements.txt
-└── README.md
+├── .env.example
+├── notebooks/                    # 20 Jupyter notebooks (exploration + development)
+├── docs/                         # Architecture, tool reference, notebook guide
+└── src/
+    ├── config.py                 # Neo4jSettings, AnthropicSettings
+    ├── domain/
+    │   └── models.py             # ToolResult, AgentResult, InvestigationTrace, PlanStep, ...
+    ├── storage/
+    │   ├── neo4j_repository.py   # Raw Cypher execution — schema, company, ownership, address, SIC
+    │   └── trace_repository.py   # Trace subgraph CRUD (save, load, delete, link)
+    ├── clients/
+    │   ├── ai_client.py          # AIClient ABC
+    │   ├── anthropic_client.py   # Haiku / Sonnet implementation
+    │   ├── mcp_tool_client.py    # In-process MCP tool calls
+    │   └── remote_mcp_tool_client.py  # HTTP MCP client (Railway / hosted)
+    ├── tools/
+    │   ├── graph_tools.py        # Deterministic graph queries → ToolResult
+    │   ├── risk_tools.py         # Risk signal heuristics → ToolResult
+    │   ├── shared_tools.py       # resolve_entity, validate_plan, evaluate_stop_conditions
+    │   └── trace_tools.py        # Trace retrieval tools
+    ├── tracing/
+    │   └── trace_service.py      # Single write surface for trace events
+    ├── agents/
+    │   ├── base.py               # BaseAgent ABC
+    │   ├── graph_agent.py
+    │   ├── risk_agent.py
+    │   └── trace_agent.py
+    ├── mcp/
+    │   └── server.py             # FastMCP server — 14 tools, stdio + HTTP transports
+    ├── orchestration/
+    │   ├── planner.py            # InvestigationPlanner — LLM plan generation
+    │   └── orchestrator.py       # Orchestrator — 7-stage multi-agent execution
+    └── app/
+        ├── factory.py            # AppComponents wiring (@st.cache_resource)
+        ├── layout.py             # Main Streamlit layout
+        ├── state.py              # Session state management
+        ├── components.py         # Reusable UI widgets
+        ├── contextual_graph.py   # Graph visualisation
+        └── styles.py             # UI styling
 ```

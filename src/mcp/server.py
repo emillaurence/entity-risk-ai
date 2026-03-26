@@ -1,15 +1,18 @@
 """
-Local MCP server — single tool-access layer for Phase 3.
+MCP server — exposes all investigation tools via the Model Context Protocol.
 
-Exposes all investigation tools (shared, graph, risk, trace) via the Model
-Context Protocol. Wraps the existing Python tool classes without reimplementing
-any logic.
+Wraps the existing Python tool classes (shared, graph, risk, trace) without
+reimplementing any logic. Supports two transports:
 
-Start the server (stdio transport, for Claude Desktop / MCP clients):
+- stdio (default, no PORT set) — for Claude Desktop, MCP Inspector, `mcp dev`
+- streamable-http (PORT set) — for Docker / Railway hosted deployment
 
-    python -m src.mcp.server
+Start the server:
 
-Or via the MCP CLI (dev inspector):
+    python -m src.mcp.server            # stdio
+    PORT=8000 python -m src.mcp.server  # HTTP
+
+Or via the MCP CLI dev inspector:
 
     mcp dev src/mcp/server.py
 
