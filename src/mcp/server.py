@@ -309,4 +309,9 @@ def list_recent_traces(limit: int = 20) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run()
+    import os
+    port = int(os.environ.get("PORT", 0))
+    if port:
+        mcp.run(transport="http", host="0.0.0.0", port=port)
+    else:
+        mcp.run()  # stdio — unchanged for local use
