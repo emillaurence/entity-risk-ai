@@ -749,7 +749,7 @@ def _add_address_layer(
     addr_color = _C_ADDRESS_KEY if is_key else _C_ADDRESS
     addr_size  = 24 if is_key else 16
 
-    postal     = (address.get("postal_code") or address.get("post_code") or "").strip()
+    postal     = (address.get("post_code") or "").strip()
     town       = (address.get("post_town") or "").strip()
     addr_label = postal or town or "Address"
     full_addr  = ", ".join(filter(None, [

@@ -2024,7 +2024,7 @@ def _build_agraph_data(
         cp      = (sr.findings or {}).get("company_profile") or {}
         address = cp.get("address") or {}
         if address and non_focal < _GRAPH_MAX_NODES:
-            postal     = (address.get("postal_code") or "").strip()
+            postal     = (address.get("post_code") or "").strip()
             town       = (address.get("post_town") or "").strip()
             addr_label = postal or town or "Address"
             full_addr  = ", ".join(filter(None, [

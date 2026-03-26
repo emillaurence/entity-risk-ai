@@ -10,7 +10,7 @@ Component graph
 ---------------
 AnthropicSettings ──► AnthropicClient (ai_client)
 Neo4jSettings ──► Neo4jRepository ──► TraceRepository ──► TraceService
-MCPToolClient (in-process MCP dispatcher — lazy Neo4j init inside server.py)
+MCPToolClient (in-process) OR RemoteMCPToolClient (HTTP, keyed by use_remote_mcp)
 ai_client + mcp_client + trace_service ──► GraphAgent, RiskAgent, TraceAgent
 ai_client ──► InvestigationPlanner
 planner + mcp_client + agents + trace_service + trace_repo ──► Orchestrator
@@ -28,7 +28,8 @@ from src.agents.risk_agent import RiskAgent
 from src.agents.trace_agent import TraceAgent
 from src.clients.anthropic_client import AnthropicClient
 from src.clients.mcp_tool_client import MCPToolClient
-from src.config import get_anthropic_settings, get_neo4j_settings
+from src.clients.remote_mcp_tool_client import RemoteMCPToolClient
+from src.config import get_anthropic_settings, get_neo4j_settings, get_remote_mcp_url
 from src.orchestration.orchestrator import Orchestrator
 from src.orchestration.planner import InvestigationPlanner
 from src.storage.neo4j_repository import Neo4jRepository
@@ -48,7 +49,7 @@ class AppComponents:
     repo: Neo4jRepository
     trace_repo: TraceRepository
     trace_service: TraceService
-    mcp_client: MCPToolClient
+    mcp_client: MCPToolClient | RemoteMCPToolClient
     graph_agent: GraphAgent
     risk_agent: RiskAgent
     trace_agent: TraceAgent
@@ -57,7 +58,7 @@ class AppComponents:
 
 
 @st.cache_resource
-def create_app_components() -> AppComponents:
+def create_app_components(use_remote_mcp: bool = False) -> AppComponents:
     """Instantiate and wire all system components.
 
     Called once per Streamlit server process; result is cached by
@@ -78,7 +79,13 @@ def create_app_components() -> AppComponents:
 
     # Clients ---------------------------------------------------------------
     ai_client = AnthropicClient(anthropic_settings)
-    mcp_client = MCPToolClient()
+    if use_remote_mcp:
+        remote_url = get_remote_mcp_url()
+        mcp_client: MCPToolClient | RemoteMCPToolClient = RemoteMCPToolClient(remote_url)
+        _log.info("MCP backend: remote (%s)", remote_url)
+    else:
+        mcp_client = MCPToolClient()
+        _log.info("MCP backend: local (in-process)")
 
     # Storage ---------------------------------------------------------------
     # Neo4jRepository is opened here without a context manager; the cache
