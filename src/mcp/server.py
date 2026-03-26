@@ -9,15 +9,21 @@ Start the server (stdio transport, for Claude Desktop / MCP clients):
 
     python -m src.mcp.server
 
-Or via the MCP CLI:
+Or via the MCP CLI (dev inspector):
 
-    mcp run src/mcp/server.py
+    mcp dev src/mcp/server.py
 
 The tool layer is lazy-initialised on the first call so the server starts
 without a Neo4j connection until a tool is actually invoked.
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path when invoked via `mcp dev`
+sys.path.insert(0, str(Path(__file__).parents[2]))
 
 import dataclasses
 from typing import Any
