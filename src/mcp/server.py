@@ -29,6 +29,7 @@ import dataclasses
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 
 from src.config import get_neo4j_settings
 from src.storage.neo4j_repository import Neo4jRepository
@@ -50,6 +51,7 @@ mcp = FastMCP(
         "risk tools to gather signals, and evaluate_stop_conditions to decide when the "
         "investigation is complete. Use trace tools to retrieve prior investigations."
     ),
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 # ---------------------------------------------------------------------------
