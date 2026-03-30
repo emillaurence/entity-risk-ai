@@ -345,17 +345,32 @@ def _label_row(text: str) -> None:
     )
 
 
-def _section_header(title: str, subtitle: str = "") -> None:
-    """Render a styled section header with optional helper-text subtitle."""
+def _risk_badge_html(overall: "str | None") -> str:
+    """Return an inline badge HTML snippet for the given risk level, or empty string."""
+    if not overall or overall not in _RISK_COLORS:
+        return ""
+    tc, bg, border = _RISK_COLORS[overall]
+    return (
+        f'<span style="background:{bg};color:{tc};border:2px solid {border};'
+        f'border-radius:8px;padding:4px 14px;font-size:1em;font-weight:800;'
+        f'letter-spacing:0.05em;white-space:nowrap">'
+        f'{_esc(overall)}</span>'
+    )
+
+
+def _section_header(title: str, subtitle: str = "", badge_html: str = "") -> None:
+    """Render a styled section header with optional subtitle and right-aligned badge."""
     sub = (
         f'<span style="display:block;font-size:0.78em;color:#6B7280;margin-top:2px">'
         f'{_esc(subtitle)}</span>'
         if subtitle else ""
     )
+    badge = f'<div style="margin-left:auto;align-self:center">{badge_html}</div>' if badge_html else ""
     st.markdown(
-        f'<div style="margin-bottom:10px">'
-        f'<span style="font-size:1.05em;font-weight:700;color:#111827">'
-        f'{_esc(title)}</span>{sub}</div>',
+        f'<div style="display:flex;align-items:flex-start;margin-bottom:10px">'
+        f'<div><span style="font-size:1.05em;font-weight:700;color:#111827">'
+        f'{_esc(title)}</span>{sub}</div>'
+        f'{badge}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1253,24 +1268,6 @@ def _render_replay_plan(replay_data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_risk_badge(overall: "str | None") -> None:
-    """Render the Overall Risk badge inline inside a tab. No-op if no risk level."""
-    if not overall or overall not in _RISK_COLORS:
-        return
-    tc, bg, border = _RISK_COLORS[overall]
-    st.markdown(
-        f'<div style="display:flex;align-items:center;gap:10px;'
-        f'margin-bottom:0.75rem">'
-        f'<span style="font-size:0.7em;font-weight:700;color:#6B7280;'
-        f'text-transform:uppercase;letter-spacing:0.06em;white-space:nowrap">'
-        f'Overall Risk</span>'
-        f'<span style="background:{bg};color:{tc};border:2px solid {border};'
-        f'border-radius:8px;padding:5px 16px;font-size:1.15em;font-weight:800;'
-        f'letter-spacing:0.05em;white-space:nowrap">'
-        f'{_esc(overall)}</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
 
 
 def render_app_header() -> None:
@@ -2279,14 +2276,11 @@ def render_investigate_tab(components: "AppComponents") -> None:
 
     Layout
     ------
-    [Overall Risk badge]  (when a result exists)
     [Progress bar]        (only during active investigation)
     [Col 1 — AI Assistant]  [Col 2 — Context Graph]  [Col 3 — Decision Insights]
                                                        └─ "How this decision was made"
                                                           (collapsed expander at bottom)
     """
-    result = state.get_result()
-    _render_risk_badge(_overall_risk_from_result(result) if result else None)
     _render_progress_section()
 
     # Compute once per render pass; passed into the two columns that need it
@@ -2716,11 +2710,14 @@ def _render_insights_column(live_dims: dict) -> None:
 
     During execution: shows investigation type + live risk signal list.
     """
-    _section_header("⚡ Assessment", "Outcome and risk factor breakdown")
-
     live_phase = state.get_live_phase()
     result     = state.get_result()
     live_plan  = state.get_live_plan()
+    _section_header(
+        "⚡ Assessment",
+        "Outcome and risk factor breakdown",
+        badge_html=_risk_badge_html(_overall_risk_from_result(result) if result else None),
+    )
     plan       = (result.planner_output if result is not None else None) or live_plan
 
     # ── Idle, no data ──────────────────────────────────────────────────
@@ -3027,10 +3024,8 @@ def render_replay_tab(components: "AppComponents") -> None:
     """Render the Replay / Audit tab.
 
     Layout mirrors the Investigate tab exactly:
-    [Overall Risk badge]  (when a trace is loaded)
     [Col 1 — Replay loader + Assessment]  [Col 2 — Context Graph]  [Col 3 — Assessment panel]
     """
-    _render_risk_badge(_overall_risk_from_replay(state.get_replay_data()))
     col1, col2, col3 = st.columns([2, 2, 2])
 
     with col1:
@@ -3283,7 +3278,11 @@ def _render_replay_insights_column() -> None:
     replay_status = state.get_replay_status()
     replay_data   = state.get_replay_data()
 
-    _section_header("⚡ Assessment", "Outcome and risk factor breakdown")
+    _section_header(
+        "⚡ Assessment",
+        "Outcome and risk factor breakdown",
+        badge_html=_risk_badge_html(_overall_risk_from_replay(replay_data)),
+    )
 
     if replay_status != "loaded" or not replay_data:
         st.markdown(
