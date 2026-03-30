@@ -489,6 +489,13 @@ def _overall_risk_from_result(result: Any) -> str | None:
     return best
 
 
+def _overall_risk_from_replay(replay_data: dict | None) -> str | None:
+    """Extract overall risk from a loaded replay trace dict."""
+    if not replay_data:
+        return None
+    assessment = _build_replay_assessment(replay_data)
+    risk = assessment.get("overall_risk")
+    return risk if risk in _RISK_COLORS else None
 
 
 def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
@@ -1246,38 +1253,36 @@ def _render_replay_plan(replay_data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _render_risk_badge(overall: "str | None") -> None:
+    """Render the Overall Risk badge inline inside a tab. No-op if no risk level."""
+    if not overall or overall not in _RISK_COLORS:
+        return
+    tc, bg, border = _RISK_COLORS[overall]
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;'
+        f'margin-bottom:0.75rem">'
+        f'<span style="font-size:0.7em;font-weight:700;color:#6B7280;'
+        f'text-transform:uppercase;letter-spacing:0.06em;white-space:nowrap">'
+        f'Overall Risk</span>'
+        f'<span style="background:{bg};color:{tc};border:2px solid {border};'
+        f'border-radius:8px;padding:5px 16px;font-size:1.15em;font-weight:800;'
+        f'letter-spacing:0.05em;white-space:nowrap">'
+        f'{_esc(overall)}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_app_header() -> None:
     """Full-width app title and subtitle rendered above the tab layout."""
-    result = state.get_result()
-    overall = _overall_risk_from_result(result) if result else None
-
-    if overall and overall in _RISK_COLORS:
-        tc, bg, border = _RISK_COLORS[overall]
-        badge_html = (
-            f'<div style="display:flex;align-items:center;gap:10px">'
-            f'<span style="font-size:0.7em;font-weight:700;color:#6B7280;'
-            f'text-transform:uppercase;letter-spacing:0.06em;white-space:nowrap">'
-            f'Overall Risk</span>'
-            f'<span style="background:{bg};color:{tc};border:2px solid {border};'
-            f'border-radius:8px;padding:5px 16px;font-size:1.15em;font-weight:800;'
-            f'letter-spacing:0.05em;white-space:nowrap">'
-            f'{_esc(overall)}</span>'
-            f'</div>'
-        )
-    else:
-        badge_html = ''
-
     st.markdown(
         f'<div style="padding:1.2rem 0 1.1rem 0;border-bottom:1px solid #E5E7EB;'
-        f'margin-bottom:1.4rem;display:flex;justify-content:space-between;align-items:center">'
-        f'<div>'
+        f'margin-bottom:1.4rem">'
         f'<div style="font-size:1.55rem;font-weight:800;color:#111827;'
         f'letter-spacing:-0.02em;line-height:1.3">Entity Risk AI</div>'
         f'<div style="font-size:0.875rem;color:#6B7280;margin-top:5px;'
         f'font-weight:400;line-height:1.5">'
         f'Investigate ownership, risk, and traceable decisions</div>'
-        f'</div>'
-        f'{badge_html}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -2274,11 +2279,14 @@ def render_investigate_tab(components: "AppComponents") -> None:
 
     Layout
     ------
-    [Progress bar]  (only during active investigation)
+    [Overall Risk badge]  (when a result exists)
+    [Progress bar]        (only during active investigation)
     [Col 1 — AI Assistant]  [Col 2 — Context Graph]  [Col 3 — Decision Insights]
                                                        └─ "How this decision was made"
                                                           (collapsed expander at bottom)
     """
+    result = state.get_result()
+    _render_risk_badge(_overall_risk_from_result(result) if result else None)
     _render_progress_section()
 
     # Compute once per render pass; passed into the two columns that need it
@@ -3019,8 +3027,10 @@ def render_replay_tab(components: "AppComponents") -> None:
     """Render the Replay / Audit tab.
 
     Layout mirrors the Investigate tab exactly:
+    [Overall Risk badge]  (when a trace is loaded)
     [Col 1 — Replay loader + Assessment]  [Col 2 — Context Graph]  [Col 3 — Assessment panel]
     """
+    _render_risk_badge(_overall_risk_from_replay(state.get_replay_data()))
     col1, col2, col3 = st.columns([2, 2, 2])
 
     with col1:
