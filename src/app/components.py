@@ -258,6 +258,29 @@ _RISK_TASKS = frozenset({
     "industry_context_check",
 })
 
+# Dimension key → display label (used in node detail panel)
+_DIM_LABEL_MAP: dict[str, str] = {
+    "ownership": "Ownership",
+    "address":   "Address",
+    "control":   "Control",
+    "industry":  "Industry",
+}
+
+# Company status → (text_color, bg_color) for node detail panel badge
+_STATUS_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "Active":         ("#166534", "#DCFCE7"),
+    "Dissolved":      ("#7F1D1D", "#FEE2E2"),
+    "Liquidation":    ("#78350F", "#FEF3C7"),
+    "Administration": ("#78350F", "#FEF3C7"),
+}
+
+# Risk level → (text_color, bg_color) for node detail panel badge
+_RISK_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "HIGH":   ("#7F1D1D", "#FEE2E2"),
+    "MEDIUM": ("#78350F", "#FEF3C7"),
+    "LOW":    ("#14532D", "#DCFCE7"),
+}
+
 # Status design tokens
 _STATUS_ACCENT: dict[str, str] = {
     "success": "#16A34A",
@@ -416,19 +439,6 @@ def _first_sentences(text: str, n: int = 1) -> str:
 
 
 
-def _clean_event_text(text: str) -> str:
-    """Strip technical/debug fragments from event summaries."""
-    if not text:
-        return text
-    cleaned = _re.sub(r"\|\s*tokens\s+in=\d+\s+out=\d+", "", text, flags=_re.IGNORECASE)
-    cleaned = _re.sub(
-        r"^AI summary generated for task '[^']*'[^\n]*\n?",
-        "",
-        cleaned,
-        flags=_re.IGNORECASE | _re.MULTILINE,
-    )
-    return cleaned.strip()
-
 
 def _get_summarize_findings(result: Any) -> dict | None:
     """Return findings from the summarize_risk_for_company step, or None."""
@@ -566,14 +576,6 @@ def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
     return dims
 
 
-_RISK_TASK_NAMES = {
-    "ownership_complexity_check",
-    "control_signal_check",
-    "address_risk_check",
-    "industry_context_check",
-}
-
-
 def _extract_replay_all_findings(replay_data: dict) -> dict[str, dict]:
     """Extract full per-task findings dicts from replay trace events.
 
@@ -585,7 +587,7 @@ def _extract_replay_all_findings(replay_data: dict) -> dict[str, dict]:
         if ev.get("event_type") != "tool_returned":
             continue
         task = ev.get("tool_name", "")
-        if task not in _RISK_TASK_NAMES:
+        if task not in _RISK_TASKS:
             continue
         raw = ev.get("data_json") or ""
         if not raw:
