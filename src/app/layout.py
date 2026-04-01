@@ -39,6 +39,7 @@ import streamlit as st
 
 import src.app.state as state
 from src.app.app_logger import get_app_logger, log_event
+from src.app.auth import authenticate, dev_bypass_user, is_dev_bypass_enabled
 from src.app.components import (
     render_app_header,
     render_investigate_tab,
@@ -146,23 +147,69 @@ def _polling_fragment() -> None:
     # No full rebuild; next fragment tick in 250 ms.
 
 
+def _render_login() -> None:
+    """Render the pre-app login gate.
+
+    Shows a username / password form.  On success, calls ``state.login()``
+    and triggers a full rerun so ``render_layout`` picks up the auth state.
+
+    A dev bypass button is shown when ``DEV_BYPASS_AUTH=true`` is set.
+    """
+    _, col, _ = st.columns([1, 1, 1])
+    with col:
+        st.markdown("## Entity Risk Investigation")
+        st.markdown("Sign in to continue.")
+
+        error = state.get_auth_error()
+        if error:
+            st.error(error)
+
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="e.g. jr_analyst")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign in", use_container_width=True)
+
+        if submitted:
+            user = authenticate(username.strip(), password)
+            if user:
+                state.login(user)
+                st.rerun()
+            else:
+                state.set_auth_error("Invalid username or password.")
+                st.rerun()
+
+        if is_dev_bypass_enabled():
+            st.divider()
+            st.caption("Dev bypass enabled (`DEV_BYPASS_AUTH=true`)")
+            if st.button("Enter as dev user (bypass)", use_container_width=True):
+                state.login(dev_bypass_user())
+                state.set_auth_dev_bypass(True)
+                st.rerun()
+
+
 def render_layout() -> None:
     """Render the full page.
 
     Entry point called by ``app.py``.  Call order:
       1. inject_styles         — global CSS (idempotent across reruns)
       2. state.init            — seed session_state defaults on first load
-      3. log startup           — once per browser session
-      4. create_app_components — cached across reruns via @st.cache_resource
-      5. render header + error banner — above the tabs
-      6. render two tabs        — Investigate | Replay / Audit
+      3. auth gate             — returns early if not authenticated
+      4. log startup           — once per browser session
+      5. create_app_components — cached across reruns via @st.cache_resource
+      6. render header + error banner — above the tabs
+      7. render two tabs        — Investigate | Replay / Audit
          (progress bar rendered inside the Investigate tab)
-      7. handle triggers        — consumed AFTER widgets render
-      8. _polling_fragment      — fragment-scoped poller; triggers full reruns
+      8. handle triggers        — consumed AFTER widgets render
+      9. _polling_fragment      — fragment-scoped poller; triggers full reruns
                                   only when new events arrive
     """
     inject_styles()
     state.init()
+
+    # ── Auth gate ────────────────────────────────────────────────────────
+    if not state.is_authenticated():
+        _render_login()
+        return
 
     if not st.session_state.get("_app_started"):
         log_event("app_start")
@@ -186,6 +233,15 @@ def render_layout() -> None:
         )
         if not remote_url_configured:
             st.caption("Set REMOTE_MCP_URL in .env to enable remote mode.")
+
+        st.divider()
+        user = state.get_authenticated_user()
+        if user:
+            st.caption(f"Signed in as **{user.user_id}**")
+            st.caption(f"Role: `{user.role}`")
+        if st.button("Sign out", key="btn_logout", use_container_width=True):
+            state.logout()
+            st.rerun()
 
     components = create_app_components(use_remote_mcp=(mcp_mode == "remote"))
 
