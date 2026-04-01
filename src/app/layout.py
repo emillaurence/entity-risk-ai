@@ -47,18 +47,28 @@ from src.app.components import (
     render_status_banner,
 )
 from src.app.factory import AppComponents, create_app_components
+from src.app.policy import get_policy_for_user
 from src.app.styles import inject_styles
 
 _log = get_app_logger()
 
 
-def _start_investigation(components: AppComponents, question: str) -> None:
+def _start_investigation(
+    components: AppComponents,
+    question: str,
+    allowed_tools: "frozenset[str] | None" = None,
+) -> None:
     """Reset live state, start the orchestrator in a background thread, and
     seed the run queue so the UI picks up progress events on each rerun.
 
     Creates an ``entity_confirm_queue`` so the orchestrator thread can block
     on entity selection when multiple candidates are returned.  Any prior
     confirmation queue is signalled with ``None`` first to unblock stale threads.
+
+    Args:
+        allowed_tools: Optional MCP tool allowlist from the current user's
+                       RolePolicy.  Passed through to ``Orchestrator.run()``
+                       so disallowed tool steps are skipped safely.
     """
     # Unblock any previously blocking orchestrator thread
     old_cq: "_queue.Queue | None" = st.session_state.get("entity_confirm_queue")
@@ -87,6 +97,7 @@ def _start_investigation(components: AppComponents, question: str) -> None:
                 question,
                 on_progress=on_progress,
                 confirmation_queue=confirm_q,
+                allowed_tools=allowed_tools,
             )
             q.put({"event": "done", "data": {"result": result}})
         except Exception as exc:  # noqa: BLE001
@@ -245,17 +256,30 @@ def render_layout() -> None:
 
     components = create_app_components(use_remote_mcp=(mcp_mode == "remote"))
 
+    # ── Derive policy for current user ─────────────────────────────────
+    _policy = get_policy_for_user(user) if user else None
+
     # ── Render page ────────────────────────────────────────────────────
     render_app_header()
     render_status_banner()  # error-only; hidden when idle
 
-    tab_investigate, tab_replay = st.tabs(["🔍 Investigate", "📼 Replay / Audit"])
+    # Build tab list based on what the current role can access.
+    # Jr analysts see Investigate only; Sr analysts see both tabs.
+    _tab_labels = ["🔍 Investigate"]
+    _show_replay = _policy is not None and _policy.can_replay
+    if _show_replay:
+        _tab_labels.append("📼 Replay / Audit")
+
+    _tabs = st.tabs(_tab_labels)
+    tab_investigate = _tabs[0]
+    tab_replay = _tabs[1] if _show_replay else None
 
     with tab_investigate:
         render_investigate_tab(components)
 
-    with tab_replay:
-        render_replay_tab(components)
+    if tab_replay is not None:
+        with tab_replay:
+            render_replay_tab(components)
 
     # ── Handle triggers AFTER all widgets are rendered ─────────────────
     # Triggers are set by widgets during this rerun; checking them here
@@ -264,32 +288,41 @@ def render_layout() -> None:
     # triggers from either tab are reliably visible here.
 
     if st.session_state.pop("_trigger_replay", False):
-        replay_id = state.get_replay_trace_id()
-        if replay_id:
-            log_event("replay_started", trace_id=replay_id)
-            state.set_replay_status("loading")
-            try:
-                replay_data = components.trace_repo.load_trace(replay_id)
-                state.set_replay_data(replay_data)
-                state.set_replay_status("loaded")
-                log_event(
-                    "replay_completed",
-                    trace_id=replay_id,
-                    mode=replay_data.get("mode"),
-                    event_count=len(replay_data.get("events") or []),
-                )
-            except KeyError:
-                state.set_replay_status("error")
-                state.set_replay_error(
-                    f"Trace '{replay_id}' was not found in the database."
-                )
-                log_event("replay_failed", trace_id=replay_id, error="not_found")
-            except Exception as exc:
-                _log.error("Replay failed for trace %s: %s", replay_id, exc)
-                state.set_replay_status("error")
-                state.set_replay_error(f"Failed to load trace: {exc}")
-                log_event("replay_failed", trace_id=replay_id, error=str(exc))
-            st.rerun()
+        # Hard block: enforce replay access even if the session key was set
+        # through a crafted path (e.g. direct URL param manipulation).
+        if not _show_replay:
+            _log.warning(
+                "Replay attempt blocked for role '%s'",
+                user.role if user else "unknown",
+            )
+            state.reset_replay_state()
+        else:
+            replay_id = state.get_replay_trace_id()
+            if replay_id:
+                log_event("replay_started", trace_id=replay_id)
+                state.set_replay_status("loading")
+                try:
+                    replay_data = components.trace_repo.load_trace(replay_id)
+                    state.set_replay_data(replay_data)
+                    state.set_replay_status("loaded")
+                    log_event(
+                        "replay_completed",
+                        trace_id=replay_id,
+                        mode=replay_data.get("mode"),
+                        event_count=len(replay_data.get("events") or []),
+                    )
+                except KeyError:
+                    state.set_replay_status("error")
+                    state.set_replay_error(
+                        f"Trace '{replay_id}' was not found in the database."
+                    )
+                    log_event("replay_failed", trace_id=replay_id, error="not_found")
+                except Exception as exc:
+                    _log.error("Replay failed for trace %s: %s", replay_id, exc)
+                    state.set_replay_status("error")
+                    state.set_replay_error(f"Failed to load trace: {exc}")
+                    log_event("replay_failed", trace_id=replay_id, error=str(exc))
+                st.rerun()
 
     if st.session_state.pop("_clear_replay", False):
         state.reset_replay_state()
@@ -298,7 +331,8 @@ def render_layout() -> None:
     if st.session_state.pop("_trigger_run", False):
         question = state.get_question()
         if question:
-            _start_investigation(components, question)
+            _allowed = _policy.allowed_mcp_tools if _policy is not None else None
+            _start_investigation(components, question, allowed_tools=_allowed)
             st.rerun()  # immediately show "Planning…" state
 
     # ── Fragment-scoped poller ─────────────────────────────────────────

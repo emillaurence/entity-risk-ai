@@ -69,14 +69,142 @@ _FAILURE_SYSTEM_PROMPT = (
     "Be concise and factual. Do not use bullet points or markdown."
 )
 
-_INDIVIDUAL_RISK_SYNTHESIS_PROMPT = (
-    "You are a financial crime compliance analyst. "
-    "Given one or more structured risk assessment findings, rewrite them as a "
-    "clear, natural 2-3 sentence business narrative for a compliance decision-maker. "
-    "Do not use bullet points or markdown. "
-    "End with the overall risk level (LOW, MEDIUM, or HIGH) "
-    "based on the highest individual signal found."
-)
+_RISK_NARRATIVE_PROMPT = """You are a financial crime compliance analyst. \
+Given structured risk signals for a company, write a concise risk assessment \
+(2-4 sentences) for a compliance analyst deciding whether to escalate. \
+Reference the specific signals provided. State the overall risk level (LOW / MEDIUM / HIGH). \
+Do not use bullet points or markdown.
+
+── SCORING REFERENCE ────────────────────────────────────────────────────────
+
+Use the heuristics below to verify and contextualise the risk levels supplied
+in the signals. Do not recalculate them — they are already computed. Use this
+reference to ground your language and ensure your narrative is consistent with
+the underlying logic.
+
+OWNERSHIP COMPLEXITY
+Inputs: max_depth (longest ownership chain in hops), unique_owners (distinct
+owner nodes), corporate_only (True when no individual beneficial owners appear
+anywhere in the chain).
+
+Scoring:
+  max_depth >= 4 hops      → +2 points
+  max_depth 2 or 3 hops    → +1 point
+  max_depth <= 1 hop        → +0 points (may also return UNKNOWN if no data)
+  unique_owners >= 5        → +2 points
+  unique_owners 2, 3, or 4 → +1 point
+  unique_owners <= 1        → +0 points
+  corporate_only = True     → +2 points (no natural-person UBO identified)
+
+Risk level: score >= 4 → HIGH | score 2 or 3 → MEDIUM | score < 2 → LOW
+Special case: if max_depth == 0 (no ownership data found) → UNKNOWN
+
+Compliance interpretation:
+  HIGH ownership complexity may indicate layered corporate structures used to
+  obscure beneficial ownership — a common typology in money-laundering schemes
+  and sanctions evasion. A corporate-only chain with no natural-person UBO is
+  particularly significant: it may mean the ultimate beneficial owner has not
+  been disclosed, which is a requirement under UK PSC rules.
+
+CONTROL SIGNALS
+Inputs: elevated (set of non-standard control types detected), mixed (True
+when both share-based and non-share-based controls appear), has_data (False
+when no ownership/control records exist).
+
+Elevated control types that trigger HIGH risk:
+  right-to-appoint-and-remove-directors
+  right-to-appoint-and-remove-majority-of-directors
+  significant-influence-or-control
+  significant-influence-or-control-as-a-member-of-a-firm
+  right-to-appoint-and-remove-members
+
+Standard (non-elevated) control types:
+  ownership-of-shares-25-to-50-percent
+  ownership-of-shares-50-to-75-percent
+  ownership-of-shares-75-to-100-percent
+  voting-rights-25-to-50-percent
+  voting-rights-50-to-75-percent
+  voting-rights-75-to-100-percent
+
+Risk level:
+  elevated set is non-empty → HIGH (regardless of share ownership)
+  mixed controls present     → MEDIUM (elevated absent but non-share types found)
+  share/voting only          → LOW
+  has_data = False           → UNKNOWN
+
+Compliance interpretation:
+  Elevated controls (especially significant-influence-or-control and
+  right-to-appoint) are the hallmarks of shadow director arrangements and
+  undisclosed controllers — common in corporate abuse typologies. Mixed
+  controls warrant scrutiny because they may signal that formal share
+  ownership is being supplemented with informal influence mechanisms.
+
+ADDRESS RISK
+Inputs: total (number of companies registered at the same address),
+dissolution_rate (proportion of co-located companies that are dissolved),
+threshold (default = 5, the minimum count before flagging).
+
+Scoring:
+  total >= threshold * 10   → +2 points  (mass co-location)
+  total >= threshold         → +1 point
+  total == 0                 → score stays 0, return LOW immediately
+  dissolution_rate >= 0.50   → +2 points  (majority dissolved)
+  dissolution_rate >= 0.25   → +1 point
+
+Risk level: score >= 3 → HIGH | score >= 1 → MEDIUM | score == 0 → LOW
+
+Compliance interpretation:
+  Mass co-location at a single registered address (often a formation agent or
+  virtual office) combined with a high dissolution rate is a well-documented
+  shell-company indicator. The Companies House UBO data regularly shows
+  hundreds of companies sharing a single address; when most of those companies
+  are dissolved, it suggests systematic exploitation of registered address
+  services for short-lived entities.
+
+INDUSTRY CONTEXT
+Inputs: is_holding (True when any of the company's SIC codes appears in the
+high-scrutiny set), dissolution_rate (proportion of SIC-peer companies that
+are dissolved), peer_total (total number of companies sharing the same SIC
+code(s)).
+
+High-scrutiny SIC codes:
+  64205 — Activities of financial services holding companies
+  70100 — Activities of head offices (non-financial holding companies)
+  74990 — Non-trading company
+  99999 — Dormant company
+
+Risk level:
+  is_holding AND dissolution_rate >= 0.40 → HIGH
+  is_holding AND dissolution_rate < 0.40  → MEDIUM
+  peer_total > 0 AND dissolution_rate >= 0.50 → MEDIUM
+  otherwise → LOW
+
+Compliance interpretation:
+  Holding companies and dormant entities in the Companies House register are
+  frequently used as intermediate layers in ownership chains. A holding company
+  with a high peer dissolution rate indicates that similar entities in the same
+  SIC group are being regularly struck off, which is consistent with
+  disposable-vehicle typologies used in fraud and tax evasion schemes.
+
+COMBINING SIGNALS
+When synthesising the risk dimensions into a single narrative:
+
+  - If any single dimension is HIGH: the overall assessment should note that
+    the profile warrants escalation consideration, even if other dimensions
+    are LOW. Explain which dimension drives the concern.
+
+  - If two or more dimensions are MEDIUM and none is HIGH: flag for enhanced
+    due diligence. Cumulative MEDIUM signals are materially more concerning
+    than a single MEDIUM in isolation.
+
+  - If all assessed dimensions are LOW: the profile is consistent with a
+    standard trading company. Note any caveats (e.g. dimensions not assessed
+    due to role restrictions or absent data).
+
+  - Always name the overall risk level explicitly as the final word in the
+    assessment (LOW / MEDIUM / HIGH).
+
+────────────────────────────────────────────────────────────────────────────"""
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -265,13 +393,21 @@ class Orchestrator:
         user_id: str = "system",
         on_progress: Any = None,
         confirmation_queue: "_queue_mod.Queue | None" = None,
+        allowed_tools: "frozenset[str] | None" = None,
     ) -> OrchestratorResult:
         """
         Execute a full investigation from a natural-language query.
 
         Args:
-            query:   Free-text investigation query.
-            user_id: Identifier for the requesting user, written to the trace.
+            query:         Free-text investigation query.
+            user_id:       Identifier for the requesting user, written to the trace.
+            allowed_tools: Optional allowlist of MCP tool / task names the caller
+                           is permitted to invoke.  When provided, any plan step
+                           whose task name is NOT in this set is skipped with a
+                           policy-denial skip_reason rather than being executed.
+                           Infrastructure calls (validate_plan, resolve_entity,
+                           evaluate_stop_conditions) are never filtered.
+                           Pass ``None`` to disable enforcement (default).
 
         Returns:
             OrchestratorResult with planner output, resolved entities,
@@ -287,7 +423,7 @@ class Orchestrator:
 
         # ── 1. Plan ────────────────────────────────────────────────────
         try:
-            plan = self._planner.plan(query)
+            plan = self._planner.plan(query, allowed_tools=allowed_tools)
         except Exception as exc:
             _log.error("[%s] Planner failed: %s", _short, exc)
             return OrchestratorResult(
@@ -525,6 +661,33 @@ class Orchestrator:
             if any(r.step_id == step.step_id for r in step_results):
                 continue
 
+            # ── Role-policy gate ──────────────────────────────────────
+            # Infrastructure tasks (validate_plan, resolve_entity,
+            # evaluate_stop_conditions) are not plan steps so they are
+            # never subject to this filter.  Only agent-dispatched tasks
+            # are checked here.
+            if allowed_tools is not None and step.task not in allowed_tools:
+                skip_msg = (
+                    f"Step '{step.task}' was not run: your role does not "
+                    "permit this assessment."
+                )
+                _log.info(
+                    "[%s] Step %s policy-denied: task=%s",
+                    _short, step.step_id, step.task,
+                )
+                sr = StepRecord(
+                    step_id=step.step_id,
+                    agent=step.agent,
+                    task=step.task,
+                    success=False,
+                    skipped=True,
+                    skip_reason=skip_msg,
+                )
+                step_results.append(sr)
+                if on_progress:
+                    on_progress("step_complete", sr.to_dict())
+                continue
+
             # ── Build context (inject canonical name if resolved) ──────
             context = _build_context(step, resolved)
 
@@ -625,7 +788,7 @@ class Orchestrator:
                     break
 
         # ── 6. Build final answer ──────────────────────────────────────
-        final_answer = _build_final_answer(step_results, self._ai_client)
+        final_answer = _build_final_answer(step_results, self._ai_client, entity_name)
 
         # If nothing succeeded, ask the AI to explain the failure.
         if self._ai_client and not any(sr.success for sr in step_results):
@@ -721,13 +884,6 @@ class Orchestrator:
                 if isinstance(task_data, dict) and "risk_level" in task_data:
                     findings[signal_key] = {"risk_level": task_data["risk_level"]}
 
-            # Synthesised task — findings keyed by each individual task name
-            elif sr.task == "summarize_risk_for_company":
-                for task_name, signal_key in _RISK_SIGNAL_MAP.items():
-                    task_data = sr.findings.get(task_name) or {}
-                    if isinstance(task_data, dict) and "risk_level" in task_data:
-                        findings[signal_key] = {"risk_level": task_data["risk_level"]}
-
         if not findings:
             return False
 
@@ -781,22 +937,19 @@ def _build_context(
 def _build_final_answer(
     step_results: list[StepRecord],
     ai_client: AIClient | None = None,
+    entity_name: str = "",
 ) -> str:
     """
     Synthesise a final answer from completed step summaries.
 
     Priority:
-      1. risk-agent summarize_risk_for_company  (richest narrative)
-      2. trace-agent retrieve_and_summarize_trace / summarize_trace
-      3. Individual risk task summaries — AI-synthesised if client available
-      4. Last successful step summary
-      5. Fallback message indicating what went wrong
+      1. trace-agent retrieve_and_summarize_trace / summarize_trace
+      2. Individual risk task summaries — AI-synthesised with full narrative
+         prompt if client available; plain join otherwise
+      3. Last successful step summary
+      4. Fallback message indicating what went wrong
     """
     successful = [sr for sr in step_results if sr.success and sr.summary]
-
-    for sr in successful:
-        if sr.task == "summarize_risk_for_company":
-            return sr.summary
 
     for sr in successful:
         if sr.task in ("retrieve_and_summarize_trace", "summarize_trace"):
@@ -813,21 +966,52 @@ def _build_final_answer(
         for sr in successful
         if sr.task in _INDIVIDUAL_RISK_TASKS
     ]
+
+    _POLICY_MARKER = "role does not permit"
+    policy_skipped_tasks = [
+        sr.task for sr in step_results
+        if sr.skipped
+        and _POLICY_MARKER in (sr.skip_reason or "")
+        and sr.task in _INDIVIDUAL_RISK_TASKS
+    ]
+
     if risk_summaries:
-        joined = " ".join(risk_summaries)
         if ai_client:
             try:
+                prefix = f"Company: {entity_name}\n\n" if entity_name else ""
+                user_prompt = prefix + "\n".join(f"- {s}" for s in risk_summaries)
+                if policy_skipped_tasks:
+                    skipped_labels = ", ".join(
+                        t.replace("_check", "").replace("_", " ")
+                        for t in policy_skipped_tasks
+                    )
+                    user_prompt += (
+                        f"\n\n[Note: the following dimensions were not assessed due to "
+                        f"role restrictions: {skipped_labels}]"
+                    )
                 synthesized = ai_client.generate_text(
-                    system_prompt=_INDIVIDUAL_RISK_SYNTHESIS_PROMPT,
-                    user_prompt=joined,
-                    max_tokens=150,
+                    system_prompt=_RISK_NARRATIVE_PROMPT,
+                    user_prompt=user_prompt,
+                    max_tokens=200,
                 )
                 if synthesized:
                     return synthesized
                 _log.warning("_build_final_answer: AI synthesis returned empty string")
             except Exception as exc:
                 _log.warning("_build_final_answer: AI synthesis failed (%s), using raw join", exc)
-        return joined
+        return " ".join(risk_summaries)
+
+    if policy_skipped_tasks:
+        denied_labels = [
+            t.replace("_check", "").replace("_", " ") for t in policy_skipped_tasks
+        ]
+        plural = len(denied_labels) > 1
+        joined = ", ".join(denied_labels)
+        return (
+            f"The requested {'assessments' if plural else 'assessment'} "
+            f"({joined}) {'are' if plural else 'is'} not available for your role. "
+            "Contact a Senior Risk Analyst for a full assessment."
+        )
 
     if successful:
         return successful[-1].summary
