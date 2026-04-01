@@ -2295,9 +2295,9 @@ def _render_progress_section() -> None:
     """Thin progress bar at the top of the Investigate tab during a run.
 
     Maps the investigation lifecycle to 3 user-friendly phases:
-        Step 1/3 — Identifying entity
-        Step 2/3 — Mapping ownership
-        Step 3/3 — Assessing risk
+        Phase 1/3 — Identifying entity
+        Phase 2/3 — Mapping ownership
+        Phase 3/3 — Assessing risk
     Hidden when idle or done.
     """
     phase = state.get_live_phase()
@@ -2315,13 +2315,13 @@ def _render_progress_section() -> None:
 
     if phase in ("planning", "resolving") or current_task in _PROGRESS_PHASE1:
         pct  = 0.12
-        text = "Step 1/3 — Identifying entity"
+        text = "Phase 1/3 — Identifying entity"
     elif current_task in _PROGRESS_PHASE2:
         pct  = 0.45
-        text = "Step 2/3 — Mapping ownership"
+        text = "Phase 2/3 — Mapping ownership"
     elif current_task in _PROGRESS_PHASE3:
         pct  = 0.78
-        text = "Step 3/3 — Assessing risk"
+        text = "Phase 3/3 — Assessing risk"
     else:
         # Fallback: use raw step counters if task doesn't map to a known phase
         num   = state.get_live_step_num()
