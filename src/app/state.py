@@ -207,10 +207,6 @@ def reset_replay_state() -> None:
     st.session_state[_KEY_REPLAY_TRACE_ID] = None
 
 
-# Keep old name as alias for backward compatibility during the transition.
-clear_replay_state = reset_replay_state
-
-
 # ---------------------------------------------------------------------------
 # execution_status
 # ---------------------------------------------------------------------------

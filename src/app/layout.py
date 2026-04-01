@@ -31,6 +31,7 @@ to the post-render trigger-handling block below.
 
 from __future__ import annotations
 
+import os
 import queue as _queue
 import threading
 
@@ -167,7 +168,26 @@ def render_layout() -> None:
         log_event("app_start")
         st.session_state["_app_started"] = True
 
-    components = create_app_components()
+    # ── Sidebar ─────────────────────────────────────────────────────────
+    remote_url_configured = bool(os.getenv("REMOTE_MCP_URL"))
+    with st.sidebar:
+        st.markdown("### Settings")
+        mcp_mode = st.radio(
+            "Tool backend",
+            options=["local", "remote"],
+            format_func=lambda x: "Local (in-process)" if x == "local" else "Remote MCP Server",
+            index=0,
+            key="mcp_mode",
+            help=(
+                "Switch between the in-process tool layer and the hosted "
+                "Railway MCP server. Set REMOTE_MCP_URL in .env to enable."
+            ),
+            disabled=not remote_url_configured,
+        )
+        if not remote_url_configured:
+            st.caption("Set REMOTE_MCP_URL in .env to enable remote mode.")
+
+    components = create_app_components(use_remote_mcp=(mcp_mode == "remote"))
 
     # ── Render page ────────────────────────────────────────────────────
     render_app_header()

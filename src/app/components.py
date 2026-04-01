@@ -258,6 +258,29 @@ _RISK_TASKS = frozenset({
     "industry_context_check",
 })
 
+# Dimension key → display label (used in node detail panel)
+_DIM_LABEL_MAP: dict[str, str] = {
+    "ownership": "Ownership",
+    "address":   "Address",
+    "control":   "Control",
+    "industry":  "Industry",
+}
+
+# Company status → (text_color, bg_color) for node detail panel badge
+_STATUS_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "Active":         ("#166534", "#DCFCE7"),
+    "Dissolved":      ("#7F1D1D", "#FEE2E2"),
+    "Liquidation":    ("#78350F", "#FEF3C7"),
+    "Administration": ("#78350F", "#FEF3C7"),
+}
+
+# Risk level → (text_color, bg_color) for node detail panel badge
+_RISK_BADGE_STYLE: dict[str, tuple[str, str]] = {
+    "HIGH":   ("#7F1D1D", "#FEE2E2"),
+    "MEDIUM": ("#78350F", "#FEF3C7"),
+    "LOW":    ("#14532D", "#DCFCE7"),
+}
+
 # Status design tokens
 _STATUS_ACCENT: dict[str, str] = {
     "success": "#16A34A",
@@ -345,17 +368,32 @@ def _label_row(text: str) -> None:
     )
 
 
-def _section_header(title: str, subtitle: str = "") -> None:
-    """Render a styled section header with optional helper-text subtitle."""
+def _risk_badge_html(overall: "str | None") -> str:
+    """Return an inline badge HTML snippet for the given risk level, or empty string."""
+    if not overall or overall not in _RISK_COLORS:
+        return ""
+    tc, bg, border = _RISK_COLORS[overall]
+    return (
+        f'<span style="background:{bg};color:{tc};border:2px solid {border};'
+        f'border-radius:8px;padding:4px 14px;font-size:1em;font-weight:800;'
+        f'letter-spacing:0.05em;white-space:nowrap">'
+        f'{_esc(overall)}</span>'
+    )
+
+
+def _section_header(title: str, subtitle: str = "", badge_html: str = "") -> None:
+    """Render a styled section header with optional subtitle and right-aligned badge."""
     sub = (
         f'<span style="display:block;font-size:0.78em;color:#6B7280;margin-top:2px">'
         f'{_esc(subtitle)}</span>'
         if subtitle else ""
     )
+    badge = f'<div style="margin-left:auto;align-self:center">{badge_html}</div>' if badge_html else ""
     st.markdown(
-        f'<div style="margin-bottom:10px">'
-        f'<span style="font-size:1.05em;font-weight:700;color:#111827">'
-        f'{_esc(title)}</span>{sub}</div>',
+        f'<div style="display:flex;align-items:flex-start;margin-bottom:10px">'
+        f'<div><span style="font-size:1.05em;font-weight:700;color:#111827">'
+        f'{_esc(title)}</span>{sub}</div>'
+        f'{badge}</div>',
         unsafe_allow_html=True,
     )
 
@@ -400,30 +438,6 @@ def _first_sentences(text: str, n: int = 1) -> str:
     return s
 
 
-def _display_question(query: str) -> str:
-    """Return a display-friendly question string."""
-    if not query:
-        return ""
-    q = query.strip()
-    markers = ("?", "who ", "what ", " is ", " are ", " does ",
-               "investigate", "find", "check", "assess", "review")
-    if any(m in q.lower() for m in markers):
-        return q
-    return f"Investigate {q}"
-
-
-def _clean_event_text(text: str) -> str:
-    """Strip technical/debug fragments from event summaries."""
-    if not text:
-        return text
-    cleaned = _re.sub(r"\|\s*tokens\s+in=\d+\s+out=\d+", "", text, flags=_re.IGNORECASE)
-    cleaned = _re.sub(
-        r"^AI summary generated for task '[^']*'[^\n]*\n?",
-        "",
-        cleaned,
-        flags=_re.IGNORECASE | _re.MULTILINE,
-    )
-    return cleaned.strip()
 
 
 def _get_summarize_findings(result: Any) -> dict | None:
@@ -500,6 +514,13 @@ def _overall_risk_from_result(result: Any) -> str | None:
     return best
 
 
+def _overall_risk_from_replay(replay_data: dict | None) -> str | None:
+    """Extract overall risk from a loaded replay trace dict."""
+    if not replay_data:
+        return None
+    assessment = _build_replay_assessment(replay_data)
+    risk = assessment.get("overall_risk")
+    return risk if risk in _RISK_COLORS else None
 
 
 def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
@@ -555,14 +576,6 @@ def _extract_replay_risk_dimensions(replay_data: dict) -> dict[str, str]:
     return dims
 
 
-_RISK_TASK_NAMES = {
-    "ownership_complexity_check",
-    "control_signal_check",
-    "address_risk_check",
-    "industry_context_check",
-}
-
-
 def _extract_replay_all_findings(replay_data: dict) -> dict[str, dict]:
     """Extract full per-task findings dicts from replay trace events.
 
@@ -574,7 +587,7 @@ def _extract_replay_all_findings(replay_data: dict) -> dict[str, dict]:
         if ev.get("event_type") != "tool_returned":
             continue
         task = ev.get("tool_name", "")
-        if task not in _RISK_TASK_NAMES:
+        if task not in _RISK_TASKS:
             continue
         raw = ev.get("data_json") or ""
         if not raw:
@@ -742,22 +755,6 @@ def _extract_replay_entity(events: list, query: str) -> dict:
     cn, st = _from_lookup(events)
     return {"canonical_name": query, "company_number": cn, "status": st}
 
-
-def _extract_replay_company_number(events: list) -> str:
-    """Extract company number from the entity_lookup tool_returned event.
-
-    Returns the number string (e.g. "04083193") or "" if not found.
-    """
-    for ev in events:
-        if ev.get("event_type") != "tool_returned":
-            continue
-        if ev.get("tool_name") != "entity_lookup":
-            continue
-        text = ev.get("output_summary") or ""
-        m = _re.search(r"No\.\s*([A-Z0-9]+)", text, _re.IGNORECASE)
-        if m:
-            return m.group(1)
-    return ""
 
 
 # Maps individual tool names to the logical plan-step (task, agent) pair
@@ -947,24 +944,6 @@ def _render_assessment_card(
         unsafe_allow_html=True,
     )
 
-
-def _render_overall_risk_badge(overall_risk: "str | None") -> None:
-    """Render a prominent overall risk verdict badge in the Assessment column."""
-    if not overall_risk or overall_risk not in _RISK_COLORS:
-        return
-    tc, bg, border = _RISK_COLORS[overall_risk]
-    st.markdown(
-        f'<div style="margin:6px 0 14px 0">'
-        f'<div style="font-size:0.66em;font-weight:700;color:#6B7280;'
-        f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:5px">'
-        f'Overall Risk</div>'
-        f'<div style="background:{bg};color:{tc};border:2px solid {border};'
-        f'border-radius:8px;padding:6px 18px;font-size:1.0em;font-weight:800;'
-        f'display:inline-block;letter-spacing:0.05em">'
-        f'{_esc(overall_risk)}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
 
 
 def _render_risk_drivers_grid(dims: "dict[str, str]") -> None:
@@ -1283,134 +1262,7 @@ def _render_replay_plan(replay_data: dict) -> None:
                 )
 
 
-def _render_replay_event_timeline(events: list) -> None:
-    """Render a list of trace events as a compact audit timeline."""
-    if not events:
-        st.caption("No activity was recorded for this investigation.")
-        return
 
-    _prev_etype = ""
-    for ev in events:
-        etype       = ev.get("event_type", "")
-
-        if etype == "step_started" and _prev_etype not in ("", "plan_created"):
-            st.markdown(
-                '<div style="height:1px;background:#E5E7EB;margin:8px 0 6px 0"></div>',
-                unsafe_allow_html=True,
-            )
-        _prev_etype = etype
-
-        agent_name  = ev.get("agent_name", "")
-        tool_name   = ev.get("tool_name", "")
-        in_summary  = _clean_event_text(ev.get("input_summary",  "") or "")
-        out_summary = _clean_event_text(ev.get("output_summary", "") or "")
-        ev_num      = ev.get("event_number", "")
-
-        icon    = _EVENT_TYPE_ICONS.get(etype, "·")
-        if etype == "tool_returned" and tool_name:
-            label = _TOOL_RETURNED_LABELS.get(tool_name, "Data retrieved")
-        elif etype == "tool_called" and tool_name:
-            label = _TASK_LABELS.get(tool_name, tool_name.replace("_", " ").title())
-        else:
-            label = _EVENT_TYPE_LABELS.get(etype, etype.replace("_", " ").title())
-        tooltip = _EVENT_TYPE_TOOLTIPS.get(etype, "")
-
-        if etype == "step_failed":
-            accent = "#DC2626"
-        elif etype in ("step_completed", "investigation_complete"):
-            accent = "#16A34A"
-        elif etype == "tool_returned":
-            accent = "#16A34A"
-        elif etype in ("tool_called", "agent_reasoning"):
-            accent = "#6B7280"
-        else:
-            accent = "#3B82F6"
-
-        agent_chip = ""
-        if agent_name:
-            agent_label = _AGENT_LABELS.get(agent_name, agent_name)
-            agent_chip = (
-                f'<span style="font-size:0.72em;background:#F3F4F6;color:#374151;'
-                f'border-radius:8px;padding:1px 8px;white-space:nowrap;margin-left:6px">'
-                f'{_esc(_AGENT_ICONS.get(agent_name, "·"))} {_esc(agent_label)}</span>'
-            )
-        tool_chip = ""
-        if tool_name:
-            tool_display = _TASK_LABELS.get(tool_name, tool_name.replace("_", " ").title())
-            tool_chip = (
-                f'<span style="font-size:0.72em;background:#EFF6FF;color:#1D4ED8;'
-                f'border:1px solid #BFDBFE;border-radius:8px;padding:1px 8px;'
-                f'white-space:nowrap;margin-left:6px">{_esc(tool_display)}</span>'
-            )
-
-        show_out = etype not in ("tool_returned", "tool_called")
-        out_text = (out_summary[:80] + "…") if len(out_summary) > 80 else out_summary
-
-        show_in = etype not in ("tool_called", "tool_returned")
-        summary_text = (in_summary[:120] + "…") if len(in_summary) > 120 else in_summary
-
-        out_html = (
-            f'<div style="font-size:0.78em;color:#16A34A;margin-top:2px;'
-            f'font-style:italic">{_esc(out_text)}</div>'
-            if (out_text and show_out) else ""
-        )
-        summary_html = (
-            f'<div style="font-size:0.80em;color:#6B7280;margin-top:3px;'
-            f'line-height:1.45">{_esc(summary_text)}</div>'
-            if (summary_text and show_in) else ""
-        )
-
-        title_attr = f' title="{_esc(tooltip)}"' if tooltip else ""
-
-        st.markdown(
-            f'<div{title_attr} style="border-left:3px solid {accent};'
-            f'padding:6px 0 6px 12px;margin:4px 0;background:#FAFAFA;'
-            f'border-radius:0 6px 6px 0;cursor:default">'
-            f'  <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px">'
-            f'    <span style="font-size:0.68em;color:#9CA3AF;font-weight:700;'
-            f'      background:#F3F4F6;border-radius:3px;padding:1px 5px">#{ev_num}</span>'
-            f'    <span style="font-size:0.76em;font-weight:600;color:#374151">'
-            f'      {icon} {_esc(label)}</span>'
-            f'    {agent_chip}{tool_chip}'
-            f'  </div>'
-            f'  {summary_html}{out_html}'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
-
-
-def _render_replay_trace_metadata(replay_data: dict) -> None:
-    """Render trace metadata for a replayed investigation."""
-    trace_id   = replay_data.get("trace_id", "")
-    mode       = replay_data.get("mode", "")
-    query      = replay_data.get("query", "")
-    events     = replay_data.get("events") or []
-    started_at = replay_data.get("started_at") or ""
-    ended_at   = replay_data.get("ended_at") or ""
-
-    st.markdown(
-        '<div style="background:#F3F4F6;border-radius:6px;'
-        'padding:10px 12px;margin:6px 0 12px 0">'
-        '<div style="font-size:0.66em;color:#6B7280;text-transform:uppercase;'
-        'letter-spacing:0.06em;font-weight:700;margin-bottom:4px">Trace ID</div>'
-        f'<code style="font-size:0.76em;color:#374151;word-break:break-all">'
-        f'{_esc(trace_id)}</code></div>',
-        unsafe_allow_html=True,
-    )
-
-    mode_display = _MODE_DISPLAY.get(mode, mode.title() if mode else "—")
-    c1, c2 = st.columns(2)
-    c1.metric("Investigation Type", mode_display)
-    c2.metric("Activity Events", len(events))
-
-    st.markdown(
-        f'<div style="font-size:0.80em;color:#374151;margin:8px 0 4px 0">'
-        f'<span style="color:#6B7280">Entity:</span> {_esc(query)}</div>'
-        f'<div style="font-size:0.78em;color:#6B7280">'
-        f'Started: {_esc(_fmt_ts(started_at))}<br>'
-        f'Completed: {_esc(_fmt_ts(ended_at))}</div>',
-        unsafe_allow_html=True,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1418,38 +1270,18 @@ def _render_replay_trace_metadata(replay_data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+
 def render_app_header() -> None:
     """Full-width app title and subtitle rendered above the tab layout."""
-    result = state.get_result()
-    overall = _overall_risk_from_result(result) if result else None
-
-    if overall and overall in _RISK_COLORS:
-        tc, bg, border = _RISK_COLORS[overall]
-        badge_html = (
-            f'<div style="display:flex;align-items:center;gap:10px">'
-            f'<span style="font-size:0.7em;font-weight:700;color:#6B7280;'
-            f'text-transform:uppercase;letter-spacing:0.06em;white-space:nowrap">'
-            f'Overall Risk</span>'
-            f'<span style="background:{bg};color:{tc};border:2px solid {border};'
-            f'border-radius:8px;padding:5px 16px;font-size:1.15em;font-weight:800;'
-            f'letter-spacing:0.05em;white-space:nowrap">'
-            f'{_esc(overall)}</span>'
-            f'</div>'
-        )
-    else:
-        badge_html = ''
-
     st.markdown(
         f'<div style="padding:1.2rem 0 1.1rem 0;border-bottom:1px solid #E5E7EB;'
-        f'margin-bottom:1.4rem;display:flex;justify-content:space-between;align-items:center">'
-        f'<div>'
+        f'margin-bottom:1.4rem">'
         f'<div style="font-size:1.55rem;font-weight:800;color:#111827;'
         f'letter-spacing:-0.02em;line-height:1.3">Entity Risk AI</div>'
         f'<div style="font-size:0.875rem;color:#6B7280;margin-top:5px;'
         f'font-weight:400;line-height:1.5">'
         f'Investigate ownership, risk, and traceable decisions</div>'
-        f'</div>'
-        f'{badge_html}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -1653,469 +1485,6 @@ def _render_assessment_card_skeleton(
         f'</div>',
         unsafe_allow_html=True,
     )
-
-
-def _extract_graph_insights(result: Any) -> dict:
-    """Extract ownership graph metrics from ownership_complexity_check findings.
-
-    Returns dict with keys: ownership_depth, beneficial_owner, structure_complexity.
-    Values are display strings ("3 hops", "Yes", "High") or "—" when unavailable.
-    """
-    out = {"ownership_depth": "—", "beneficial_owner": "—", "structure_complexity": "—"}
-    for sr in (result.step_results or []):
-        if not sr.success:
-            continue
-        findings_sr = sr.findings or {}
-        if sr.task == "ownership_complexity_check":
-            data = findings_sr.get("ownership_complexity_check") or {}
-        elif sr.task == "summarize_risk_for_company":
-            data = findings_sr.get("ownership_complexity_check") or {}
-        else:
-            continue
-        if not isinstance(data, dict) or not data:
-            continue
-        depth = data.get("max_chain_depth")
-        if depth is not None:
-            out["ownership_depth"] = f"{depth} hop{'s' if depth != 1 else ''}"
-        has_ubos = data.get("has_individual_ubos")
-        if has_ubos is not None:
-            out["beneficial_owner"] = "Yes" if has_ubos else "No"
-        risk_lvl = data.get("risk_level", "")
-        _cmap = {"HIGH": "High", "MEDIUM": "Medium", "LOW": "Low"}
-        if risk_lvl in _cmap:
-            out["structure_complexity"] = _cmap[risk_lvl]
-        break
-    # Fallback: derive graph insights from expand_ownership when complexity check didn't run
-    if out["ownership_depth"] == "—":
-        for sr in (result.step_results or []):
-            if sr.task != "expand_ownership" or not sr.success:
-                continue
-            data = (sr.findings or {}).get("expand_ownership") or {}
-            paths = data.get("paths") or []
-            ubos  = data.get("ultimate_owners") or []
-            if not paths and not ubos:
-                break
-            max_d    = max((r.get("path_depth", 0) for r in paths), default=0)
-            unique_n = len({r.get("from_name") for r in paths if r.get("from_name")})
-            has_ubos_flag = len(ubos) > 0
-            corporate = len(paths) > 0 and not has_ubos_flag
-            out["ownership_depth"]  = f"{max_d} hop{'s' if max_d != 1 else ''}"
-            out["beneficial_owner"] = "Yes" if has_ubos_flag else "No"
-            score = 0
-            if max_d >= 4:      score += 2
-            elif max_d >= 2:    score += 1
-            if unique_n >= 5:   score += 2
-            elif unique_n >= 2: score += 1
-            if corporate:       score += 2
-            out["structure_complexity"] = "High" if score >= 4 else ("Medium" if score >= 2 else "Low")
-            break
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Context Graph — intent detection, risk colours, and data builder
-# ---------------------------------------------------------------------------
-
-# Node colour palettes (background / border / highlight)
-_GRAPH_COLOR_FOCAL: dict = {
-    "background": "#1D4ED8", "border": "#1E3A8A",
-    "highlight":  {"background": "#3B82F6", "border": "#1E3A8A"},
-}
-_GRAPH_COLOR_COMPANY: dict = {
-    "background": "#DBEAFE", "border": "#93C5FD",
-    "highlight":  {"background": "#BFDBFE", "border": "#60A5FA"},
-}
-_GRAPH_COLOR_PERSON: dict = {
-    "background": "#D1FAE5", "border": "#34D399",
-    "highlight":  {"background": "#A7F3D0", "border": "#10B981"},
-}
-_GRAPH_COLOR_ADDRESS: dict = {
-    "background": "#FEF3C7", "border": "#FCD34D",
-    "highlight":  {"background": "#FDE68A", "border": "#F59E0B"},
-}
-_GRAPH_COLOR_ADDRESS_KEY: dict = {  # address node when address intent is active
-    "background": "#FDE68A", "border": "#D97706",
-    "highlight":  {"background": "#FCD34D", "border": "#B45309"},
-}
-_GRAPH_COLOR_NOUBO: dict = {  # "No UBO identified" phantom node
-    "background": "#FFF7ED", "border": "#F97316",
-    "highlight":  {"background": "#FED7AA", "border": "#EA580C"},
-}
-_GRAPH_COLOR_CLUSTER: dict = {  # co-located entity cluster indicator
-    "background": "#F1F5F9", "border": "#94A3B8",
-    "highlight":  {"background": "#E2E8F0", "border": "#64748B"},
-}
-
-# Legend colours (flat hex for the HTML legend strip)
-_LEGEND_FOCAL   = "#1D4ED8"
-_LEGEND_COMPANY = "#93C5FD"
-_LEGEND_PERSON  = "#34D399"
-_LEGEND_ADDRESS = "#FCD34D"
-
-_GRAPH_MAX_PATH_DEPTH = 3   # max ownership hops rendered
-_GRAPH_MAX_NODES      = 12  # cap on non-focal nodes for readability
-
-
-def _detect_graph_intent(question: str) -> str:
-    """Determine the primary visual focus of the graph from the user's question.
-
-    Returns one of: 'ownership', 'address', 'control', 'risk'.
-    """
-    q = question.lower()
-    address_kws  = {"address", "location", "registered at", "where is", "office", "postcode", "postal"}
-    control_kws  = {"control", "psc", "significant control", "director", "signatory"}
-    ownership_kws = {"own", "owner", "owned", "ubo", "beneficial", "parent", "who owns", "holds", "shareholder"}
-
-    has_ownership = any(t in q for t in ownership_kws)
-    has_address   = any(t in q for t in address_kws)
-    has_control   = any(t in q for t in control_kws)
-
-    if has_address and not has_ownership and not has_control:
-        return "address"
-    if has_control and not has_ownership:
-        return "control"
-    if has_ownership:
-        return "ownership"
-    return "risk"  # general / combined
-
-
-def _edge_color_for_risk(risk_level: str) -> str:
-    """Map a risk_level string ('HIGH'/'MEDIUM'/'LOW') to a hex edge colour."""
-    return {"HIGH": "#EF4444", "MEDIUM": "#F59E0B", "LOW": "#22C55E"}.get(
-        (risk_level or "").upper(), "#9CA3AF"
-    )
-
-
-def _build_agraph_data(
-    result: Any,
-    intent: str = "risk",
-    risk_findings: dict | None = None,
-    repo: Any = None,
-) -> tuple[list, list, dict]:
-    """Build Node/Edge lists and per-node metadata from an investigation result.
-
-    Parameters
-    ----------
-    result        OrchestratorResult — step_results, resolved_entities.
-    intent        Graph focus derived from _detect_graph_intent().
-    risk_findings {task_name: findings_dict} — used to colour edges by risk level.
-    repo          Optional Neo4jRepository for secondary queries when the
-                  investigation did not produce ownership or address data.
-
-    Key behaviours
-    --------------
-    - Ownership edges on the primary chain are coloured by the relevant risk level
-      and carry pct labels; secondary/non-key edges are grey and unlabelled.
-    - Address node is enlarged and highlighted when intent == 'address'.
-    - A "? No UBO" phantom node is added when corporate_chain_only == True.
-    - Secondary Neo4j queries run (once, scoped) when investigation data is absent.
-
-    Returns (nodes, edges, node_meta) where node_meta maps node_id to
-    {"full_name", "type", "context"}.
-    """
-    from streamlit_agraph import Edge, Node
-
-    nodes: list[Node] = []
-    edges: list[Edge] = []
-    seen:  set[str]   = set()
-    node_meta: dict[str, dict] = {}
-
-    rf = risk_findings or {}
-
-    # Determine key-path edge colour from intent + risk findings
-    if intent == "address":
-        key_color = _edge_color_for_risk(rf.get("address_risk_check", {}).get("risk_level", ""))
-    elif intent == "control":
-        key_color = _edge_color_for_risk(rf.get("control_signal_check", {}).get("risk_level", ""))
-    else:  # 'ownership' or 'risk'
-        key_color = _edge_color_for_risk(rf.get("ownership_complexity_check", {}).get("risk_level", ""))
-
-    ownership_is_key = intent in ("ownership", "risk", "control")
-
-    def add_node(
-        nid: str, label: str, color: dict, size: int,
-        full_name: str, node_type: str, context: str = "",
-        border_width: int = 1,
-    ) -> None:
-        if nid not in seen:
-            seen.add(nid)
-            nodes.append(Node(
-                id=nid, label=label, color=color, size=size,
-                title=full_name, borderWidth=border_width,
-            ))
-            node_meta[nid] = {"full_name": full_name, "type": node_type, "context": context}
-
-    def add_edge(
-        src: str, dst: str, label: str = "",
-        color: str = "#9CA3AF", is_key: bool = False,
-    ) -> None:
-        edges.append(Edge(
-            source=src, target=dst,
-            label=label if is_key else "",  # pct labels only on key-path edges
-            color=color,
-            width=3 if is_key else 1,
-            font={"size": 10, "align": "middle",
-                  "strokeWidth": 2, "strokeColor": "#FFFFFF"},
-        ))
-
-    def _short(name: str, n: int = 22) -> str:
-        return name if len(name) <= n else name[: n - 1] + "\u2026"
-
-    def _pct_label(lo: Any, hi: Any) -> str:
-        if lo is None:
-            return ""
-        lo_i = int(lo)
-        hi_i = int(hi) if hi is not None else lo_i
-        return f"{lo_i}%" if lo_i == hi_i else f"{lo_i}\u2013{hi_i}%"
-
-    # ── Focal entity ──────────────────────────────────────────────────────
-    focal_id = ""
-    focal_number = ""
-    for _, edata in (result.resolved_entities or {}).items():
-        if edata:
-            focal_id     = edata.get("canonical_name", "")
-            focal_number = edata.get("company_number", "")
-            break
-    if not focal_id:
-        focal_id = result.query or "Entity"
-
-    focal_ctx = f"Company No. {focal_number}" if focal_number else "Investigated entity"
-    add_node(focal_id, _short(focal_id, 24), _GRAPH_COLOR_FOCAL, size=34,
-             full_name=focal_id, node_type="Focal Company",
-             context=focal_ctx, border_width=3)
-
-    non_focal: int = 0
-    ownership_found = False
-    address_found   = False
-
-    # ── Ownership paths from expand_ownership ─────────────────────────────
-    for sr in (result.step_results or []):
-        if sr.task != "expand_ownership" or not sr.success:
-            continue
-        eo    = (sr.findings or {}).get("expand_ownership") or {}
-        paths = eo.get("paths") or []
-        ubos  = eo.get("ultimate_owners") or []
-
-        for row in paths:
-            if non_focal >= _GRAPH_MAX_NODES:
-                break
-            if (row.get("path_depth") or 0) > _GRAPH_MAX_PATH_DEPTH:
-                continue
-            from_name = (row.get("from_name") or "").strip()
-            to_name   = (row.get("to_name") or "").strip()
-            if not from_name or not to_name:
-                continue
-            from_labels = row.get("from_labels") or []
-            is_person   = "Person" in from_labels
-            color       = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
-            node_type   = "Individual" if is_person else "Company"
-            pct         = _pct_label(row.get("ownership_pct_min"), row.get("ownership_pct_max"))
-            if from_name not in seen:
-                non_focal += 1
-            add_node(from_name, _short(from_name), color,
-                     size=22 if is_person else 18,
-                     full_name=from_name, node_type=node_type,
-                     context=f"Ownership: {pct}" if pct else "Owner")
-            add_edge(from_name, to_name, label=pct,
-                     color=key_color if ownership_is_key else "#9CA3AF",
-                     is_key=ownership_is_key)
-            ownership_found = True
-
-        # UBOs not already captured via path rows
-        for ubo in ubos:
-            if non_focal >= _GRAPH_MAX_NODES:
-                break
-            name = (ubo.get("owner_name") or "").strip()
-            if not name:
-                continue
-            pct = _pct_label(ubo.get("ownership_pct_min"), ubo.get("ownership_pct_max"))
-            if name not in seen:
-                non_focal += 1
-            add_node(name, _short(name), _GRAPH_COLOR_PERSON, size=26,
-                     full_name=name, node_type="Individual / Beneficial Owner",
-                     context=f"Ownership: {pct}" if pct else "Beneficial owner")
-            if not any(e.source == name and e.target == focal_id for e in edges):
-                add_edge(name, focal_id,
-                         color=key_color if ownership_is_key else "#34D399",
-                         is_key=ownership_is_key)
-            ownership_found = True
-        break  # only process the first expand_ownership step
-
-    # ── Fallback: direct owners from company_profile ──────────────────────
-    if not ownership_found:
-        for sr in (result.step_results or []):
-            if sr.task != "company_profile" or not sr.success:
-                continue
-            cp = (sr.findings or {}).get("company_profile") or {}
-            for owner in (cp.get("direct_owners") or []):
-                if non_focal >= _GRAPH_MAX_NODES:
-                    break
-                name = (owner.get("owner_name") or "").strip()
-                if not name:
-                    continue
-                labels    = owner.get("owner_labels") or []
-                is_person = "Person" in labels
-                color     = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
-                node_type = "Individual" if is_person else "Company"
-                pct       = _pct_label(owner.get("ownership_pct_min"), owner.get("ownership_pct_max"))
-                if name not in seen:
-                    non_focal += 1
-                add_node(name, _short(name), color, size=20,
-                         full_name=name, node_type=node_type,
-                         context=f"Ownership: {pct}" if pct else "Direct owner")
-                add_edge(name, focal_id, label=pct,
-                         color=key_color if ownership_is_key else "#9CA3AF",
-                         is_key=ownership_is_key)
-                ownership_found = True
-            break
-
-    # ── Secondary Neo4j: fetch direct owners when investigation omitted them ─
-    if not ownership_found and repo is not None and intent in ("ownership", "risk"):
-        try:
-            db_owners = repo.get_direct_owners(focal_id)
-            for owner in db_owners[:5]:
-                if non_focal >= _GRAPH_MAX_NODES:
-                    break
-                name = (owner.get("owner_name") or "").strip()
-                if not name:
-                    continue
-                labels    = owner.get("owner_labels") or []
-                is_person = "Person" in labels
-                color     = _GRAPH_COLOR_PERSON if is_person else _GRAPH_COLOR_COMPANY
-                node_type = "Individual" if is_person else "Company"
-                pct       = _pct_label(owner.get("ownership_pct_min"), owner.get("ownership_pct_max"))
-                if name not in seen:
-                    non_focal += 1
-                add_node(name, _short(name), color, size=20,
-                         full_name=name, node_type=node_type,
-                         context=f"Ownership: {pct}" if pct else "Direct owner")
-                add_edge(name, focal_id, label=pct,
-                         color=key_color if ownership_is_key else "#9CA3AF",
-                         is_key=ownership_is_key)
-                ownership_found = True
-        except Exception:
-            pass  # DB unavailable — fall through silently
-
-    # ── "No UBO" phantom node — corporate chain only ──────────────────────
-    own_findings = rf.get("ownership_complexity_check", {})
-    if (
-        intent in ("ownership", "risk")
-        and own_findings.get("corporate_chain_only") is True
-        and non_focal < _GRAPH_MAX_NODES
-    ):
-        nid = "__no_ubo__"
-        if nid not in seen:
-            non_focal += 1
-        add_node(nid, "? No UBO", _GRAPH_COLOR_NOUBO, size=14,
-                 full_name="No individual beneficial owner identified",
-                 node_type="Missing UBO",
-                 context="Full ownership chain consists of corporate entities only.",
-                 border_width=2)
-        add_edge(focal_id, nid, color="#F97316", is_key=False)
-
-    # ── Address node ───────────────────────────────────────────────────────
-    address_is_key = intent == "address"
-    addr_color     = _GRAPH_COLOR_ADDRESS_KEY if address_is_key else _GRAPH_COLOR_ADDRESS
-    addr_size      = 22 if address_is_key else 14
-
-    for sr in (result.step_results or []):
-        if sr.task != "company_profile" or not sr.success:
-            continue
-        cp      = (sr.findings or {}).get("company_profile") or {}
-        address = cp.get("address") or {}
-        if address and non_focal < _GRAPH_MAX_NODES:
-            postal     = (address.get("postal_code") or "").strip()
-            town       = (address.get("post_town") or "").strip()
-            addr_label = postal or town or "Address"
-            full_addr  = ", ".join(filter(None, [
-                address.get("address_line_1", ""),
-                town,
-                postal,
-            ]))
-            addr_id   = f"__addr__{focal_id}"
-            co_total  = rf.get("address_risk_check", {}).get("co_located_total", 0)
-            addr_ctx  = full_addr or addr_label
-            if co_total:
-                addr_ctx  += f" · {co_total} co-located entities"
-                addr_label = f"{addr_label} ({co_total})"
-            if addr_id not in seen:
-                non_focal += 1
-            add_node(addr_id, _short(addr_label, 22), addr_color, size=addr_size,
-                     full_name=full_addr or addr_label,
-                     node_type="Registered Address",
-                     context=addr_ctx)
-            add_edge(focal_id, addr_id, label="at",
-                     color=key_color if address_is_key else "#F59E0B",
-                     is_key=address_is_key)
-            address_found = True
-
-            # Co-located cluster indicator (address intent, high concentration)
-            if address_is_key and co_total > 5 and non_focal < _GRAPH_MAX_NODES:
-                clust_id  = "__colocated__"
-                diss_pct  = round(rf.get("address_risk_check", {}).get("dissolution_rate", 0.0) * 100)
-                clust_lbl = f"+{co_total} entities"
-                clust_ctx = f"{co_total} companies share this address"
-                if diss_pct:
-                    clust_ctx += f" · {diss_pct}% dissolved"
-                if clust_id not in seen:
-                    non_focal += 1
-                add_node(clust_id, clust_lbl, _GRAPH_COLOR_CLUSTER, size=16,
-                         full_name=f"{co_total} co-located companies",
-                         node_type="Co-located Cluster",
-                         context=clust_ctx)
-                add_edge(addr_id, clust_id, color=key_color, is_key=address_is_key)
-        break
-
-    # ── Secondary Neo4j: fetch address when company_profile didn't run ─────
-    if not address_found and repo is not None and intent in ("address", "risk"):
-        try:
-            db_addr = repo.get_company_address_context(focal_id)
-            if db_addr and non_focal < _GRAPH_MAX_NODES:
-                postal     = (db_addr.get("post_code") or "").strip()
-                town       = (db_addr.get("post_town") or "").strip()
-                addr_label = postal or town or "Address"
-                full_addr  = ", ".join(filter(None, [
-                    db_addr.get("address_line_1", ""),
-                    town,
-                    postal,
-                ]))
-                addr_id = f"__addr__{focal_id}"
-                if addr_id not in seen:
-                    non_focal += 1
-                add_node(addr_id, addr_label, addr_color, size=addr_size,
-                         full_name=full_addr or addr_label,
-                         node_type="Registered Address",
-                         context=full_addr or addr_label)
-                add_edge(focal_id, addr_id, label="at",
-                         color=key_color if address_is_key else "#F59E0B",
-                         is_key=address_is_key)
-        except Exception:
-            pass  # DB unavailable — fall through silently
-
-    return nodes, edges, node_meta
-
-
-# ---------------------------------------------------------------------------
-# Interactive node detail panel
-# ---------------------------------------------------------------------------
-
-_RISK_BADGE_STYLE: dict[str, tuple[str, str]] = {
-    "HIGH":    ("#B91C1C", "#FEF2F2"),
-    "MEDIUM":  ("#92400E", "#FFFBEB"),
-    "LOW":     ("#14532D", "#F0FDF4"),
-}
-
-_STATUS_BADGE_STYLE: dict[str, tuple[str, str]] = {
-    "Active":   ("#14532D", "#F0FDF4"),
-    "Dissolved": ("#6B7280", "#F3F4F6"),
-}
-
-_DIM_LABEL_MAP: dict[str, str] = {
-    "ownership": "Ownership",
-    "address":   "Address",
-    "control":   "Control",
-    "industry":  "Industry",
-}
 
 
 def _render_node_detail_panel(
@@ -2909,7 +2278,7 @@ def render_investigate_tab(components: "AppComponents") -> None:
 
     Layout
     ------
-    [Progress bar]  (only during active investigation)
+    [Progress bar]        (only during active investigation)
     [Col 1 — AI Assistant]  [Col 2 — Context Graph]  [Col 3 — Decision Insights]
                                                        └─ "How this decision was made"
                                                           (collapsed expander at bottom)
@@ -3343,11 +2712,14 @@ def _render_insights_column(live_dims: dict) -> None:
 
     During execution: shows investigation type + live risk signal list.
     """
-    _section_header("⚡ Assessment", "Outcome and risk factor breakdown")
-
     live_phase = state.get_live_phase()
     result     = state.get_result()
     live_plan  = state.get_live_plan()
+    _section_header(
+        "⚡ Assessment",
+        "Outcome and risk factor breakdown",
+        badge_html=_risk_badge_html(_overall_risk_from_result(result) if result else None),
+    )
     plan       = (result.planner_output if result is not None else None) or live_plan
 
     # ── Idle, no data ──────────────────────────────────────────────────
@@ -3908,7 +3280,11 @@ def _render_replay_insights_column() -> None:
     replay_status = state.get_replay_status()
     replay_data   = state.get_replay_data()
 
-    _section_header("⚡ Assessment", "Outcome and risk factor breakdown")
+    _section_header(
+        "⚡ Assessment",
+        "Outcome and risk factor breakdown",
+        badge_html=_risk_badge_html(_overall_risk_from_replay(replay_data)),
+    )
 
     if replay_status != "loaded" or not replay_data:
         st.markdown(

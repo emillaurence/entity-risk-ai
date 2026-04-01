@@ -195,9 +195,8 @@ class Neo4jRepository:
             RETURN
                 a.address_line_1    AS address_line_1,
                 a.address_line_2    AS address_line_2,
-                a.locality          AS locality,
-                a.region            AS region,
-                a.postal_code       AS postal_code,
+                a.post_town         AS post_town,
+                a.post_code         AS post_code,
                 a.country           AS country
         """
         rows = self.run_query(query, {"name": company_name})

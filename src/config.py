@@ -67,6 +67,11 @@ class AnthropicSettings:
         }
 
 
+def get_remote_mcp_url() -> str:
+    """Return the remote MCP server URL, or empty string if not configured."""
+    return os.getenv("REMOTE_MCP_URL", "")
+
+
 def get_anthropic_settings() -> AnthropicSettings:
     missing = [key for key in _ANTHROPIC_REQUIRED if not os.getenv(key)]
     if missing:
