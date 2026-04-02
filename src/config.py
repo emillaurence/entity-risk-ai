@@ -1,3 +1,13 @@
+"""
+src.config — Application configuration from environment variables.
+
+Loads ``.env`` via python-dotenv.  Call ``get_neo4j_settings()`` and
+``get_anthropic_settings()`` to get validated settings objects.
+Both raise ``EnvironmentError`` listing any missing required keys.
+
+``get_remote_mcp_url()`` returns ``REMOTE_MCP_URL`` or an empty string.
+"""
+
 from dataclasses import dataclass
 from dotenv import load_dotenv
 import os

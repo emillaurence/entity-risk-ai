@@ -91,8 +91,9 @@ ALL_MCP_TOOLS: frozenset[str] = frozenset({
 })
 
 #: Tools restricted from the Jr analyst role.
-# summarize_risk_for_company is decommissioned (replaced by orchestrator-level
-# synthesis), but kept here as a safety net in case a legacy plan step appears.
+# summarize_risk_for_company is a synthetic RiskAgent task (not an MCP endpoint),
+# so it is absent from ALL_MCP_TOOLS above.  It is included here as a safety net
+# so that if the planner emits it as a step, Jr analysts cannot invoke it.
 _JR_DENIED_TOOLS: frozenset[str] = (
     ADDRESS_RISK_TOOLS | INDUSTRY_RISK_TOOLS | frozenset({"summarize_risk_for_company"})
 )

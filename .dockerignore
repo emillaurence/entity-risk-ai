@@ -1,0 +1,21 @@
+# Secrets — never bake into image
+.env
+.env.*
+!.env.example
+
+# Version control
+.git/
+.gitignore
+
+# Dev / local-only files
+notebooks/
+docs/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Streamlit app (not needed in MCP server image)
+app.py

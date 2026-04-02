@@ -24,6 +24,45 @@ streamlit run app.py
 jupyter notebook notebooks/
 ```
 
+## Authentication and Roles
+
+The app uses a mock login gate. Two demo users are pre-configured:
+
+| Username | Password | Role |
+|---|---|---|
+| `jr_analyst` | `demo123` | `jr_risk_analyst` |
+| `sr_analyst` | `demo123` | `sr_risk_analyst` |
+
+Sign in at the login screen. The sidebar shows the active user and role. A **Sign out** button is available at the bottom of the sidebar.
+
+**Dev bypass** — set `DEV_BYPASS_AUTH=true` in `.env` to enable a bypass button on the login screen that logs in as an `sr_risk_analyst` without a password. Never active by default.
+
+## Current Authorization Model
+
+Authorization is enforced in-app by `src/app/policy.py`.
+
+| Capability | Jr Risk Analyst | Sr Risk Analyst |
+|---|---|---|
+| Investigate tab | ✓ | ✓ |
+| Replay / Audit tab | ✗ | ✓ |
+| View technical evidence | ✓ | ✓ |
+| `address_risk_check` MCP tool | ✗ | ✓ |
+| `industry_context_check` MCP tool | ✗ | ✓ |
+| All other MCP tools | ✓ | ✓ |
+
+Policy is centralized in `RolePolicy` / `get_policy_for_user()` in `src/app/policy.py`. No role decisions are made outside that module.
+
+## Future Kong Integration
+
+Phase 1 uses mock login and in-app policy enforcement. The architecture is intentionally shaped to support a future Kong MCP Gateway layer:
+
+- `AuthenticatedUser.auth_provider` is set to `"mock"` or `"dev_bypass"`; a Kong-backed flow will set it to `"kong"` and populate `metadata` with JWT claims.
+- `UserContext.metadata` carries `role`, `auth_provider`, and `gateway_mode` into the investigation flow and persisted trace.
+- Each `InvestigationTrace` in Neo4j stores `user_id`, `user_role`, `auth_provider`, `session_id`, and `gateway_mode` for future audit and Kong consumer tracing.
+- MCP tool categories in `policy.py` (`ADDRESS_RISK_TOOLS`, `INDUSTRY_RISK_TOOLS`) map directly to the intended Kong consumer ACL scopes (`mcp:address_risk`, `mcp:industry_risk`).
+
+When Kong enforcement is added, replace `authenticate()` in `src/app/auth.py` with a Kong-backed provider and update the `auth_provider` value. In-app policy enforcement can then be removed or demoted to a fallback.
+
 ## Agents
 
 Three specialist agents handle all investigation work:
@@ -120,6 +159,10 @@ Notebooks live in `notebooks/` and are the primary surface for exploration and d
 | `303_llm_planner` | InvestigationPlanner — LLM-based plan generation |
 | `304_orchestrator` | Multi-agent orchestrator — end-to-end investigation |
 | `401_step_result_contract_check` | Data contract validation for step results |
+| `501_mock_login_smoke` | Mock login gate, session-state helpers, dev bypass |
+| `502_role_policy_smoke` | Role policy, Jr/Sr capability checks, MCP tool allowlists |
+| `503_trace_context_smoke` | User/session context propagation into trace metadata |
+| `504_phase1_hardening_smoke` | Phase-1 consistency and hardening assertions |
 
 ## Project Structure
 
@@ -161,6 +204,8 @@ entity-risk-ai/
     │   ├── planner.py            # InvestigationPlanner — LLM plan generation
     │   └── orchestrator.py       # Orchestrator — 7-stage multi-agent execution
     └── app/
+        ├── auth.py               # Phase-1 mock auth, AuthenticatedUser
+        ├── policy.py             # Role-based authorization, RolePolicy
         ├── factory.py            # AppComponents wiring (@st.cache_resource)
         ├── layout.py             # Main Streamlit layout
         ├── state.py              # Session state management
