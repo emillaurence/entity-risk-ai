@@ -145,11 +145,9 @@ def login(user: "AuthenticatedUser") -> None:
 
 
 def logout() -> None:
-    """Clear auth state, returning the session to the unauthenticated gate."""
-    st.session_state[_KEY_AUTH_USER]          = None
-    st.session_state[_KEY_AUTH_AUTHENTICATED] = False
-    st.session_state[_KEY_AUTH_ERROR]         = None
-    st.session_state[_KEY_AUTH_DEV_BYPASS]    = False
+    """Clear all session state, returning the session to the unauthenticated gate."""
+    for key, default in _DEFAULTS.items():
+        st.session_state[key] = default.copy() if isinstance(default, (dict, list)) else default
 
 
 def get_auth_error() -> str | None:
