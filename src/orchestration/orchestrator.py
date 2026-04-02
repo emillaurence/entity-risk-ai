@@ -49,7 +49,7 @@ from src.agents.risk_agent import RiskAgent
 from src.agents.trace_agent import TraceAgent
 from src.clients.ai_client import AIClient
 from src.clients.mcp_tool_client import MCPToolClient
-from src.domain.models import AgentResult, EventType, InvestigationTrace, TraceEvent
+from src.domain.models import AgentResult, EventType, InvestigationTrace, TraceEvent, UserContext
 from src.orchestration.planner import InvestigationPlanner, PlannerResult, PlanStep
 from src.storage.trace_repository import TraceRepository
 from src.tracing.trace_service import TraceService
@@ -391,6 +391,7 @@ class Orchestrator:
         self,
         query: str,
         user_id: str = "system",
+        user_context: "UserContext | None" = None,
         on_progress: Any = None,
         confirmation_queue: "_queue_mod.Queue | None" = None,
         allowed_tools: "frozenset[str] | None" = None,
@@ -400,7 +401,13 @@ class Orchestrator:
 
         Args:
             query:         Free-text investigation query.
-            user_id:       Identifier for the requesting user, written to the trace.
+            user_id:       Identifier for the requesting user (legacy; kept for
+                           backward compatibility). Ignored when ``user_context``
+                           is provided.
+            user_context:  Richer session context built from the authenticated user.
+                           Preferred over bare ``user_id``. When provided, identity
+                           fields (user_id, role, auth_provider, session_id,
+                           gateway_mode) are all written to the trace.
             allowed_tools: Optional allowlist of MCP tool / task names the caller
                            is permitted to invoke.  When provided, any plan step
                            whose task name is NOT in this set is skipped with a
@@ -415,6 +422,10 @@ class Orchestrator:
         """
         warnings: list[str] = []
         errors: list[str] = []
+
+        # Resolve to a canonical user context for this run.
+        # user_context is preferred; fall back to bare user_id for legacy callers.
+        _user_ctx = user_context or UserContext(user_id=user_id, session_id="", metadata={})
 
         # Short ID for log correlation across all events in this run.
         _run_id = str(uuid.uuid4())
@@ -454,8 +465,12 @@ class Orchestrator:
             request_id=_run_id,
             entity_name=entity_name,
             question=query,
-            user_id=user_id,
+            user_id=_user_ctx.user_id,
             mode=plan.mode,
+            user_role=_user_ctx.metadata.get("role", ""),
+            auth_provider=_user_ctx.metadata.get("auth_provider", ""),
+            session_id=_user_ctx.session_id,
+            gateway_mode=_user_ctx.metadata.get("gateway_mode", ""),
         )
         self._trace_repo.save_trace(trace)
         if on_progress:

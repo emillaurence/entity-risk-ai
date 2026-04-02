@@ -1204,6 +1204,27 @@ def _render_replay_plan(replay_data: dict) -> None:
                 unsafe_allow_html=True,
             )
 
+        # Session identity — collapsed by default; hidden when all fields are empty
+        # (older traces that pre-date this feature will have no identity fields).
+        _sid_rows = [
+            ("User",          replay_data.get("user_id") or ""),
+            ("Role",          replay_data.get("user_role") or ""),
+            ("Auth Provider", replay_data.get("auth_provider") or ""),
+            ("Session",       replay_data.get("session_id") or ""),
+            ("Gateway Mode",  replay_data.get("gateway_mode") or ""),
+        ]
+        _sid_populated = [r for r in _sid_rows if r[1]]
+        if _sid_populated:
+            with st.expander("🔑 Session Identity", expanded=False):
+                for _label, _value in _sid_populated:
+                    st.markdown(
+                        f'<div style="font-size:0.82em;color:#374151;padding:3px 0">'
+                        f'<b>{_esc(_label)}:</b>&nbsp;'
+                        f'<span style="font-family:monospace;color:#1F2937">'
+                        f'{_esc(_value)}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
         focus_text = plan_reason or _MODE_PLAN_FALLBACK.get(mode, "")
         if focus_text:
             st.markdown(

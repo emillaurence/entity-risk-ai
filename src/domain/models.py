@@ -172,6 +172,10 @@ class InvestigationTrace:
     question: str = ""
     user_id: str = ""
     mode: str = "interactive"
+    user_role: str = ""        # e.g. "sr_risk_analyst"; "" for non-app callers
+    auth_provider: str = ""    # "mock" | "dev_bypass" | future "kong"
+    session_id: str = ""       # AuthenticatedUser.session_id (uuid)
+    gateway_mode: str = ""     # "local" | "remote"; future "kong"
     final_summary: str = ""
     ended_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

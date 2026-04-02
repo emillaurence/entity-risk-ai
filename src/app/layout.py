@@ -49,6 +49,7 @@ from src.app.components import (
 from src.app.factory import AppComponents, create_app_components
 from src.app.policy import get_policy_for_user
 from src.app.styles import inject_styles
+from src.domain.models import UserContext
 
 _log = get_app_logger()
 
@@ -57,6 +58,7 @@ def _start_investigation(
     components: AppComponents,
     question: str,
     allowed_tools: "frozenset[str] | None" = None,
+    user_context: "UserContext | None" = None,
 ) -> None:
     """Reset live state, start the orchestrator in a background thread, and
     seed the run queue so the UI picks up progress events on each rerun.
@@ -95,6 +97,7 @@ def _start_investigation(
         try:
             result = components.orchestrator.run(
                 question,
+                user_context=user_context,
                 on_progress=on_progress,
                 confirmation_queue=confirm_q,
                 allowed_tools=allowed_tools,
@@ -332,7 +335,21 @@ def render_layout() -> None:
         question = state.get_question()
         if question:
             _allowed = _policy.allowed_mcp_tools if _policy is not None else None
-            _start_investigation(components, question, allowed_tools=_allowed)
+            # Build a richer UserContext from the authenticated session so
+            # the orchestrator can persist full identity into the trace.
+            # Future Kong: replace auth_provider / metadata with JWT claims.
+            _user_ctx: UserContext | None = None
+            if user is not None:
+                _user_ctx = UserContext(
+                    user_id=user.user_id,
+                    session_id=user.session_id,
+                    metadata={
+                        "role":          user.role,
+                        "auth_provider": user.auth_provider,
+                        "gateway_mode":  mcp_mode,
+                    },
+                )
+            _start_investigation(components, question, allowed_tools=_allowed, user_context=_user_ctx)
             st.rerun()  # immediately show "Planning…" state
 
     # ── Fragment-scoped poller ─────────────────────────────────────────
