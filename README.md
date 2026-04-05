@@ -52,7 +52,39 @@ Authorization is enforced in-app by `src/app/policy.py`.
 
 Policy is centralized in `RolePolicy` / `get_policy_for_user()` in `src/app/policy.py`. No role decisions are made outside that module.
 
-## Future Kong Integration
+## Upcoming Kong Integration
+
+Kong is being added in staged phases, starting with connectivity scaffolding (phase 505) and ending with live AI and MCP gateway routing.  **The app continues to use direct Anthropic and direct remote-MCP paths until a later phase explicitly switches.**
+
+**Deployment model:** all Kong phases use **Konnect Serverless Gateway** — Kong manages the data plane; no containers, cluster certificates, or self-hosted nodes are required.
+
+### Staged rollout
+
+| Phase | Notebook | What it does |
+|---|---|---|
+| 505 | `505_kong_konnect_bootstrap_and_connectivity` | Install decK, create PAT, create Serverless gateway, validate Konnect connectivity — no live traffic yet |
+| 506 | `506_kong_ai_gateway` | Wire `AnthropicClient` through a Kong AI Gateway route |
+| 507 | `507_kong_mcp_gateway` | Expose the MCP server behind a Kong route with auth plugins |
+
+### Kong config variables
+
+All Kong variables are defined in `.env.example` under a clearly labelled section.  None are required today.  Set them when you reach the phase that needs them.
+
+| Variable | Used from phase | Purpose |
+|---|---|---|
+| `KONG_KONNECT_REGION` | 505 | Konnect region (`eu`, `us`, `au`, `in`) |
+| `KONG_KONNECT_CONTROL_PLANE_NAME` | 505 | Control plane name in Konnect |
+| `KONG_KONNECT_TOKEN` | 505 | Konnect Personal Access Token |
+| `KONG_PROXY_URL` | 506 | Base URL of the Kong data plane proxy |
+| `KONG_AI_GATEWAY_ENABLED` | 506 | `true` to route AI calls through Kong |
+| `KONG_AI_GATEWAY_ROUTE_PATH` | 506 | Proxy route path for AI requests |
+| `KONG_AI_GATEWAY_API_KEY` | 506 | API key forwarded as `X-Kong-API-Key` |
+| `KONG_MCP_GATEWAY_ENABLED` | 507 | `true` to route MCP calls through Kong |
+| `KONG_MCP_GATEWAY_ROUTE_PATH` | 507 | Proxy route path for MCP requests |
+| `KONG_MCP_GATEWAY_API_KEY` | 507 | API key forwarded as `X-Kong-API-Key` |
+| `ENABLE_LIVE_KONG_NOTEBOOK_TESTS` | 505+ | `true` to run notebook cells that hit real Konnect/proxy |
+
+### Architecture shape for Kong
 
 Phase 1 uses mock login and in-app policy enforcement. The architecture is intentionally shaped to support a future Kong MCP Gateway layer:
 
@@ -163,6 +195,7 @@ Notebooks live in `notebooks/` and are the primary surface for exploration and d
 | `502_role_policy_smoke` | Role policy, Jr/Sr capability checks, MCP tool allowlists |
 | `503_trace_context_smoke` | User/session context propagation into trace metadata |
 | `504_phase1_hardening_smoke` | Phase-1 consistency and hardening assertions |
+| `505_kong_konnect_bootstrap_and_connectivity` | Install decK, create PAT, validate Konnect connectivity — Kong phase 505 |
 
 ## Project Structure
 
