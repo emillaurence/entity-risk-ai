@@ -182,3 +182,29 @@ def get_policy(role: str) -> RolePolicy:
 def get_policy_for_user(user: "AuthenticatedUser") -> RolePolicy:
     """Convenience wrapper — extracts role from an AuthenticatedUser."""
     return get_policy(user.role)
+
+
+# ---------------------------------------------------------------------------
+# Phase 509 — Kong consumer group mapping
+#
+# Maps stable app role identifiers → Kong Consumer Group names.
+# Kong uses these group names to enforce tool-level ACL when
+# KONG_MCP_ACL_POLICY_ENABLED=true and the UI backend is "kong".
+#
+# Keep in sync with kong/consumer_groups.yaml and kong/acl_policy.yaml.
+# ---------------------------------------------------------------------------
+
+#: Maps app role → Kong Consumer Group name.
+KONG_CONSUMER_GROUP_MAP: dict[str, str] = {
+    ROLE_JR_RISK_ANALYST: "jr-analyst",
+    ROLE_SR_RISK_ANALYST: "sr-analyst",
+}
+
+
+def get_kong_consumer_group(role: str) -> str | None:
+    """Return the Kong Consumer Group name for *role*, or None if unmapped.
+
+    Used for logging when Kong ACL enforcement is active.  The actual ACL
+    decision is made by Kong — this is informational only.
+    """
+    return KONG_CONSUMER_GROUP_MAP.get(role)

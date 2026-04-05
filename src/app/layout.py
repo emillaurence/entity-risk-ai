@@ -47,8 +47,9 @@ from src.app.components import (
     render_status_banner,
 )
 from src.app.factory import AppComponents, create_app_components
-from src.app.policy import get_policy_for_user
+from src.app.policy import get_kong_consumer_group, get_policy_for_user
 from src.app.styles import inject_styles
+from src.config import get_kong_mcp_gateway_settings, kong_acl_enforcement_active
 from src.domain.models import UserContext
 
 _log = get_app_logger()
@@ -232,6 +233,7 @@ def render_layout() -> None:
     # ── Sidebar ─────────────────────────────────────────────────────────
     remote_url_configured = bool(os.getenv("REMOTE_MCP_URL"))
     kong_mcp_enabled = os.getenv("KONG_MCP_GATEWAY_ENABLED", "").strip().lower() == "true"
+    kong_acl_flag = os.getenv("KONG_MCP_ACL_POLICY_ENABLED", "").strip().lower() == "true"
 
     _mcp_options = ["local", "remote"]
     if kong_mcp_enabled:
@@ -268,6 +270,12 @@ def render_layout() -> None:
         if not remote_url_configured and not kong_mcp_enabled:
             st.caption("Set REMOTE_MCP_URL or KONG_MCP_GATEWAY_ENABLED in .env to enable remote mode.")
 
+        # Phase 509 — show ACL enforcement status when Kong MCP is active
+        if mcp_mode == "kong" and kong_mcp_enabled and kong_acl_flag:
+            st.caption("🔒 Kong ACL policy ACTIVE — tool access enforced at gateway")
+        elif mcp_mode == "kong" and kong_mcp_enabled:
+            st.caption("🔓 Kong transport (ACL disabled — app policy applies)")
+
         st.divider()
         user = state.get_authenticated_user()
         if user:
@@ -277,7 +285,7 @@ def render_layout() -> None:
             state.logout()
             st.rerun()
 
-    components = create_app_components(mcp_mode=mcp_mode)
+    components = create_app_components(mcp_mode=mcp_mode, role=user.role if user else "")
 
     # ── Derive policy for current user ─────────────────────────────────
     _policy = get_policy_for_user(user) if user else None
@@ -354,7 +362,26 @@ def render_layout() -> None:
     if st.session_state.pop("_trigger_run", False):
         question = state.get_question()
         if question:
-            _allowed = _policy.allowed_mcp_tools if _policy is not None else None
+            # ── Phase 509: Kong ACL enforcement switch ──────────────────────
+            # Determine whether Kong gateway is enforcing tool access control.
+            # When active: pass allowed_tools=None so the app does NOT filter
+            # tools — Kong enforces at the gateway level instead.
+            # When inactive: use the app-side policy allowlist as before.
+            _kong_mcp_settings = get_kong_mcp_gateway_settings()
+            _kong_acl_active = kong_acl_enforcement_active(mcp_mode, _kong_mcp_settings)
+
+            if _kong_acl_active:
+                _allowed = None  # Kong enforces — do NOT filter in app
+                _consumer_group = get_kong_consumer_group(user.role) if user else None
+                _log.info(
+                    "Kong MCP ACL policy ACTIVE — role=%s consumer_group=%s endpoint=%s",
+                    user.role if user else "unknown",
+                    _consumer_group or "unmapped",
+                    _kong_mcp_settings.gateway_url,
+                )
+            else:
+                _allowed = _policy.allowed_mcp_tools if _policy is not None else None
+
             # Build a richer UserContext from the authenticated session so
             # the orchestrator can persist full identity into the trace.
             # Future Kong: replace auth_provider / metadata with JWT claims.
@@ -364,9 +391,10 @@ def render_layout() -> None:
                     user_id=user.user_id,
                     session_id=user.session_id,
                     metadata={
-                        "role":          user.role,
-                        "auth_provider": user.auth_provider,
-                        "gateway_mode":  mcp_mode,
+                        "role":           user.role,
+                        "auth_provider":  user.auth_provider,
+                        "gateway_mode":   mcp_mode,
+                        "kong_acl_active": _kong_acl_active,
                     },
                 )
             _start_investigation(components, question, allowed_tools=_allowed, user_context=_user_ctx)

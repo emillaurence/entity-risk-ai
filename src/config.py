@@ -17,6 +17,10 @@ app uses the direct Anthropic path — no Kong vars need to be set.
 ``get_kong_mcp_gateway_settings()`` returns a ``KongMCPGatewaySettings`` object
 for Phase 507 MCP Gateway transport setup.  When ``enabled`` is False (the
 default) the app uses the direct remote MCP path unchanged.
+
+``kong_acl_enforcement_active(mcp_mode, settings)`` returns True only when ALL
+THREE Phase 509 ACL conditions are met: KONG_MCP_GATEWAY_ENABLED=true,
+KONG_MCP_ACL_POLICY_ENABLED=true, and the UI MCP backend is "kong".
 """
 
 from dataclasses import dataclass, replace
@@ -303,27 +307,51 @@ class KongMCPGatewaySettings:
     upstream_url — The actual remote MCP server sitting behind Kong.
     """
 
-    enabled: bool       # True = route MCP calls through Kong; False = direct remote MCP
-    proxy_url: str      # Serverless proxy base URL (from Konnect Gateway Manager)
-    route_path: str     # MCP route path (default: /mcp)
-    api_key: str        # Key sent as X-Kong-API-Key to authenticate to Kong
-    upstream_url: str   # Upstream MCP server URL (full path, preserved by Kong)
+    enabled: bool            # True = route MCP calls through Kong; False = direct remote MCP
+    proxy_url: str           # Serverless proxy base URL (from Konnect Gateway Manager)
+    route_path: str          # MCP route path (default: /mcp)
+    api_key: str             # Shared key (fallback when no per-role key is set)
+    upstream_url: str        # Upstream MCP server URL (full path, preserved by Kong)
+    acl_policy_enabled: bool # Phase 509 — True = Kong enforces tool ACL per consumer group
+    jr_api_key: str          # Phase 509 — key for jr-analyst-app consumer (KONG_MCP_ACL_JR_API_KEY)
+    sr_api_key: str          # Phase 509 — key for sr-analyst-app consumer (KONG_MCP_ACL_SR_API_KEY)
 
     @property
     def gateway_url(self) -> str:
         """Full URL of the Kong MCP gateway route (proxy_url + route_path)."""
         return self.proxy_url.rstrip("/") + self.route_path
 
+    def resolve_api_key(self, role: str) -> str:
+        """Return the API key to use for *role*.
+
+        When ACL is active, each role has a dedicated consumer with its own
+        key so Kong can attribute the request to the correct consumer group.
+        Falls back to the shared ``api_key`` when no role-specific key is set.
+
+        Role strings match the stable identifiers in ``src.app.policy``:
+            ``"jr_risk_analyst"`` → ``jr_api_key`` (KONG_MCP_ACL_JR_API_KEY)
+            ``"sr_risk_analyst"`` → ``sr_api_key`` (KONG_MCP_ACL_SR_API_KEY)
+        """
+        if role == "jr_risk_analyst" and self.jr_api_key:
+            return self.jr_api_key
+        if role == "sr_risk_analyst" and self.sr_api_key:
+            return self.sr_api_key
+        return self.api_key
+
     def masked(self) -> dict:
         """Return a safe repr with secrets redacted."""
-        key_preview = f"{self.api_key[:8]}…***" if self.api_key else ""
+        def _preview(key: str) -> str:
+            return f"{key[:8]}…***" if key else ""
         return {
             "enabled": self.enabled,
             "proxy_url": self.proxy_url,
             "route_path": self.route_path,
-            "api_key": key_preview,
+            "api_key": _preview(self.api_key),
             "upstream_url": self.upstream_url,
             "gateway_url": self.gateway_url if self.proxy_url else "(proxy_url not set)",
+            "acl_policy_enabled": self.acl_policy_enabled,
+            "jr_api_key": _preview(self.jr_api_key),
+            "sr_api_key": _preview(self.sr_api_key),
         }
 
 
@@ -345,7 +373,32 @@ def get_kong_mcp_gateway_settings() -> KongMCPGatewaySettings:
             "KONG_MCP_UPSTREAM_URL",
             "https://entity-risk-ai-production.up.railway.app/mcp",
         ),
+        acl_policy_enabled=_bool("KONG_MCP_ACL_POLICY_ENABLED"),
+        jr_api_key=os.getenv("KONG_MCP_ACL_JR_API_KEY", ""),
+        sr_api_key=os.getenv("KONG_MCP_ACL_SR_API_KEY", ""),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 509 — Kong MCP ACL policy enforcement helper
+# ---------------------------------------------------------------------------
+
+
+def kong_acl_enforcement_active(
+    mcp_mode: str,
+    settings: "KongMCPGatewaySettings",
+) -> bool:
+    """Return True when all three Kong ACL enforcement conditions are met.
+
+    Kong ACL is ACTIVE only when:
+      1. settings.enabled is True        (KONG_MCP_GATEWAY_ENABLED=true)
+      2. settings.acl_policy_enabled is True (KONG_MCP_ACL_POLICY_ENABLED=true)
+      3. mcp_mode == "kong"              (UI backend selection)
+
+    When any condition is False the app falls back to its own policy.py
+    tool allowlist — Kong is either not in the path or not enforcing ACL.
+    """
+    return settings.enabled and settings.acl_policy_enabled and mcp_mode == "kong"
 
 
 def get_anthropic_settings() -> AnthropicSettings:

@@ -1,0 +1,145 @@
+# Phase 509 — Kong MCP ACL: Tool Access Policy
+#
+# PURPOSE
+# -------
+# This file is REFERENCE DOCUMENTATION only.  It is NOT a live sync target.
+# Konnect Gateway Manager is the source of truth for the running configuration.
+#
+# This file defines the ACL configuration for the ai-mcp-proxy plugin on the
+# /mcp route.  It extends the Phase 507 passthrough-listener config with
+# consumer-group-aware tool access control.
+#
+# PREREQUISITES
+# -------------
+# - Kong Gateway 3.13+ (ai-mcp-proxy ACL features)
+# - AI Gateway Enterprise license (same plan as Phase 507)
+# - Consumer groups created (see consumer_groups.yaml)
+# - key-auth plugin already on the /mcp route (Phase 507)
+#
+# ACL TOOL RULES (mirroring src/app/policy.py)
+# --------------------------------------------
+# These rules replicate the app-side policy at the gateway level.
+# The app policy.py remains the source of truth — keep both in sync.
+#
+# jr-analyst group (ROLE_JR_RISK_ANALYST):
+#   Denied:  address_risk_check, industry_context_check, summarize_risk_for_company
+#   Allowed: all other tools (entity_lookup, company_profile, expand_ownership,
+#            shared_address_check, sic_context, ownership_complexity_check,
+#            control_signal_check, resolve_entity, validate_plan,
+#            evaluate_stop_conditions, retrieve_trace, find_traces_by_entity,
+#            list_recent_traces)
+#
+# sr-analyst group (ROLE_SR_RISK_ANALYST):
+#   Allowed: all tools (no restrictions)
+#
+# KONNECT UI WALKTHROUGH
+# ----------------------
+# 1. Gateway Manager → Routes → mcp-route → Plugins
+# 2. Find the existing ai-mcp-proxy plugin → Edit
+# 3. Update config (see plugin config below)
+#
+# DECK USAGE
+# ----------
+# Dry-run diff:
+#   deck gateway diff --konnect-addr "$KONG_KONNECT_ADDR" \
+#                     --konnect-token "$KONG_KONNECT_TOKEN" \
+#                     --konnect-control-plane-name "$KONG_KONNECT_CONTROL_PLANE_NAME" \
+#                     kong/acl_policy.yaml
+#
+# ROLLBACK
+# --------
+# To disable ACL enforcement without removing the plugin:
+#   - Set KONG_MCP_ACL_POLICY_ENABLED=false in .env (app stops bypassing app policy)
+#   - OR remove consumer_groups entries from ai-mcp-proxy config in Konnect UI
+#   - OR revert to the Phase 507 plugin config (no consumer_groups section)
+#
+# FORMAT
+# ------
+# decK 1.x / Konnect format_version 3.0
+
+_format_version: "3.0"
+_konnect:
+  control_plane_name: entity-risk-ai
+
+services:
+- name: mcp-upstream-service
+  routes:
+  - name: mcp-route
+    plugins:
+
+    # ── Plugin 1: key-auth ────────────────────────────────────────────────────
+    # Unchanged from Phase 507.  Validates X-Kong-API-Key before ACL runs.
+    - name: key-auth
+      enabled: true
+      config:
+        key_names:
+        - x-kong-api-key
+        - X-Kong-API-Key
+        key_in_header: true
+        key_in_query: true
+        key_in_body: false
+        hide_credentials: true
+        anonymous: null
+        run_on_preflight: true
+      protocols:
+      - http
+      - https
+
+    # ── Plugin 2: ai-mcp-proxy (Phase 509 ACL extension) ─────────────────────
+    # Extends the Phase 507 passthrough-listener config with:
+    #   - consumer_identifier: username  — Kong reads consumer from key-auth result
+    #   - include_consumer_groups: true  — Kong reads group membership
+    #   - consumer_groups: ACL rules per group
+    #
+    # Requires Kong Gateway 3.13+ for consumer_groups ACL support.
+    # The key-auth plugin must run BEFORE ai-mcp-proxy (lower priority number
+    # or explicit ordering) so the consumer identity is available.
+    #
+    # NOTE: The exact field names for consumer_groups ACL in ai-mcp-proxy may
+    # vary by Kong version.  Verify against your Konnect plugin schema:
+    #   GET /v2/control-planes/{cp_id}/core-entities/schemas/ai-mcp-proxy
+    #
+    - name: ai-mcp-proxy
+      enabled: true
+      config:
+        mode: passthrough-listener
+        max_request_body_size: 1048576
+        logging:
+          log_audits: true
+          log_payloads: false
+          log_statistics: true
+
+        # Phase 509 additions — consumer group ACL
+        consumer_identifier: username       # identity source: key-auth consumer username
+        include_consumer_groups: true       # pass group membership to ACL engine
+
+        consumer_groups:
+        # sr-analyst: unrestricted access to all MCP tools
+        - name: sr-analyst
+          # No tool restrictions — allow all
+
+        # jr-analyst: restricted access — mirrors JR_ALLOWED_MCP_TOOLS in policy.py
+        - name: jr-analyst
+          # Allowed tools (explicit allowlist; deny all others)
+          allowed_tools:
+          - resolve_entity
+          - validate_plan
+          - evaluate_stop_conditions
+          - entity_lookup
+          - company_profile
+          - expand_ownership
+          - shared_address_check
+          - sic_context
+          - ownership_complexity_check
+          - control_signal_check
+          - retrieve_trace
+          - find_traces_by_entity
+          - list_recent_traces
+          # Denied tools (for documentation — enforced by absence from allowed_tools)
+          # - address_risk_check        (ADDRESS_RISK_TOOLS)
+          # - industry_context_check    (INDUSTRY_RISK_TOOLS)
+          # - summarize_risk_for_company (synthetic RiskAgent task)
+
+      protocols:
+      - http
+      - https

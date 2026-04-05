@@ -16,6 +16,10 @@ MCP client — one of three modes (keyed by mcp_mode):
   "local"  → MCPToolClient (in-process)
   "remote" → RemoteMCPToolClient (HTTP, REMOTE_MCP_URL)
   "kong"   → KongMCPToolClient (HTTP via Kong proxy, KONG_MCP_GATEWAY_ENABLED=true required)
+             When KONG_MCP_ACL_POLICY_ENABLED=true, the client uses the role-specific
+             API key (KONG_MCP_ACL_JR_API_KEY / KONG_MCP_ACL_SR_API_KEY) so Kong can
+             attribute the request to the correct consumer group.  Falls back to the
+             shared KONG_MCP_GATEWAY_API_KEY when role-specific keys are not set.
 ai_client + mcp_client + trace_service ──► GraphAgent, RiskAgent, TraceAgent
 ai_client ──► InvestigationPlanner
 planner + mcp_client + agents + trace_service + trace_repo ──► Orchestrator
@@ -41,6 +45,7 @@ from src.config import (
     get_kong_mcp_gateway_settings,
     get_neo4j_settings,
     get_remote_mcp_url,
+    kong_acl_enforcement_active,
 )
 from src.orchestration.orchestrator import Orchestrator
 from src.orchestration.planner import InvestigationPlanner
@@ -70,16 +75,20 @@ class AppComponents:
 
 
 @st.cache_resource
-def create_app_components(mcp_mode: str = "local") -> AppComponents:
+def create_app_components(mcp_mode: str = "local", role: str = "") -> AppComponents:
     """Instantiate and wire all system components.
 
-    Called once per Streamlit server process; result is cached by
+    Called once per unique ``(mcp_mode, role)`` pair; result is cached by
     ``@st.cache_resource``.  Raises ``EnvironmentError`` (from config) if any
     required environment variable is missing.
 
     Args:
         mcp_mode: One of ``"local"``, ``"remote"``, or ``"kong"``.
                   ``"kong"`` requires ``KONG_MCP_GATEWAY_ENABLED=true``.
+        role:     Signed-in user's role (e.g. ``"jr_risk_analyst"``).
+                  Used to select the correct Kong API key when
+                  ``KONG_MCP_ACL_POLICY_ENABLED=true``.  Empty string falls
+                  back to the shared ``KONG_MCP_GATEWAY_API_KEY``.
     """
     # Config ----------------------------------------------------------------
     neo4j_settings = get_neo4j_settings()
@@ -88,13 +97,14 @@ def create_app_components(mcp_mode: str = "local") -> AppComponents:
 
     _log = logging.getLogger(__name__)
     _log.info(
-        "App components initialising: neo4j=%s db=%s model=%s planner_model=%s kong_ai=%s mcp_mode=%s",
+        "App components initialising: neo4j=%s db=%s model=%s planner_model=%s kong_ai=%s mcp_mode=%s role=%s",
         neo4j_settings.uri,
         neo4j_settings.database,
         anthropic_settings.model_haiku,
         anthropic_settings.planner_model,
         "enabled" if kong_ai_settings.enabled else "disabled",
         mcp_mode,
+        role or "(none)",
     )
 
     # Clients ---------------------------------------------------------------
@@ -123,6 +133,18 @@ def create_app_components(mcp_mode: str = "local") -> AppComponents:
             raise EnvironmentError(
                 "mcp_mode='kong' requested but KONG_MCP_GATEWAY_ENABLED is not true. "
                 "Set KONG_MCP_GATEWAY_ENABLED=true in .env to use Kong MCP Gateway."
+            )
+        # Phase 509 — when ACL is active, use the role-specific API key so Kong
+        # can attribute the request to the correct consumer group.  Falls back to
+        # the shared key when ACL is disabled or no role-specific key is set.
+        if kong_acl_enforcement_active(mcp_mode, kong_mcp_settings) and role:
+            resolved_key = kong_mcp_settings.resolve_api_key(role)
+            from dataclasses import replace as _replace
+            kong_mcp_settings = _replace(kong_mcp_settings, api_key=resolved_key)
+            _log.info(
+                "Kong MCP ACL: resolved API key for role=%s (has_role_key=%s)",
+                role,
+                resolved_key != get_kong_mcp_gateway_settings().api_key,
             )
         mcp_client = KongMCPToolClient(kong_mcp_settings)
         # Logging happens inside KongMCPToolClient.__init__
