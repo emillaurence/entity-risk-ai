@@ -1,8 +1,16 @@
-# Phase 506 — Kong AI Gateway: /ai route declarative configuration
+# Phase 506 — Kong AI Gateway: /ai and /ai/sonnet route declarative configuration
 #
 # Uses the Kong ai-proxy plugin — the actual Kong AI Gateway feature —
 # to route requests to Anthropic. This is NOT a generic proxy; the ai-proxy
 # plugin handles provider routing, upstream auth, and Anthropic versioning.
+#
+# Two routes under a single Service:
+#
+#   /ai          — generic AI route (Haiku); used by agents and all non-planner calls
+#   /ai/sonnet   — planner-only route (Sonnet); used exclusively by InvestigationPlanner
+#
+# Both routes share the same Service (anthropic-ai) and the same consumer credential,
+# but each has its own ai-proxy plugin instance configured with the appropriate model.
 #
 # Sync to Konnect with:
 #
@@ -99,8 +107,57 @@ services:
               policy: local
               fault_tolerant: true      # pass through if Redis unavailable
 
+      # ── /ai/sonnet — planner-only Sonnet route ────────────────────────
+      - name: ai-sonnet-route
+        paths:
+          - /ai/sonnet
+        methods:
+          - POST
+        protocols:
+          - https
+        strip_path: false
+        plugins:
+          # ── ai-proxy (Kong AI Gateway) — Sonnet model ──────────────────
+          #
+          # Identical plugin configuration to ai-route above, but with
+          # claude-sonnet-4-6 as the model.  Only InvestigationPlanner
+          # traffic is routed here (via KongAIGatewaySettings.for_planner()).
+          #
+          # The planner needs Sonnet for reliable structured JSON output.
+          # No other call site uses this route.
+          - name: ai-proxy
+            config:
+              route_type: llm/v1/chat
+              llm_format: anthropic
+              auth:
+                header_name: x-api-key
+                header_value: ${{ env "DECK_ANTHROPIC_API_KEY" }}
+              model:
+                provider: anthropic
+                name: claude-sonnet-4-6
+                options:
+                  anthropic_version: "2023-06-01"
+                  max_tokens: 1024
+
+          # ── key-auth ──────────────────────────────────────────────────
+          # Same consumer credential as /ai — no separate key needed.
+          - name: key-auth
+            config:
+              key_names:
+                - x-kong-api-key
+                - X-Kong-API-Key
+              hide_credentials: true
+
+          # ── rate-limiting ─────────────────────────────────────────────
+          # Tighter limit for Sonnet (more expensive per token).
+          - name: rate-limiting
+            config:
+              minute: 10
+              policy: local
+              fault_tolerant: true
+
 # ── Consumers ─────────────────────────────────────────────────────────────
-# One consumer per application or environment that needs access to /ai.
+# One consumer credential grants access to both /ai and /ai/sonnet.
 consumers:
   - username: entity-risk-ai-app
     keyauth_credentials:

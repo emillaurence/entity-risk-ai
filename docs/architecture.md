@@ -180,31 +180,44 @@ Token spend is tracked per call in `AnthropicClient.last_usage` and surfaced as 
 
 `AnthropicClient` supports an optional Kong routing mode activated by `KONG_AI_GATEWAY_ENABLED=true`.
 
+### Routes
+
+Two routes sit under a single `anthropic-ai` Service in Konnect:
+
+| Route | Path | Model | Used by |
+|---|---|---|---|
+| `ai-route` | `/ai` | `claude-haiku-4-5-20251001` | All agents (GraphAgent, RiskAgent, TraceAgent) |
+| `ai-sonnet-route` | `/ai/sonnet` | `claude-sonnet-4-6` | `InvestigationPlanner` only |
+
 ### Traffic flow
 
 ```
 Kong mode (KONG_AI_GATEWAY_ENABLED=true):
-  App ──[X-Kong-API-Key]──► POST KONG_PROXY_URL/ai
-                             Kong key-auth validates key
-                             Kong ai-proxy injects x-api-key, routes to:
-                             POST api.anthropic.com/v1/messages
+
+  Planner  ──[X-Kong-API-Key]──► POST KONG_PROXY_URL/ai/sonnet ─► api.anthropic.com (Sonnet)
+  Agents   ──[X-Kong-API-Key]──► POST KONG_PROXY_URL/ai        ─► api.anthropic.com (Haiku)
 
 Direct mode (default, KONG_AI_GATEWAY_ENABLED=false):
-  App ──[x-api-key]──────────────────────────────────────────────► api.anthropic.com
+  All      ──[x-api-key]──────────────────────────────────────────► api.anthropic.com
+  (Planner uses Sonnet, agents use Haiku — model selection is unchanged)
 ```
 
 ### How it fits the layer diagram
 
 ```
 Layer 2 — Clients
-  AnthropicClient(kong_settings=KongAIGatewaySettings)
-    ├── kong_settings.enabled=False  → _call_direct()  (Anthropic SDK, unchanged)
+  AnthropicClient(kong_settings, default_model)
+    ├── kong_settings.enabled=False  → _call_direct()   (Anthropic SDK, unchanged)
     └── kong_settings.enabled=True   → _call_via_kong() (requests, X-Kong-API-Key)
+
+factory.py creates two AnthropicClient instances:
+  ai_client         default_model=haiku   route=/ai          → agents
+  planner_ai_client default_model=sonnet  route=/ai/sonnet   → InvestigationPlanner
 ```
 
-`factory.py` reads `get_kong_ai_gateway_settings()` at startup and passes the result
-to `AnthropicClient`.  All callers above Layer 2 are unaffected — the interface is
-identical in both modes.
+`factory.py` reads `get_kong_ai_gateway_settings()` at startup. `KongAIGatewaySettings.for_planner()`
+returns a copy with `route_path=sonnet_route_path` used to construct `planner_ai_client`.
+All callers above Layer 2 are unaffected — the interface is identical in both modes.
 
 ### Security model
 
@@ -212,7 +225,10 @@ identical in both modes.
 |---|---|---|
 | App → Kong | `X-Kong-API-Key` | `KONG_AI_GATEWAY_API_KEY` in `.env` |
 | Kong → Anthropic | `x-api-key` injected by **ai-proxy** plugin | Konnect ai-proxy `auth.header_value` |
-| Rate limiting | 20 req/min (default) | Konnect rate-limiting plugin |
+| Rate limiting `/ai` | 20 req/min (default) | Konnect rate-limiting plugin on `ai-route` |
+| Rate limiting `/ai/sonnet` | 10 req/min (default) | Konnect rate-limiting plugin on `ai-sonnet-route` |
+
+The same consumer credential (`KONG_AI_GATEWAY_API_KEY`) is used for both routes.
 
 The **`ai-proxy` plugin** is the Kong AI Gateway feature. It handles provider routing,
 upstream auth injection, and Anthropic versioning. It is not the same as:
@@ -233,6 +249,7 @@ not the Konnect API/admin URL.
 ### Default-safe behaviour
 
 - When `KONG_AI_GATEWAY_ENABLED=false` (default), the app behaves exactly as before Phase 506.
+  The planner still uses Sonnet via direct Anthropic SDK; agents still use Haiku.
 - The existing remote MCP path is not affected by Phase 506 (that is Phase 507).
 
 ### Rollback

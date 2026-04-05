@@ -51,7 +51,7 @@ This lets notebooks import from `src/` regardless of where Jupyter was launched 
 | `304_orchestrator` | End-to-end orchestrated investigation: plan → trace → validate → resolve → execute → stop-check → finalise. Shows `OrchestratorResult`. |
 | `401_step_result_contract_check` | Data contract validation: checks that step results from all agents conform to the expected `AgentResult` field shapes. |
 | `505_kong_konnect_bootstrap_and_connectivity` | Install decK, create Konnect PAT, set up Serverless gateway, validate connectivity — Kong phase 505. |
-| `506_kong_ai_gateway_anthropic_smoke` | Wire Anthropic calls through Kong AI Gateway. Beginner-friendly tutorial with UI walkthrough, decK examples, live smoke tests, troubleshooting, and rollback steps — Kong phase 506. |
+| `506_kong_ai_gateway_anthropic_smoke` | Wire Anthropic calls through Kong AI Gateway. Covers both the generic `/ai` route (Haiku) and the planner-only `/ai/sonnet` route (Sonnet). Beginner-friendly tutorial with UI walkthrough, decK examples, live smoke tests, troubleshooting, and rollback steps — Kong phase 506. |
 
 ## Tips
 

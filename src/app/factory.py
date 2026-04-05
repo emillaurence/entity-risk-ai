@@ -79,18 +79,31 @@ def create_app_components(use_remote_mcp: bool = False) -> AppComponents:
 
     _log = logging.getLogger(__name__)
     _log.info(
-        "App components initialising: neo4j=%s db=%s model=%s kong_ai=%s",
+        "App components initialising: neo4j=%s db=%s model=%s planner_model=%s kong_ai=%s",
         neo4j_settings.uri,
         neo4j_settings.database,
         anthropic_settings.model_haiku,
+        anthropic_settings.planner_model,
         "enabled" if kong_ai_settings.enabled else "disabled",
     )
 
     # Clients ---------------------------------------------------------------
+    # Main AI client — Haiku default, generic /ai Kong route.
     # Pass kong_ai_settings so AnthropicClient can route through Kong when
     # KONG_AI_GATEWAY_ENABLED=true.  When disabled (default), direct Anthropic
     # SDK is used — no behaviour change.
     ai_client = AnthropicClient(anthropic_settings, kong_settings=kong_ai_settings)
+
+    # Planner AI client — Sonnet default, dedicated /ai/sonnet Kong route.
+    # The planner performs the most reasoning-intensive task (free-text → structured
+    # JSON plan) and benefits most from Sonnet.  Routing is isolated here so no
+    # other call site needs to know about the planner's model choice.
+    # When Kong is disabled, this falls back to direct Anthropic with Sonnet.
+    planner_ai_client = AnthropicClient(
+        anthropic_settings,
+        kong_settings=kong_ai_settings.for_planner(),
+        default_model=anthropic_settings.planner_model,
+    )
     if use_remote_mcp:
         remote_url = get_remote_mcp_url()
         mcp_client: MCPToolClient | RemoteMCPToolClient = RemoteMCPToolClient(remote_url)
@@ -112,7 +125,7 @@ def create_app_components(use_remote_mcp: bool = False) -> AppComponents:
     trace_agent = TraceAgent(mcp_client, trace_service, ai_client)
 
     # Orchestration ---------------------------------------------------------
-    planner = InvestigationPlanner(ai_client)
+    planner = InvestigationPlanner(planner_ai_client)
     orchestrator = Orchestrator(
         planner,
         mcp_client,

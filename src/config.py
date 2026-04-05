@@ -15,7 +15,7 @@ for Phase 506 AI Gateway routing.  When ``enabled`` is False (the default) the
 app uses the direct Anthropic path — no Kong vars need to be set.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dotenv import load_dotenv
 import os
 
@@ -74,6 +74,7 @@ class AnthropicSettings:
     api_key: str
     model_haiku: str
     model_sonnet: str
+    planner_model: str  # model used exclusively by InvestigationPlanner (defaults to model_sonnet)
 
     def masked(self) -> dict:
         """Return a safe repr with the API key redacted."""
@@ -81,6 +82,7 @@ class AnthropicSettings:
             "api_key": f"{self.api_key[:8]}…***",
             "model_haiku": self.model_haiku,
             "model_sonnet": self.model_sonnet,
+            "planner_model": self.planner_model,
         }
 
 
@@ -203,15 +205,31 @@ class KongAIGatewaySettings:
                   requests to.  Kong strips the route prefix before forwarding.
     """
 
-    enabled: bool       # True = route AI calls through Kong; False = direct Anthropic
-    proxy_url: str      # Serverless proxy base URL (from Konnect Gateway Manager)
-    route_path: str     # Route path (default: /ai)
-    api_key: str        # Key sent as X-Kong-API-Key to authenticate to Kong
+    enabled: bool           # True = route AI calls through Kong; False = direct Anthropic
+    proxy_url: str          # Serverless proxy base URL (from Konnect Gateway Manager)
+    route_path: str         # Generic AI route path (default: /ai)
+    api_key: str            # Key sent as X-Kong-API-Key to authenticate to Kong
+    sonnet_route_path: str  # Planner-only Sonnet route path (default: /ai/sonnet)
 
     @property
     def gateway_url(self) -> str:
-        """Full URL of the AI gateway route (proxy_url + route_path)."""
+        """Full URL of the generic AI gateway route (proxy_url + route_path)."""
         return self.proxy_url.rstrip("/") + self.route_path
+
+    @property
+    def sonnet_gateway_url(self) -> str:
+        """Full URL of the planner-only Sonnet route (proxy_url + sonnet_route_path)."""
+        return self.proxy_url.rstrip("/") + self.sonnet_route_path
+
+    def for_planner(self) -> "KongAIGatewaySettings":
+        """Return a copy of these settings routing to the Sonnet/planner Kong route.
+
+        Used by factory.py to create a dedicated AnthropicClient for the planner
+        that sends traffic to /ai/sonnet instead of /ai.  All other fields
+        (enabled, proxy_url, api_key) are unchanged so the fallback to direct
+        Anthropic mode works correctly when enabled=False.
+        """
+        return replace(self, route_path=self.sonnet_route_path)
 
     def masked(self) -> dict:
         """Return a safe repr with secrets redacted."""
@@ -220,8 +238,10 @@ class KongAIGatewaySettings:
             "enabled": self.enabled,
             "proxy_url": self.proxy_url,
             "route_path": self.route_path,
+            "sonnet_route_path": self.sonnet_route_path,
             "api_key": key_preview,
             "gateway_url": self.gateway_url if self.proxy_url else "(proxy_url not set)",
+            "sonnet_gateway_url": self.sonnet_gateway_url if self.proxy_url else "(proxy_url not set)",
         }
 
 
@@ -239,6 +259,7 @@ def get_kong_ai_gateway_settings() -> KongAIGatewaySettings:
         proxy_url=os.getenv("KONG_PROXY_URL", ""),
         route_path=os.getenv("KONG_AI_GATEWAY_ROUTE_PATH", "/ai"),
         api_key=os.getenv("KONG_AI_GATEWAY_API_KEY", ""),
+        sonnet_route_path=os.getenv("KONG_AI_GATEWAY_SONNET_ROUTE_PATH", "/ai/sonnet"),
     )
 
 
@@ -250,8 +271,12 @@ def get_anthropic_settings() -> AnthropicSettings:
             "Copy .env.example to .env and fill in the values."
         )
 
+    model_sonnet = os.getenv("ANTHROPIC_MODEL_SONNET", _ANTHROPIC_MODEL_SONNET_DEFAULT)
     return AnthropicSettings(
         api_key=os.environ["ANTHROPIC_API_KEY"],
         model_haiku=os.getenv("ANTHROPIC_MODEL_HAIKU", _ANTHROPIC_MODEL_HAIKU_DEFAULT),
-        model_sonnet=os.getenv("ANTHROPIC_MODEL_SONNET", _ANTHROPIC_MODEL_SONNET_DEFAULT),
+        model_sonnet=model_sonnet,
+        # PLANNER_MODEL defaults to model_sonnet so the planner always uses Sonnet
+        # unless explicitly overridden (e.g. PLANNER_MODEL=claude-haiku-4-5-20251001).
+        planner_model=os.getenv("PLANNER_MODEL", model_sonnet),
     )

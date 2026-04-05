@@ -58,17 +58,24 @@ Kong is being added in staged phases using **Konnect Serverless Gateway** — Ko
 
 ### What is active now (Phase 506)
 
-Anthropic calls can optionally route through a Kong AI Gateway route.
+Anthropic calls can optionally route through Kong AI Gateway. Two routes are used:
+
+| Route | Path | Model | Used by |
+|---|---|---|---|
+| Generic | `/ai` | Haiku | All agents |
+| Planner | `/ai/sonnet` | Sonnet | `InvestigationPlanner` only |
 
 ```
 Kong mode (KONG_AI_GATEWAY_ENABLED=true):
-  App → Kong /ai → api.anthropic.com
+  Planner → Kong /ai/sonnet → api.anthropic.com  (Sonnet)
+  Agents  → Kong /ai        → api.anthropic.com  (Haiku)
 
 Direct mode (default):
-  App → api.anthropic.com
+  Planner → api.anthropic.com  (Sonnet)
+  Agents  → api.anthropic.com  (Haiku)
 ```
 
-The app is **default-safe**: `KONG_AI_GATEWAY_ENABLED=false` means the app behaves exactly as before. The existing remote MCP path is not affected.
+The app is **default-safe**: `KONG_AI_GATEWAY_ENABLED=false` means the app behaves exactly as before. Model selection (Sonnet for planner, Haiku for agents) applies in both modes.
 
 **Rollback:** set `KONG_AI_GATEWAY_ENABLED=false` in `.env` and restart the app.
 
@@ -77,7 +84,7 @@ The app is **default-safe**: `KONG_AI_GATEWAY_ENABLED=false` means the app behav
 | Phase | Notebook | Status |
 |---|---|---|
 | 505 | `505_kong_konnect_bootstrap_and_connectivity` | ✅ Complete — decK, PAT, Serverless gateway, connectivity check |
-| 506 | `506_kong_ai_gateway_anthropic_smoke` | ✅ Complete — AI Gateway route, key-auth, rate-limiting, Kong-routed client |
+| 506 | `506_kong_ai_gateway_anthropic_smoke` | ✅ Complete — AI Gateway routes (`/ai` + `/ai/sonnet`), planner-only Sonnet routing, key-auth, rate-limiting |
 | 507 | `507_kong_mcp_gateway` | Planned — MCP server behind Kong route with auth plugins |
 
 ### Key env vars
@@ -91,8 +98,10 @@ All Kong variables are defined in `.env.example`.  None are required unless you 
 | `KONG_KONNECT_CONTROL_PLANE_NAME` | 505 | Control plane name in Konnect |
 | `KONG_PROXY_URL` | 506 | **Serverless proxy URL** (e.g. `https://abc.au.kong.tech`) — where the app sends traffic |
 | `KONG_AI_GATEWAY_ENABLED` | 506 | `true` to route AI calls through Kong |
-| `KONG_AI_GATEWAY_ROUTE_PATH` | 506 | Proxy route path (default: `/ai`) |
-| `KONG_AI_GATEWAY_API_KEY` | 506 | Key sent as `X-Kong-API-Key` to Kong |
+| `KONG_AI_GATEWAY_ROUTE_PATH` | 506 | Generic AI route path (default: `/ai`) |
+| `KONG_AI_GATEWAY_SONNET_ROUTE_PATH` | 506 | Planner-only Sonnet route path (default: `/ai/sonnet`) |
+| `KONG_AI_GATEWAY_API_KEY` | 506 | Key sent as `X-Kong-API-Key` to Kong (same key for both routes) |
+| `PLANNER_MODEL` | 506 | Model used by `InvestigationPlanner` (defaults to `ANTHROPIC_MODEL_SONNET`) |
 | `KONG_MCP_GATEWAY_ENABLED` | 507 | `true` to route MCP calls through Kong |
 | `ENABLE_LIVE_KONG_NOTEBOOK_TESTS` | 505+ | `true` to run notebook cells that hit real Konnect/proxy |
 
@@ -102,8 +111,8 @@ All Kong variables are defined in `.env.example`.  None are required unless you 
 
 ### Kong config assets
 
-`kong/declarative/phase-506-ai-route.yaml` contains a reference decK config for the `/ai` route,
-key-auth plugin, rate-limiting plugin, and request-transformer plugin (upstream Anthropic key injection).
+`kong/declarative/phase-506-ai-route.yaml` contains a reference decK config for both the `/ai`
+and `/ai/sonnet` routes, with ai-proxy, key-auth, and rate-limiting plugins on each.
 See [kong/README.md](kong/README.md) for decK usage instructions.
 
 ### Architecture shape for future phases

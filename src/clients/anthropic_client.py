@@ -20,6 +20,13 @@ feature) instead of calling the Anthropic API directly.
           Kong ai-proxy injects x-api-key (Anthropic credential) upstream.
           The app does NOT send the Anthropic key in Kong mode.
 
+  Request format:
+    Both routes use llm_format: anthropic in the ai-proxy plugin config,
+    so Kong passes the request through in native Anthropic Messages API format
+    (top-level "system" field, "messages" array with user/assistant roles only).
+    Do NOT send {"role":"system"} inside messages — that is OpenAI format and
+    Anthropic will reject it with a 400 error.
+
   Plugin clarification:
     ai-proxy           — Kong AI Gateway plugin. Routes to provider, injects
                          upstream auth. This is what we use.
@@ -69,10 +76,13 @@ class AnthropicClient(AIClient):
         self,
         settings: AnthropicSettings | None = None,
         kong_settings: KongAIGatewaySettings | None = None,
+        default_model: str | None = None,
     ) -> None:
         self._settings = settings or get_anthropic_settings()
         self._kong = kong_settings  # None or KongAIGatewaySettings
-        self._default_model = self._settings.model_haiku
+        # default_model lets callers (e.g. factory.py for the planner client) override
+        # the per-call default without touching every call site.
+        self._default_model = default_model or self._settings.model_haiku
         # Populated after every _call() so callers can inspect token usage.
         self.last_usage: dict[str, int] | None = None
 
@@ -286,21 +296,18 @@ class AnthropicClient(AIClient):
                 "created in Konnect for this application."
             )
 
-        # Kong ai-proxy (llm/v1/chat route_type) uses OpenAI Chat Completions
-        # format for requests.  The top-level "system" key is Anthropic-native
-        # and is silently ignored by Kong — the system prompt must be sent as a
-        # {"role": "system"} message inside the messages array instead.
-        # cache_control blocks are also dropped (Kong does not relay them to
-        # Anthropic's prompt-caching endpoint), so we extract the plain text.
-        if cache_system:
-            system_text = system_prompt  # cache_control stripped — not supported via Kong
-        else:
-            system_text = system_prompt
-
-        messages: list[dict] = []
-        if system_text:
-            messages.append({"role": "system", "content": system_text})
-        messages.append({"role": "user", "content": user_prompt})
+        # Kong ai-proxy with llm_format: anthropic passes the request through in
+        # native Anthropic Messages API format.  Send "system" as a top-level
+        # field exactly as the direct SDK path does — Kong forwards it unchanged.
+        #
+        # cache_control blocks are not relayed to Anthropic's prompt-caching
+        # endpoint by Kong, so we extract the plain text string and drop the
+        # cache_control wrapper.
+        system_arg: str = (
+            system_prompt  # cache_control stripped — not supported via Kong
+            if cache_system
+            else system_prompt
+        )
 
         # The ai-proxy plugin intercepts at the route; the app sends to the route
         # path only.  ai-proxy handles the /v1/messages upstream path internally.
@@ -314,7 +321,8 @@ class AnthropicClient(AIClient):
         payload = {
             "model": model,
             "max_tokens": max_tokens,
-            "messages": messages,
+            "system": system_arg,
+            "messages": [{"role": "user", "content": user_prompt}],
         }
 
         t0 = time.monotonic()
