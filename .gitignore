@@ -21,3 +21,4 @@ __pycache__/
 logs/
 *.log
 kong/declarative/live-dump.yaml
+kong/declarative/current-live-state.yaml

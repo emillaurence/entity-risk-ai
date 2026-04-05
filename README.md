@@ -102,7 +102,6 @@ All Kong variables are defined in `.env.example`.  None are required unless you 
 | `KONG_AI_GATEWAY_SONNET_ROUTE_PATH` | 506 | Planner-only Sonnet route path (default: `/ai/sonnet`) |
 | `KONG_AI_GATEWAY_API_KEY` | 506 | Key sent as `X-Kong-API-Key` to Kong (same key for both routes) |
 | `PLANNER_MODEL` | 506 | Model used by `InvestigationPlanner` (defaults to `ANTHROPIC_MODEL_SONNET`) |
-| `KONG_MCP_GATEWAY_ENABLED` | 507 | `true` to route MCP calls through Kong |
 | `ENABLE_LIVE_KONG_NOTEBOOK_TESTS` | 505+ | `true` to run notebook cells that hit real Konnect/proxy |
 
 > **Important:** `KONG_PROXY_URL` must be the Serverless **proxy URL** shown in Konnect Gateway Manager
@@ -111,8 +110,9 @@ All Kong variables are defined in `.env.example`.  None are required unless you 
 
 ### Kong config assets
 
-`kong/declarative/phase-506-ai-route.yaml` contains a reference decK config for both the `/ai`
-and `/ai/sonnet` routes, with ai-proxy, key-auth, and rate-limiting plugins on each.
+No declarative config file is checked into this repo — the live configuration lives in Konnect
+(Gateway Manager is the source of truth).  Use `deck gateway dump` to capture the current state
+locally (the output file is gitignored).
 See [kong/README.md](kong/README.md) for decK usage instructions.
 
 ### Architecture shape for future phases
@@ -232,9 +232,9 @@ entity-risk-ai/
 ├── Dockerfile                    # MCP server container
 ├── requirements.txt
 ├── .env.example
-├── kong/                         # Kong declarative config assets (Phase 506+)
-│   └── declarative/
-│       └── phase-506-ai-route.yaml
+├── kong/                         # Kong Gateway docs and decK usage (Phase 506+)
+│   ├── README.md                 # Three-URL model, security model, decK commands
+│   └── declarative/              # Gitignored live dumps go here; no file checked in
 ├── notebooks/                    # Jupyter notebooks (exploration + development)
 ├── docs/                         # Architecture, tool reference, notebook guide
 └── src/

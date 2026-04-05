@@ -10,9 +10,8 @@ integration (Phase 506).  It supports workflows using
 
 ```
 kong/
-├── README.md                            — this file
-└── declarative/
-    └── phase-506-ai-route.yaml          — reference config for the /ai route
+├── README.md        — this file
+└── declarative/     — gitignored live dumps go here; no file is checked in
 ```
 
 ---
@@ -36,12 +35,12 @@ With `ai-proxy`:
 
 ---
 
-## What is source-of-truth vs reference-only?
+## What is source-of-truth?
 
 | Artifact | Role |
 |---|---|
-| `declarative/phase-506-ai-route.yaml` | **Reference / starting point.** Use as a basis when creating config in Konnect via decK or the UI. Actual live config lives in Konnect. |
 | Konnect Gateway Manager UI | **Source of truth** for the running configuration. |
+| Local `deck gateway dump` output | Point-in-time snapshot; gitignored — never commit. |
 
 ---
 
@@ -77,30 +76,30 @@ The app only knows its own Kong consumer key (`KONG_AI_GATEWAY_API_KEY`).
 
 ## decK usage
 
+No declarative config file is shipped in this repo — Konnect Gateway Manager is the source of
+truth.  Dump the live state first, then diff/sync against that file.
+
 ```bash
-# Set the Anthropic key as an env var (never commit the real key)
-export DECK_ANTHROPIC_API_KEY="sk-ant-..."
-
-# Preview what decK would change (dry run)
-deck gateway diff \
-  --konnect-addr "$KONG_KONNECT_ADDR" \
-  --konnect-token "$KONG_KONNECT_TOKEN" \
-  --konnect-control-plane-name "$KONG_KONNECT_CONTROL_PLANE_NAME" \
-  kong/declarative/phase-506-ai-route.yaml
-
-# Apply the config
-deck gateway sync \
-  --konnect-addr "$KONG_KONNECT_ADDR" \
-  --konnect-token "$KONG_KONNECT_TOKEN" \
-  --konnect-control-plane-name "$KONG_KONNECT_CONTROL_PLANE_NAME" \
-  kong/declarative/phase-506-ai-route.yaml
-
-# Dump live config back to a file (to capture UI changes)
+# Dump live config to a local file (gitignored — never commit)
 deck gateway dump \
   --konnect-addr "$KONG_KONNECT_ADDR" \
   --konnect-token "$KONG_KONNECT_TOKEN" \
   --konnect-control-plane-name "$KONG_KONNECT_CONTROL_PLANE_NAME" \
   --output-file kong/declarative/current-live-state.yaml
+
+# Preview what decK would change against a local file (dry run)
+deck gateway diff \
+  --konnect-addr "$KONG_KONNECT_ADDR" \
+  --konnect-token "$KONG_KONNECT_TOKEN" \
+  --konnect-control-plane-name "$KONG_KONNECT_CONTROL_PLANE_NAME" \
+  kong/declarative/current-live-state.yaml
+
+# Apply config from a local file
+deck gateway sync \
+  --konnect-addr "$KONG_KONNECT_ADDR" \
+  --konnect-token "$KONG_KONNECT_TOKEN" \
+  --konnect-control-plane-name "$KONG_KONNECT_CONTROL_PLANE_NAME" \
+  kong/declarative/current-live-state.yaml
 ```
 
 > **Note:** `--konnect-region` is a deprecated flag. Always use `--konnect-addr` as shown above.

@@ -92,27 +92,23 @@ def get_remote_mcp_url() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Kong Konnect / Gateway settings (all optional — future phases only)
+# Kong Konnect / Gateway settings (all optional)
 # ---------------------------------------------------------------------------
 #
 # Phase 505 — Konnect control plane targeting (KongSettings below)
-#    KONG_KONNECT_REGION             — Konnect region ("eu" | "us" | "au" | "in")
 #    KONG_KONNECT_ADDR               — full Konnect API URL (e.g. https://au.api.konghq.com)
+#                                      The region is encoded in the URL; no separate region var.
 #    KONG_KONNECT_CONTROL_PLANE_NAME — name of your Serverless control plane
 #    KONG_KONNECT_TOKEN              — Konnect Personal Access Token (PAT)
 #    KONG_KONNECT_CONTROL_PLANE_ID   — UUID of the control plane (from Gateway Manager)
 #
 # Phase 506 — AI Gateway routing (loaded by KongAIGatewaySettings below)
 #    KONG_PROXY_URL                  — Serverless proxy URL (shown in Konnect Gateway Manager)
-#                                      NOTE: this is NOT https://au.api.konghq.com
+#                                      NOTE: this is NOT the Konnect API URL (KONG_KONNECT_ADDR)
 #    KONG_AI_GATEWAY_ENABLED         — "true" to route AI calls through Kong (default: false)
 #    KONG_AI_GATEWAY_ROUTE_PATH      — proxy route path (default: /ai)
+#    KONG_AI_GATEWAY_SONNET_ROUTE_PATH — planner-only Sonnet route path (default: /ai/sonnet)
 #    KONG_AI_GATEWAY_API_KEY         — key sent as X-Kong-API-Key to Kong
-#
-# Phase 507+ (NOT yet loaded — scaffolded for the next phase)
-#    KONG_MCP_GATEWAY_ENABLED        — "true" to route MCP calls through Kong
-#    KONG_MCP_GATEWAY_ROUTE_PATH     — proxy route path (default: /mcp)
-#    KONG_MCP_GATEWAY_API_KEY        — key sent as X-Kong-API-Key
 #
 # Notebook live-test gate
 #    ENABLE_LIVE_KONG_NOTEBOOK_TESTS — "true" to run cells that hit real Konnect / proxy
@@ -131,7 +127,7 @@ class KongSettings:
     """
 
     # -- Control plane targeting -------------------------------------------
-    konnect_region: str                 # e.g. "eu", "us", "au", "in"
+    konnect_region: str                 # deprecated: region is encoded in konnect_addr
     konnect_addr: str                   # e.g. "https://au.api.konghq.com"
     konnect_control_plane_name: str     # name as shown in Konnect UI
     konnect_token: str                  # Konnect PAT (secret)
