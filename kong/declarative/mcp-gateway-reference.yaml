@@ -89,8 +89,12 @@ services:
     paths:
     - /mcp
     methods:
+    - DELETE
     - GET
     - POST
+    # DELETE is required by MCP Streamable HTTP (protocol 2025-06-18): the SDK
+    # sends DELETE /mcp with Mcp-Session-Id to terminate each session cleanly.
+    # Without it Kong returns 404 on every session close (benign but noisy).
     # strip_path: false — the /mcp path is forwarded to the upstream as-is.
     # If strip_path were true, Kong would strip /mcp and the upstream would
     # receive a bare / — breaking the Railway MCP endpoint.

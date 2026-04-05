@@ -26,10 +26,14 @@ import json
 import time
 from typing import Any
 
+import logging
+
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from src.domain.models import ToolResult
+
+_log = logging.getLogger(__name__)
 
 _TOOL_NAMES = sorted([
     "resolve_entity",
@@ -77,6 +81,7 @@ class RemoteMCPToolClient:
 
         Opens a new HTTP session for each call (stateless).
         """
+        _log.info("[remote_mcp] → %s", tool_name)
         t0 = time.monotonic()
         try:
             raw = asyncio.run(self._call_tool_async(tool_name, arguments))
