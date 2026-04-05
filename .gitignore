@@ -20,3 +20,4 @@ __pycache__/
 # App logs
 logs/
 *.log
+kong/declarative/live-dump.yaml
