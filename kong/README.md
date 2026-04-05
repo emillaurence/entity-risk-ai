@@ -1,4 +1,4 @@
-# Kong — Phase 506 AI Gateway Configuration
+# Kong — Phase 506/507 AI Gateway & MCP Gateway Configuration
 
 This directory contains reference configuration for the Kong AI Gateway
 integration (Phase 506).  It supports workflows using
@@ -10,8 +10,10 @@ integration (Phase 506).  It supports workflows using
 
 ```
 kong/
-├── README.md        — this file
-└── declarative/     — gitignored live dumps go here; no file is checked in
+├── README.md                              — this file
+└── declarative/
+    ├── mcp-gateway-reference.yaml         — Phase 507 reference config (checked in; NOT a sync target)
+    └── live-dump.yaml                     — gitignored live dumps (never committed)
 ```
 
 ---
@@ -106,6 +108,98 @@ deck gateway sync \
 
 ---
 
-## Phase 507 note
+---
 
-MCP Gateway routing is implemented in Phase 507.  No MCP config lives here yet.
+## Phase 507 — Kong MCP Gateway
+
+Phase 507 puts Kong in front of the existing remote MCP server:
+
+```
+Client / smoke test
+  ──► Kong Serverless route /mcp       (key-auth validates X-Kong-API-Key)
+  ──► upstream remote MCP server
+  ──► https://entity-risk-ai-production.up.railway.app/mcp
+```
+
+This phase is **transport plumbing only**.  The app is not switched to Kong
+MCP yet — that happens in Phase 508.
+
+### What is different from Phase 506 (AI Gateway)?
+
+| | Phase 506 (AI Gateway) | Phase 507 (MCP Gateway) |
+|---|---|---|
+| Kong plugin | `ai-proxy-advanced` | none — plain HTTP proxy |
+| Service URL | `http://localhost:32000` (placeholder overridden by plugin) | actual Railway upstream URL |
+| Path handling | POST to `/ai` or `/ai/sonnet` | POST/GET to `/mcp`, path preserved |
+| Upstream auth | Anthropic `x-api-key` injected by plugin | upstream handles its own auth |
+| App switches to Kong? | Yes, when `KONG_AI_GATEWAY_ENABLED=true` | No — Phase 508 |
+
+### Security model (Phase 507)
+
+```
+Smoke test  ──[X-Kong-API-Key]──►  Kong /mcp (key-auth)  ──►  Railway MCP upstream
+```
+
+- **key-auth plugin** validates `X-Kong-API-Key` from the caller
+- No upstream credential injection — the Railway MCP endpoint is already publicly accessible
+- `KONG_MCP_GATEWAY_API_KEY` is the app-facing key for this route (separate from the AI Gateway key)
+
+### MCP Gateway Kong setup (Konnect UI steps)
+
+See [notebooks/507_kong_mcp_gateway.ipynb](../notebooks/507_kong_mcp_gateway.ipynb) for the full
+step-by-step guide.  Summary:
+
+1. **Gateway Service** — create a new service named `mcp-upstream-service`:
+   - URL: `https://entity-risk-ai-production.up.railway.app/mcp`
+   - Connect/read/write timeouts: 60 000 ms
+2. **Route** — add route `mcp-route` to the service:
+   - Path: `/mcp`
+   - Methods: `GET`, `POST`
+   - Strip path: **off** (preserves `/mcp` when forwarding)
+3. **key-auth plugin** — add to `mcp-route`:
+   - Key names: `x-kong-api-key`, `X-Kong-API-Key`
+   - Hide credentials: on
+4. **Consumer credential** — add a keyauth credential to the existing `entity-risk-ai-app` consumer
+   (or a new dedicated consumer) with the value of `KONG_MCP_GATEWAY_API_KEY`
+
+### Declarative reference config
+
+`kong/declarative/mcp-gateway-reference.yaml` contains a decK-format reference
+for the MCP Gateway service, route, and key-auth plugin.
+
+> **Important:** this file is **reference documentation**, not a sync target.
+> Konnect Gateway Manager is the source of truth.  The AI Gateway config in
+> the live-dump is gitignored.  Do not run `deck gateway sync` against this
+> reference file unless you have reviewed the diff first.
+
+### Required `Accept` header
+
+MCP Streamable HTTP servers validate the `Accept` header on every request.
+Clients must send `Accept: application/json, text/event-stream` or the server
+rejects the request at the transport layer with a `-32600 Not Acceptable` error —
+**before Kong key-auth fires**.
+
+Always include this header in curl, httpie, or `requests.post()` calls:
+
+```bash
+-H "Accept: application/json, text/event-stream"
+```
+
+---
+
+### Three URLs — MCP edition
+
+| Name | Example | What it is |
+|---|---|---|
+| **Konnect API URL** | `https://au.api.konghq.com` | Used by decK/Konnect API to manage config. Set as `KONG_KONNECT_ADDR`. **Not a traffic endpoint.** |
+| **Serverless proxy URL** | `https://abc1234.au.kong.tech` | Where smoke tests send real MCP traffic. Set as `KONG_PROXY_URL`. |
+| **Upstream MCP URL** | `https://entity-risk-ai-production.up.railway.app/mcp` | The Railway server behind Kong. Set as `KONG_MCP_UPSTREAM_URL`. |
+
+### Rollback
+
+Phase 507 rollback is non-destructive:
+
+1. Set `KONG_MCP_GATEWAY_ENABLED=false` (already the default)
+2. Stop using `$KONG_PROXY_URL/mcp` in smoke tests — use `$REMOTE_MCP_URL` directly
+3. Optionally disable the `mcp-route` in Konnect Gateway Manager (toggle off)
+4. The direct remote MCP path (`REMOTE_MCP_URL`) is completely unaffected

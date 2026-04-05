@@ -13,6 +13,10 @@ Konnect control-plane targeting vars.  All fields are optional.
 ``get_kong_ai_gateway_settings()`` returns a ``KongAIGatewaySettings`` object
 for Phase 506 AI Gateway routing.  When ``enabled`` is False (the default) the
 app uses the direct Anthropic path — no Kong vars need to be set.
+
+``get_kong_mcp_gateway_settings()`` returns a ``KongMCPGatewaySettings`` object
+for Phase 507 MCP Gateway transport setup.  When ``enabled`` is False (the
+default) the app uses the direct remote MCP path unchanged.
 """
 
 from dataclasses import dataclass, replace
@@ -109,6 +113,13 @@ def get_remote_mcp_url() -> str:
 #    KONG_AI_GATEWAY_ROUTE_PATH      — proxy route path (default: /ai)
 #    KONG_AI_GATEWAY_SONNET_ROUTE_PATH — planner-only Sonnet route path (default: /ai/sonnet)
 #    KONG_AI_GATEWAY_API_KEY         — key sent as X-Kong-API-Key to Kong
+#
+# Phase 507 — MCP Gateway transport (loaded by KongMCPGatewaySettings below)
+#    KONG_MCP_GATEWAY_ENABLED        — "true" to route MCP smoke tests through Kong (default: false)
+#    KONG_MCP_GATEWAY_ROUTE_PATH     — proxy route path for MCP (default: /mcp)
+#    KONG_MCP_GATEWAY_API_KEY        — separate key sent as X-Kong-API-Key for MCP traffic
+#    KONG_MCP_UPSTREAM_URL           — upstream remote MCP server URL Kong forwards to
+#                                      (default: https://entity-risk-ai-production.up.railway.app/mcp)
 #
 # Notebook live-test gate
 #    ENABLE_LIVE_KONG_NOTEBOOK_TESTS — "true" to run cells that hit real Konnect / proxy
@@ -256,6 +267,84 @@ def get_kong_ai_gateway_settings() -> KongAIGatewaySettings:
         route_path=os.getenv("KONG_AI_GATEWAY_ROUTE_PATH", "/ai"),
         api_key=os.getenv("KONG_AI_GATEWAY_API_KEY", ""),
         sonnet_route_path=os.getenv("KONG_AI_GATEWAY_SONNET_ROUTE_PATH", "/ai/sonnet"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 507 — Kong MCP Gateway routing settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KongMCPGatewaySettings:
+    """Kong MCP Gateway configuration for Phase 507.
+
+    Controls whether smoke tests (and eventually the app) route MCP calls
+    through a Kong proxy instead of calling the upstream Railway endpoint
+    directly.
+
+    All fields default to safe "disabled" values.  When ``enabled`` is False
+    (the default) no Kong MCP vars are read or required, and the existing
+    remote MCP path is completely unaffected.
+
+    Security model
+    --------------
+    The caller authenticates to Kong using ``api_key`` (sent as
+    ``X-Kong-API-Key``).  Kong validates this key via the key-auth plugin on
+    the ``/mcp`` route, then forwards the request to ``upstream_url``
+    preserving the path and body exactly as received.
+
+    URL breakdown (three separate things)
+    --------------------------------------
+    proxy_url    — Serverless gateway proxy URL (e.g. https://abc.eu.kong.tech).
+                   This is NOT the Konnect API URL (https://au.api.konghq.com).
+    route_path   — The route Kong is listening on (default: /mcp).
+    gateway_url  — proxy_url + route_path.  Callers POST MCP requests here.
+                   Kong preserves the path when forwarding to upstream_url.
+    upstream_url — The actual remote MCP server sitting behind Kong.
+    """
+
+    enabled: bool       # True = route MCP calls through Kong; False = direct remote MCP
+    proxy_url: str      # Serverless proxy base URL (from Konnect Gateway Manager)
+    route_path: str     # MCP route path (default: /mcp)
+    api_key: str        # Key sent as X-Kong-API-Key to authenticate to Kong
+    upstream_url: str   # Upstream MCP server URL (full path, preserved by Kong)
+
+    @property
+    def gateway_url(self) -> str:
+        """Full URL of the Kong MCP gateway route (proxy_url + route_path)."""
+        return self.proxy_url.rstrip("/") + self.route_path
+
+    def masked(self) -> dict:
+        """Return a safe repr with secrets redacted."""
+        key_preview = f"{self.api_key[:8]}…***" if self.api_key else ""
+        return {
+            "enabled": self.enabled,
+            "proxy_url": self.proxy_url,
+            "route_path": self.route_path,
+            "api_key": key_preview,
+            "upstream_url": self.upstream_url,
+            "gateway_url": self.gateway_url if self.proxy_url else "(proxy_url not set)",
+        }
+
+
+def get_kong_mcp_gateway_settings() -> KongMCPGatewaySettings:
+    """Return Kong MCP Gateway settings from environment variables.
+
+    All fields are optional.  When ``enabled`` is False (the default), the
+    app continues to use the direct remote MCP path unchanged.
+    """
+    def _bool(key: str) -> bool:
+        return os.getenv(key, "").strip().lower() == "true"
+
+    return KongMCPGatewaySettings(
+        enabled=_bool("KONG_MCP_GATEWAY_ENABLED"),
+        proxy_url=os.getenv("KONG_PROXY_URL", ""),
+        route_path=os.getenv("KONG_MCP_GATEWAY_ROUTE_PATH", "/mcp"),
+        api_key=os.getenv("KONG_MCP_GATEWAY_API_KEY", ""),
+        upstream_url=os.getenv(
+            "KONG_MCP_UPSTREAM_URL",
+            "https://entity-risk-ai-production.up.railway.app/mcp",
+        ),
     )
 
 
