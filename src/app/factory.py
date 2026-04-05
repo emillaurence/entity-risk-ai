@@ -8,7 +8,9 @@ Streamlit shuts down the resource cache.
 
 Component graph
 ---------------
-AnthropicSettings ──► AnthropicClient (ai_client)
+AnthropicSettings + KongAIGatewaySettings ──► AnthropicClient (ai_client)
+  When KONG_AI_GATEWAY_ENABLED=true, ai_client routes through Kong proxy.
+  Otherwise direct Anthropic SDK is used (default).
 Neo4jSettings ──► Neo4jRepository ──► TraceRepository ──► TraceService
 MCPToolClient (in-process) OR RemoteMCPToolClient (HTTP, keyed by use_remote_mcp)
 ai_client + mcp_client + trace_service ──► GraphAgent, RiskAgent, TraceAgent
@@ -29,7 +31,12 @@ from src.agents.trace_agent import TraceAgent
 from src.clients.anthropic_client import AnthropicClient
 from src.clients.mcp_tool_client import MCPToolClient
 from src.clients.remote_mcp_tool_client import RemoteMCPToolClient
-from src.config import get_anthropic_settings, get_neo4j_settings, get_remote_mcp_url
+from src.config import (
+    get_anthropic_settings,
+    get_kong_ai_gateway_settings,
+    get_neo4j_settings,
+    get_remote_mcp_url,
+)
 from src.orchestration.orchestrator import Orchestrator
 from src.orchestration.planner import InvestigationPlanner
 from src.storage.neo4j_repository import Neo4jRepository
@@ -68,17 +75,22 @@ def create_app_components(use_remote_mcp: bool = False) -> AppComponents:
     # Config ----------------------------------------------------------------
     neo4j_settings = get_neo4j_settings()
     anthropic_settings = get_anthropic_settings()
+    kong_ai_settings = get_kong_ai_gateway_settings()
 
     _log = logging.getLogger(__name__)
     _log.info(
-        "App components initialising: neo4j=%s db=%s model=%s",
+        "App components initialising: neo4j=%s db=%s model=%s kong_ai=%s",
         neo4j_settings.uri,
         neo4j_settings.database,
         anthropic_settings.model_haiku,
+        "enabled" if kong_ai_settings.enabled else "disabled",
     )
 
     # Clients ---------------------------------------------------------------
-    ai_client = AnthropicClient(anthropic_settings)
+    # Pass kong_ai_settings so AnthropicClient can route through Kong when
+    # KONG_AI_GATEWAY_ENABLED=true.  When disabled (default), direct Anthropic
+    # SDK is used — no behaviour change.
+    ai_client = AnthropicClient(anthropic_settings, kong_settings=kong_ai_settings)
     if use_remote_mcp:
         remote_url = get_remote_mcp_url()
         mcp_client: MCPToolClient | RemoteMCPToolClient = RemoteMCPToolClient(remote_url)

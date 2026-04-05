@@ -52,48 +52,65 @@ Authorization is enforced in-app by `src/app/policy.py`.
 
 Policy is centralized in `RolePolicy` / `get_policy_for_user()` in `src/app/policy.py`. No role decisions are made outside that module.
 
-## Upcoming Kong Integration
+## Kong Integration
 
-Kong is being added in staged phases, starting with connectivity scaffolding (phase 505) and ending with live AI and MCP gateway routing.  **The app continues to use direct Anthropic and direct remote-MCP paths until a later phase explicitly switches.**
+Kong is being added in staged phases using **Konnect Serverless Gateway** — Kong manages the data plane; no containers, cluster certificates, or self-hosted nodes are required.
 
-**Deployment model:** all Kong phases use **Konnect Serverless Gateway** — Kong manages the data plane; no containers, cluster certificates, or self-hosted nodes are required.
+### What is active now (Phase 506)
+
+Anthropic calls can optionally route through a Kong AI Gateway route.
+
+```
+Kong mode (KONG_AI_GATEWAY_ENABLED=true):
+  App → Kong /ai → api.anthropic.com
+
+Direct mode (default):
+  App → api.anthropic.com
+```
+
+The app is **default-safe**: `KONG_AI_GATEWAY_ENABLED=false` means the app behaves exactly as before. The existing remote MCP path is not affected.
+
+**Rollback:** set `KONG_AI_GATEWAY_ENABLED=false` in `.env` and restart the app.
 
 ### Staged rollout
 
-| Phase | Notebook | What it does |
+| Phase | Notebook | Status |
 |---|---|---|
-| 505 | `505_kong_konnect_bootstrap_and_connectivity` | Install decK, create PAT, create Serverless gateway, validate Konnect connectivity — no live traffic yet |
-| 506 | `506_kong_ai_gateway` | Wire `AnthropicClient` through a Kong AI Gateway route |
-| 507 | `507_kong_mcp_gateway` | Expose the MCP server behind a Kong route with auth plugins |
+| 505 | `505_kong_konnect_bootstrap_and_connectivity` | ✅ Complete — decK, PAT, Serverless gateway, connectivity check |
+| 506 | `506_kong_ai_gateway_anthropic_smoke` | ✅ Complete — AI Gateway route, key-auth, rate-limiting, Kong-routed client |
+| 507 | `507_kong_mcp_gateway` | Planned — MCP server behind Kong route with auth plugins |
 
-### Kong config variables
+### Key env vars
 
-All Kong variables are defined in `.env.example` under a clearly labelled section.  None are required today.  Set them when you reach the phase that needs them.
+All Kong variables are defined in `.env.example`.  None are required unless you enable Kong mode.
 
-| Variable | Used from phase | Purpose |
+| Variable | Phase | Purpose |
 |---|---|---|
-| `KONG_KONNECT_REGION` | 505 | Konnect region (`eu`, `us`, `au`, `in`) |
-| `KONG_KONNECT_CONTROL_PLANE_NAME` | 505 | Control plane name in Konnect |
+| `KONG_KONNECT_ADDR` | 505 | Konnect API URL (e.g. `https://au.api.konghq.com`) — used by decK, NOT for traffic |
 | `KONG_KONNECT_TOKEN` | 505 | Konnect Personal Access Token |
-| `KONG_PROXY_URL` | 506 | Base URL of the Kong data plane proxy |
+| `KONG_KONNECT_CONTROL_PLANE_NAME` | 505 | Control plane name in Konnect |
+| `KONG_PROXY_URL` | 506 | **Serverless proxy URL** (e.g. `https://abc.au.kong.tech`) — where the app sends traffic |
 | `KONG_AI_GATEWAY_ENABLED` | 506 | `true` to route AI calls through Kong |
-| `KONG_AI_GATEWAY_ROUTE_PATH` | 506 | Proxy route path for AI requests |
-| `KONG_AI_GATEWAY_API_KEY` | 506 | API key forwarded as `X-Kong-API-Key` |
+| `KONG_AI_GATEWAY_ROUTE_PATH` | 506 | Proxy route path (default: `/ai`) |
+| `KONG_AI_GATEWAY_API_KEY` | 506 | Key sent as `X-Kong-API-Key` to Kong |
 | `KONG_MCP_GATEWAY_ENABLED` | 507 | `true` to route MCP calls through Kong |
-| `KONG_MCP_GATEWAY_ROUTE_PATH` | 507 | Proxy route path for MCP requests |
-| `KONG_MCP_GATEWAY_API_KEY` | 507 | API key forwarded as `X-Kong-API-Key` |
 | `ENABLE_LIVE_KONG_NOTEBOOK_TESTS` | 505+ | `true` to run notebook cells that hit real Konnect/proxy |
 
-### Architecture shape for Kong
+> **Important:** `KONG_PROXY_URL` must be the Serverless **proxy URL** shown in Konnect Gateway Manager
+> (e.g. `https://abc.au.kong.tech`), **not** the Konnect API URL (`https://au.api.konghq.com`).
+> See notebook 506 for a full explanation of these three different URLs.
 
-Phase 1 uses mock login and in-app policy enforcement. The architecture is intentionally shaped to support a future Kong MCP Gateway layer:
+### Kong config assets
+
+`kong/declarative/phase-506-ai-route.yaml` contains a reference decK config for the `/ai` route,
+key-auth plugin, rate-limiting plugin, and request-transformer plugin (upstream Anthropic key injection).
+See [kong/README.md](kong/README.md) for decK usage instructions.
+
+### Architecture shape for future phases
 
 - `AuthenticatedUser.auth_provider` is set to `"mock"` or `"dev_bypass"`; a Kong-backed flow will set it to `"kong"` and populate `metadata` with JWT claims.
 - `UserContext.metadata` carries `role`, `auth_provider`, and `gateway_mode` into the investigation flow and persisted trace.
-- Each `InvestigationTrace` in Neo4j stores `user_id`, `user_role`, `auth_provider`, `session_id`, and `gateway_mode` for future audit and Kong consumer tracing.
-- MCP tool categories in `policy.py` (`ADDRESS_RISK_TOOLS`, `INDUSTRY_RISK_TOOLS`) map directly to the intended Kong consumer ACL scopes (`mcp:address_risk`, `mcp:industry_risk`).
-
-When Kong enforcement is added, replace `authenticate()` in `src/app/auth.py` with a Kong-backed provider and update the `auth_provider` value. In-app policy enforcement can then be removed or demoted to a fallback.
+- MCP tool categories in `policy.py` (`ADDRESS_RISK_TOOLS`, `INDUSTRY_RISK_TOOLS`) map to the intended Kong consumer ACL scopes (`mcp:address_risk`, `mcp:industry_risk`) for Phase 507.
 
 ## Agents
 
@@ -196,6 +213,7 @@ Notebooks live in `notebooks/` and are the primary surface for exploration and d
 | `503_trace_context_smoke` | User/session context propagation into trace metadata |
 | `504_phase1_hardening_smoke` | Phase-1 consistency and hardening assertions |
 | `505_kong_konnect_bootstrap_and_connectivity` | Install decK, create PAT, validate Konnect connectivity — Kong phase 505 |
+| `506_kong_ai_gateway_anthropic_smoke` | Kong AI Gateway tutorial: Konnect UI setup, decK examples, live smoke tests, rollback — Kong phase 506 |
 
 ## Project Structure
 
@@ -205,7 +223,10 @@ entity-risk-ai/
 ├── Dockerfile                    # MCP server container
 ├── requirements.txt
 ├── .env.example
-├── notebooks/                    # 20 Jupyter notebooks (exploration + development)
+├── kong/                         # Kong declarative config assets (Phase 506+)
+│   └── declarative/
+│       └── phase-506-ai-route.yaml
+├── notebooks/                    # Jupyter notebooks (exploration + development)
 ├── docs/                         # Architecture, tool reference, notebook guide
 └── src/
     ├── config.py                 # Neo4jSettings, AnthropicSettings

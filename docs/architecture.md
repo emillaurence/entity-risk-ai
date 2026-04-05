@@ -173,3 +173,68 @@ The Streamlit app has a corresponding toggle:
 All AI calls are optional. If `ANTHROPIC_API_KEY` is not set, agents fall back to deterministic template summaries and the planner raises an error (AI is required for planning).
 
 Token spend is tracked per call in `AnthropicClient.last_usage` and surfaced as a `TraceEvent` payload in the audit trail.
+
+---
+
+## Kong AI Gateway (Phase 506)
+
+`AnthropicClient` supports an optional Kong routing mode activated by `KONG_AI_GATEWAY_ENABLED=true`.
+
+### Traffic flow
+
+```
+Kong mode (KONG_AI_GATEWAY_ENABLED=true):
+  App ──[X-Kong-API-Key]──► POST KONG_PROXY_URL/ai
+                             Kong key-auth validates key
+                             Kong ai-proxy injects x-api-key, routes to:
+                             POST api.anthropic.com/v1/messages
+
+Direct mode (default, KONG_AI_GATEWAY_ENABLED=false):
+  App ──[x-api-key]──────────────────────────────────────────────► api.anthropic.com
+```
+
+### How it fits the layer diagram
+
+```
+Layer 2 — Clients
+  AnthropicClient(kong_settings=KongAIGatewaySettings)
+    ├── kong_settings.enabled=False  → _call_direct()  (Anthropic SDK, unchanged)
+    └── kong_settings.enabled=True   → _call_via_kong() (requests, X-Kong-API-Key)
+```
+
+`factory.py` reads `get_kong_ai_gateway_settings()` at startup and passes the result
+to `AnthropicClient`.  All callers above Layer 2 are unaffected — the interface is
+identical in both modes.
+
+### Security model
+
+| Role | Credential | Where configured |
+|---|---|---|
+| App → Kong | `X-Kong-API-Key` | `KONG_AI_GATEWAY_API_KEY` in `.env` |
+| Kong → Anthropic | `x-api-key` injected by **ai-proxy** plugin | Konnect ai-proxy `auth.header_value` |
+| Rate limiting | 20 req/min (default) | Konnect rate-limiting plugin |
+
+The **`ai-proxy` plugin** is the Kong AI Gateway feature. It handles provider routing,
+upstream auth injection, and Anthropic versioning. It is not the same as:
+- `request-transformer` (generic header edits — not AI Gateway)
+- `ai-request-transformer` (uses an LLM to rewrite request content — unrelated)
+
+### Three URLs
+
+| Name | Example | Set as |
+|---|---|---|
+| Konnect API (admin) | `https://au.api.konghq.com` | `KONG_KONNECT_ADDR` |
+| Serverless proxy (traffic) | `https://abc.au.kong.tech` | `KONG_PROXY_URL` |
+| Anthropic upstream | `https://api.anthropic.com` | Kong Service URL in Konnect |
+
+`KONG_PROXY_URL` must be the **Serverless proxy URL** (from Konnect Gateway Manager),
+not the Konnect API/admin URL.
+
+### Default-safe behaviour
+
+- When `KONG_AI_GATEWAY_ENABLED=false` (default), the app behaves exactly as before Phase 506.
+- The existing remote MCP path is not affected by Phase 506 (that is Phase 507).
+
+### Rollback
+
+Set `KONG_AI_GATEWAY_ENABLED=false` in `.env` and restart the app.  No code changes required.
