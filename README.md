@@ -5,7 +5,7 @@ An AI-powered, multi-agent system for investigating UK Companies House ownership
 ## What this is
 
 entity-risk-ai combines:
-- A **Neo4j graph database** populated with Companies House UBO data
+- A **Neo4j graph database** populated with Companies House UBO data (ingested via [erikbijl/neo4j-company-house-demo](https://github.com/erikbijl/neo4j-company-house-demo))
 - Three **specialist AI agents** (graph, risk, trace) orchestrated by an LLM planner
 - A **Streamlit UI** for interactive investigations with role-based access control
 - An **MCP server** that exposes all investigation tools to any MCP-compatible client
