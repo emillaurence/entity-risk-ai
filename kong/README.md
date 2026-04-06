@@ -1,8 +1,11 @@
-# Kong — Phase 506/507 AI Gateway & MCP Gateway Configuration
+# Kong — Phases 506–509: AI Gateway, MCP Gateway & ACL Configuration
 
-This directory contains reference configuration for the Kong AI Gateway
-integration (Phase 506).  It supports workflows using
+This directory contains reference documentation for the Kong integration
+(Phases 506–509).  It supports workflows using
 [decK](https://docs.konghq.com/deck/) for Konnect Serverless management.
+
+**Konnect Gateway Manager UI is the source of truth for all running config.**
+Docs and examples here are reference and bootstrap aids only.
 
 ---
 
@@ -11,8 +14,10 @@ integration (Phase 506).  It supports workflows using
 ```
 kong/
 ├── README.md                              — this file
+├── examples/
+│   ├── phase509_jr_analyst_test.sh        — Phase 509 Jr analyst ACL smoke test
+│   └── phase509_sr_analyst_test.sh        — Phase 509 Sr analyst ACL smoke test
 └── declarative/
-    ├── mcp-gateway-reference.yaml         — Phase 507 reference config (checked in; NOT a sync target)
     └── live-dump.yaml                     — gitignored live dumps (never committed)
 ```
 
@@ -115,14 +120,11 @@ deck gateway sync \
 Phase 507 puts Kong in front of the existing remote MCP server:
 
 ```
-Client / smoke test
+Client / app
   ──► Kong Serverless route /mcp       (key-auth validates X-Kong-API-Key)
   ──► upstream remote MCP server
   ──► https://entity-risk-ai-production.up.railway.app/mcp
 ```
-
-This phase is **transport plumbing only**.  The app is not switched to Kong
-MCP yet — that happens in Phase 508.
 
 ### What is different from Phase 506 (AI Gateway)?
 
@@ -162,16 +164,6 @@ step-by-step guide.  Summary:
 4. **Consumer credential** — add a keyauth credential to the existing `entity-risk-ai-app` consumer
    (or a new dedicated consumer) with the value of `KONG_MCP_GATEWAY_API_KEY`
 
-### Declarative reference config
-
-`kong/declarative/mcp-gateway-reference.yaml` contains a decK-format reference
-for the MCP Gateway service, route, and key-auth plugin.
-
-> **Important:** this file is **reference documentation**, not a sync target.
-> Konnect Gateway Manager is the source of truth.  The AI Gateway config in
-> the live-dump is gitignored.  Do not run `deck gateway sync` against this
-> reference file unless you have reviewed the diff first.
-
 ### Required `Accept` header
 
 MCP Streamable HTTP servers validate the `Accept` header on every request.
@@ -200,6 +192,69 @@ Always include this header in curl, httpie, or `requests.post()` calls:
 Phase 507 rollback is non-destructive:
 
 1. Set `KONG_MCP_GATEWAY_ENABLED=false` (already the default)
-2. Stop using `$KONG_PROXY_URL/mcp` in smoke tests — use `$REMOTE_MCP_URL` directly
+2. Switch the UI backend selector back to Local or Remote MCP
 3. Optionally disable the `mcp-route` in Konnect Gateway Manager (toggle off)
 4. The direct remote MCP path (`REMOTE_MCP_URL`) is completely unaffected
+
+---
+
+## Phase 508 — App wiring
+
+Phase 508 wires the Streamlit UI to the Kong MCP backend.  `KongMCPToolClient`
+(`src/clients/kong_mcp_tool_client.py`) handles all HTTP calls through Kong.
+
+When the UI sidebar backend is set to **Kong MCP Gateway**:
+
+- Requests are sent to `KONG_PROXY_URL/mcp` with `X-Kong-API-Key` header
+- The key used depends on whether Phase 509 ACL is active:
+  - ACL off → `KONG_MCP_GATEWAY_API_KEY` (shared `entity-risk-ai-app` consumer)
+  - ACL on  → per-role key (see Phase 509 below)
+
+`KongMCPToolClient` is instantiated by `factory.py` at startup when
+`KONG_MCP_GATEWAY_ENABLED=true`.  Switching to a different backend in the UI
+replaces the active client without restarting the app.
+
+---
+
+## Phase 509 — Kong ACL policy
+
+Phase 509 adds per-role tool access enforcement via the `ai-mcp-proxy` plugin
+and Konnect consumer groups.
+
+### Consumer model
+
+| Consumer | Group | Key env var | Denied tools |
+|---|---|---|---|
+| `entity-risk-ai-app` | _(ungrouped)_ | `KONG_MCP_GATEWAY_API_KEY` | _(none — used when ACL is off)_ |
+| `jr-analyst-app` | `jr-analyst` | `KONG_MCP_ACL_JR_API_KEY` | `address_risk_check`, `industry_context_check` |
+| `sr-analyst-app` | `sr-analyst` | `KONG_MCP_ACL_SR_API_KEY` | _(none — full access)_ |
+
+### Activation conditions
+
+Kong ACL is only enforced when **all three** conditions are true:
+
+1. `KONG_MCP_GATEWAY_ENABLED=true`
+2. `KONG_MCP_ACL_POLICY_ENABLED=true`
+3. UI backend = **Kong MCP Gateway**
+
+When any condition is false, `policy.py` enforces the same restrictions in-app
+(app-side fallback).  This keeps local and remote development working without
+a live Kong gateway.
+
+### ACL denial behaviour
+
+When Kong denies a tool call (HTTP 403 with ACL plugin response), the app
+propagates it as a `StepStatus.SKIPPED` step in the investigation trace.
+The investigation continues; only the denied step is skipped.
+
+### Smoke tests
+
+`kong/examples/phase509_jr_analyst_test.sh` and `phase509_sr_analyst_test.sh`
+test the ACL enforcement with curl.  Requires `KONG_PROXY_URL` and the
+appropriate per-role API key.
+
+### Konnect setup (source of truth)
+
+All consumer group config lives in Konnect Gateway Manager.  The `ai-mcp-proxy`
+plugin deny lists per group are set there.  Konnect UI is the only source of truth —
+there is no declarative YAML checked into this repo that represents the live state.

@@ -142,7 +142,7 @@ class KongSettings:
     """
 
     # -- Control plane targeting -------------------------------------------
-    konnect_region: str                 # deprecated: region is encoded in konnect_addr
+    konnect_region: str                 # DEPRECATED — region is encoded in konnect_addr URL; value is never used
     konnect_addr: str                   # e.g. "https://au.api.konghq.com"
     konnect_control_plane_name: str     # name as shown in Konnect UI
     konnect_token: str                  # Konnect PAT (secret)
@@ -174,6 +174,9 @@ def get_kong_settings() -> KongSettings:
     def _bool(key: str) -> bool:
         return os.getenv(key, "").strip().lower() == "true"
 
+    # KONG_KONNECT_REGION is read for backwards-compatibility only.
+    # The region is encoded in KONG_KONNECT_ADDR (e.g. https://au.api.konghq.com = AU).
+    # The field value is never used by any code path; decK --konnect-region is also deprecated.
     return KongSettings(
         konnect_region=os.getenv("KONG_KONNECT_REGION", ""),
         konnect_addr=os.getenv("KONG_KONNECT_ADDR", ""),

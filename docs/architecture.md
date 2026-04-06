@@ -28,7 +28,8 @@ entity-risk-ai is a layered multi-agent system for investigating UK Companies Ho
 │  TraceService                                                   │
 ├─────────────────────────────────────────────────────────────────┤
 │  Layer 2 — Clients                                              │
-│  AnthropicClient  │  MCPToolClient / RemoteMCPToolClient        │
+│  AnthropicClient  │  MCPToolClient / RemoteMCPToolClient /      │
+│                      KongMCPToolClient                          │
 ├─────────────────────────────────────────────────────────────────┤
 │  Layer 1 — Storage                                              │
 │  Neo4jRepository  │  TraceRepository                           │
@@ -157,9 +158,15 @@ The MCP server supports two transports, selected at startup:
 | **stdio** | `mcp dev src/mcp/server.py` or `python -m src.mcp.server` (no PORT) | Claude Desktop, MCP Inspector, local development |
 | **streamable-http** | `PORT=8000 python -m src.mcp.server` | Docker, Railway, remote Claude Code integration |
 
-The Streamlit app has a corresponding toggle:
-- **Local MCP** — `MCPToolClient` calls tools in-process (no server needed)
-- **Remote MCP** — `RemoteMCPToolClient` sends HTTP requests to `REMOTE_MCP_URL`
+The Streamlit app has three MCP backend options (sidebar toggle):
+
+| Backend | Client class | When active |
+|---|---|---|
+| **Local MCP** | `MCPToolClient` | In-process — calls tools directly; no server needed |
+| **Remote MCP** | `RemoteMCPToolClient` | HTTP requests to `REMOTE_MCP_URL` (Railway) |
+| **Kong MCP Gateway** | `KongMCPToolClient` | HTTP via Kong route; requires `KONG_MCP_GATEWAY_ENABLED=true` |
+
+`KongMCPToolClient` adds an `X-Kong-API-Key` header and targets `KONG_PROXY_URL/mcp`. When Phase 509 ACL is active, the key is resolved per role (`jr_risk_analyst` → `KONG_MCP_ACL_JR_API_KEY`, `sr_risk_analyst` → `KONG_MCP_ACL_SR_API_KEY`).
 
 ---
 
@@ -250,8 +257,48 @@ not the Konnect API/admin URL.
 
 - When `KONG_AI_GATEWAY_ENABLED=false` (default), the app behaves exactly as before Phase 506.
   The planner still uses Sonnet via direct Anthropic SDK; agents still use Haiku.
-- The existing remote MCP path is not affected by Phase 506 (that is Phase 507).
+- The MCP backend is unaffected by `KONG_AI_GATEWAY_ENABLED` — it is controlled separately.
 
 ### Rollback
 
 Set `KONG_AI_GATEWAY_ENABLED=false` in `.env` and restart the app.  No code changes required.
+
+---
+
+## Kong MCP Gateway (Phases 507–509)
+
+### Transport path (Phase 507/508)
+
+```
+Kong MCP mode (KONG_MCP_GATEWAY_ENABLED=true, UI = "Kong MCP Gateway"):
+
+  App ──[X-Kong-API-Key]──► Kong Serverless /mcp (key-auth) ──► Railway MCP upstream
+
+Direct remote mode (default):
+  App ──────────────────────────────────────────────────────► REMOTE_MCP_URL
+```
+
+`KongMCPToolClient` (`src/clients/kong_mcp_tool_client.py`) implements this path. It is instantiated by `factory.py` when `KONG_MCP_GATEWAY_ENABLED=true` and selected when the UI backend is set to "Kong MCP Gateway".
+
+### ACL enforcement (Phase 509)
+
+When `KONG_MCP_ACL_POLICY_ENABLED=true`, Kong enforces per-role tool access using the `ai-mcp-proxy` plugin and consumer groups:
+
+```
+jr-analyst-app consumer (KONG_MCP_ACL_JR_API_KEY)
+  → jr-analyst consumer group
+  → address_risk_check, industry_context_check: DENIED by Kong ACL
+  → all other tools: allowed
+
+sr-analyst-app consumer (KONG_MCP_ACL_SR_API_KEY)
+  → sr-analyst consumer group
+  → all tools: allowed
+```
+
+`kong_acl_enforcement_active(mcp_mode, settings)` in `src/config.py` returns `True` only when all three conditions hold: `enabled`, `acl_policy_enabled`, and `mcp_mode == "kong"`. Kong ACL denials are surfaced as `StepStatus.SKIPPED` in the investigation trace.
+
+**App-side fallback:** when Kong ACL is not active, `policy.py` enforces identical restrictions in-app so local and remote development behave consistently.
+
+### Source of truth
+
+Konnect Gateway Manager UI is the live source of truth for all Kong configuration. Repo docs and examples are reference/bootstrap aids. Use `deck gateway dump` to snapshot the live state locally (output is gitignored — never commit).
