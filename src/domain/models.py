@@ -129,6 +129,7 @@ class ToolResult:
     duration_ms: float = 0.0
     input: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+    acl_denied: bool = False
 
 
 @dataclass
@@ -224,3 +225,4 @@ class AgentResult:
     trace: InvestigationTrace | None = None
     error: str | None = None
     tools_used: list[str] = field(default_factory=list)
+    acl_denied: bool = False

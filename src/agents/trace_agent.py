@@ -168,6 +168,7 @@ class TraceAgent(BaseAgent):
                 findings={"retrieve_trace": None},
                 trace=trace,
                 error=result.error,
+                acl_denied=result.acl_denied,
                 tools_used=["retrieve_trace"],
             )
 
@@ -217,6 +218,7 @@ class TraceAgent(BaseAgent):
                 findings={"find_traces_by_entity": None},
                 trace=trace,
                 error=result.error,
+                acl_denied=result.acl_denied,
                 tools_used=["find_traces_by_entity"],
             )
 

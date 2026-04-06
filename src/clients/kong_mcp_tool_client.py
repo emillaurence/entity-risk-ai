@@ -35,6 +35,67 @@ from src.domain.models import ToolResult
 
 _log = logging.getLogger(__name__)
 
+# Substrings that indicate a Kong ACL / key-auth denial (case-insensitive).
+# Kong's default ACL plugin message is "You cannot consume this service".
+_ACL_DENIAL_PATTERNS = (
+    "403",
+    "forbidden",
+    "you cannot consume",
+    "acl",
+    "not allowed",
+    "unauthorized",
+    "unauthorised",
+    "permission",
+    "consumer group",
+)
+
+
+def _is_acl_denial(text: str) -> bool:
+    """Return True when *text* looks like a Kong ACL or key-auth denial."""
+    lower = text.lower()
+    return any(pat in lower for pat in _ACL_DENIAL_PATTERNS)
+
+
+def _collect_exception_messages(exc: BaseException, _seen: set | None = None) -> list[str]:
+    """Recursively collect all exception messages from a nested exception chain.
+
+    Handles:
+    - ``BaseExceptionGroup`` / ``ExceptionGroup`` (Python 3.11+ TaskGroup failures)
+    - ``__cause__`` (explicit chaining via ``raise X from Y``)
+    - ``__context__`` (implicit chaining)
+    """
+    if _seen is None:
+        _seen = set()
+    exc_id = id(exc)
+    if exc_id in _seen:
+        return []
+    _seen.add(exc_id)
+
+    messages = [str(exc)]
+
+    # Walk ExceptionGroup / BaseExceptionGroup sub-exceptions (Python 3.11+
+    # TaskGroup failures).  Use hasattr so this also works on Python 3.10 test
+    # environments where BaseExceptionGroup is not a builtin.
+    sub_exceptions = getattr(exc, "exceptions", None)
+    if sub_exceptions:
+        for sub in sub_exceptions:
+            if isinstance(sub, BaseException):
+                messages.extend(_collect_exception_messages(sub, _seen))
+
+    # Walk explicit cause first, then implicit context
+    if exc.__cause__ is not None:
+        messages.extend(_collect_exception_messages(exc.__cause__, _seen))
+    elif exc.__context__ is not None:
+        messages.extend(_collect_exception_messages(exc.__context__, _seen))
+
+    return messages
+
+
+def _is_acl_denial_nested(exc: BaseException) -> bool:
+    """Return True when *any* nested exception message looks like an ACL denial."""
+    messages = _collect_exception_messages(exc)
+    return any(_is_acl_denial(msg) for msg in messages)
+
 
 class KongMCPToolClient:
     """
@@ -78,6 +139,24 @@ class KongMCPToolClient:
         try:
             raw = asyncio.run(self._call_tool_async(tool_name, arguments))
         except Exception as exc:
+            if _is_acl_denial_nested(exc):
+                nested_msgs = _collect_exception_messages(exc)
+                denial_detail = next(
+                    (m for m in reversed(nested_msgs) if _is_acl_denial(m)), str(exc)
+                )
+                _log.info("[kong_mcp] ACL denial for '%s': %s", tool_name, denial_detail)
+                _log.debug(
+                    "[kong_mcp] ACL denial full chain for '%s': %s",
+                    tool_name, " | ".join(nested_msgs),
+                )
+                return ToolResult(
+                    tool_name=tool_name,
+                    success=False,
+                    acl_denied=True,
+                    error=denial_detail,
+                    input=arguments,
+                    summary=f"{tool_name} denied by Kong ACL policy",
+                )
             raise RuntimeError(
                 f"Kong MCP Gateway call failed for tool '{tool_name}'.\n"
                 f"Endpoint: {self._endpoint}\n"
@@ -104,6 +183,7 @@ class KongMCPToolClient:
             duration_ms=raw.get("duration_ms", duration),
             input=raw.get("input", arguments),
             summary=raw.get("summary", ""),
+            acl_denied=raw.get("acl_denied", False),
         )
 
     def list_tools(self) -> list[str]:
@@ -133,6 +213,16 @@ class KongMCPToolClient:
                 text = result.content[0].text  # type: ignore[union-attr]
 
                 if result.isError:
+                    if _is_acl_denial(text):
+                        _log.info("[kong_mcp] ACL denial (isError) for '%s': %s", tool_name, text)
+                        return {
+                            "tool_name": tool_name,
+                            "success": False,
+                            "acl_denied": True,
+                            "error": text,
+                            "input": arguments,
+                            "summary": f"{tool_name} denied by Kong ACL policy",
+                        }
                     return {
                         "tool_name": tool_name,
                         "success": False,

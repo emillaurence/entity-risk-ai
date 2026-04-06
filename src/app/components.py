@@ -937,7 +937,7 @@ def _render_risk_drivers_grid(dims: "dict[str, str]") -> None:
         ("address",   "Address"),
         ("industry",  "Industry"),
     ]
-    _DIM_VALUE_DISPLAY = {"NOT RUN": "Not Run", "RESTRICTED": "Restricted"}
+    _DIM_VALUE_DISPLAY = {"NOT RUN": "NOT RUN", "RESTRICTED": "RESTRICTED"}
     cols = st.columns(4)
     for col, (dim_key, label) in zip(cols, checks):
         risk = dims.get(dim_key) or "UNKNOWN"

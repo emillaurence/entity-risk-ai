@@ -748,6 +748,33 @@ class Orchestrator:
                     error=str(exc),
                 )
 
+            # ── Kong ACL denial — role restriction, not a hard failure ────
+            # When Kong denies the tool call due to ACL, the agent returns
+            # success=False with the ACL marker in the error field.  Treat
+            # this the same as the app-side policy gate: skip with a
+            # "role does not permit" reason and continue to the next step.
+            if not result.success and result.acl_denied:
+                skip_msg = (
+                    f"Step '{step.task}' was not run: your role does not "
+                    "permit this assessment."
+                )
+                _log.info(
+                    "[%s] Step %s Kong ACL denied: task=%s",
+                    _short, step.step_id, step.task,
+                )
+                sr = StepRecord(
+                    step_id=step.step_id,
+                    agent=step.agent,
+                    task=step.task,
+                    success=False,
+                    skipped=True,
+                    skip_reason=skip_msg,
+                )
+                step_results.append(sr)
+                if on_progress:
+                    on_progress("step_complete", sr.to_dict())
+                continue
+
             step_results.append(StepRecord(
                 step_id=step.step_id,
                 agent=step.agent,
