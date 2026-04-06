@@ -166,7 +166,7 @@ The Streamlit app has three MCP backend options (sidebar toggle):
 | **Remote MCP** | `RemoteMCPToolClient` | HTTP requests to `REMOTE_MCP_URL` (Railway) |
 | **Kong MCP Gateway** | `KongMCPToolClient` | HTTP via Kong route; requires `KONG_MCP_GATEWAY_ENABLED=true` |
 
-`KongMCPToolClient` adds an `X-Kong-API-Key` header and targets `KONG_PROXY_URL/mcp`. When Phase 509 ACL is active, the key is resolved per role (`jr_risk_analyst` → `KONG_MCP_ACL_JR_API_KEY`, `sr_risk_analyst` → `KONG_MCP_ACL_SR_API_KEY`).
+`KongMCPToolClient` adds an `X-Kong-API-Key` header and targets `KONG_PROXY_URL/mcp`. When Kong ACL is active, the key is resolved per role (`jr_risk_analyst` → `KONG_MCP_ACL_JR_API_KEY`, `sr_risk_analyst` → `KONG_MCP_ACL_SR_API_KEY`).
 
 ---
 
@@ -183,7 +183,7 @@ Token spend is tracked per call in `AnthropicClient.last_usage` and surfaced as 
 
 ---
 
-## Kong AI Gateway (Phase 506)
+## Kong AI Gateway
 
 `AnthropicClient` supports an optional Kong routing mode activated by `KONG_AI_GATEWAY_ENABLED=true`.
 
@@ -255,7 +255,7 @@ not the Konnect API/admin URL.
 
 ### Default-safe behaviour
 
-- When `KONG_AI_GATEWAY_ENABLED=false` (default), the app behaves exactly as before Phase 506.
+- When `KONG_AI_GATEWAY_ENABLED=false` (default), the app calls Anthropic directly.
   The planner still uses Sonnet via direct Anthropic SDK; agents still use Haiku.
 - The MCP backend is unaffected by `KONG_AI_GATEWAY_ENABLED` — it is controlled separately.
 
@@ -265,9 +265,9 @@ Set `KONG_AI_GATEWAY_ENABLED=false` in `.env` and restart the app.  No code chan
 
 ---
 
-## Kong MCP Gateway (Phases 507–509)
+## Kong MCP Gateway
 
-### Transport path (Phase 507/508)
+### Transport path
 
 ```
 Kong MCP mode (KONG_MCP_GATEWAY_ENABLED=true, UI = "Kong MCP Gateway"):
@@ -280,7 +280,7 @@ Direct remote mode (default):
 
 `KongMCPToolClient` (`src/clients/kong_mcp_tool_client.py`) implements this path. It is instantiated by `factory.py` when `KONG_MCP_GATEWAY_ENABLED=true` and selected when the UI backend is set to "Kong MCP Gateway".
 
-### ACL enforcement (Phase 509)
+### ACL enforcement
 
 When `KONG_MCP_ACL_POLICY_ENABLED=true`, Kong enforces per-role tool access using the `ai-mcp-proxy` plugin and consumer groups:
 

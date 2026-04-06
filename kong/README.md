@@ -1,11 +1,8 @@
-# Kong — Phases 506–509: AI Gateway, MCP Gateway & ACL Configuration
+# Kong — AI Gateway, MCP Gateway & ACL Configuration
 
-This directory contains reference documentation for the Kong integration
-(Phases 506–509).  It supports workflows using
-[decK](https://docs.konghq.com/deck/) for Konnect Serverless management.
+This directory contains reference documentation for the Kong integration. It supports workflows using [decK](https://docs.konghq.com/deck/) for Konnect Serverless management.
 
-**Konnect Gateway Manager UI is the source of truth for all running config.**
-Docs and examples here are reference and bootstrap aids only.
+**Konnect Gateway Manager UI is the source of truth for all running configuration.** Docs and examples here are reference and bootstrap aids only.
 
 ---
 
@@ -15,8 +12,8 @@ Docs and examples here are reference and bootstrap aids only.
 kong/
 ├── README.md                              — this file
 ├── examples/
-│   ├── phase509_jr_analyst_test.sh        — Phase 509 Jr analyst ACL smoke test
-│   └── phase509_sr_analyst_test.sh        — Phase 509 Sr analyst ACL smoke test
+│   ├── phase509_jr_analyst_test.sh        — Jr analyst ACL smoke test
+│   └── phase509_sr_analyst_test.sh        — Sr analyst ACL smoke test
 └── declarative/
     └── live-dump.yaml                     — gitignored live dumps (never committed)
 ```
@@ -25,10 +22,10 @@ kong/
 
 ## Kong AI Gateway vs generic proxy
 
-Phase 506 uses the **`ai-proxy` plugin** — Kong's actual AI Gateway feature.
+The AI Gateway uses the **`ai-proxy` plugin** — Kong's native AI routing feature.
 This is not a generic HTTP proxy with header injection.
 
-| Plugin | What it does | Used in Phase 506? |
+| Plugin | What it does | Used? |
 |---|---|---|
 | `ai-proxy` | Kong AI Gateway: routes to AI provider, injects upstream auth, handles versioning | ✅ Yes |
 | `request-transformer` | Static header/body manipulation. Works as a generic key-injection workaround but is not the AI Gateway feature. | ❌ No |
@@ -42,7 +39,7 @@ With `ai-proxy`:
 
 ---
 
-## What is source-of-truth?
+## What is the source of truth?
 
 | Artifact | Role |
 |---|---|
@@ -66,7 +63,7 @@ That is the admin/management URL — sending traffic there will not work.
 
 ---
 
-## Security model (Phase 506)
+## AI Gateway security model
 
 ```
 App  ──[X-Kong-API-Key]──►  Kong /ai (key-auth + ai-proxy)  ──[x-api-key injected]──►  Anthropic
@@ -83,8 +80,7 @@ The app only knows its own Kong consumer key (`KONG_AI_GATEWAY_API_KEY`).
 
 ## decK usage
 
-No declarative config file is shipped in this repo — Konnect Gateway Manager is the source of
-truth.  Dump the live state first, then diff/sync against that file.
+No declarative config file is shipped in this repo — Konnect Gateway Manager is the source of truth. Dump the live state first, then diff/sync against that file.
 
 ```bash
 # Dump live config to a local file (gitignored — never commit)
@@ -113,11 +109,9 @@ deck gateway sync \
 
 ---
 
----
+## MCP Gateway
 
-## Phase 507 — Kong MCP Gateway
-
-Phase 507 puts Kong in front of the existing remote MCP server:
+The MCP Gateway puts Kong in front of the existing remote MCP server:
 
 ```
 Client / app
@@ -126,30 +120,29 @@ Client / app
   ──► https://entity-risk-ai-production.up.railway.app/mcp
 ```
 
-### What is different from Phase 506 (AI Gateway)?
+### How MCP Gateway differs from AI Gateway
 
-| | Phase 506 (AI Gateway) | Phase 507 (MCP Gateway) |
+| | AI Gateway | MCP Gateway |
 |---|---|---|
 | Kong plugin | `ai-proxy-advanced` | none — plain HTTP proxy |
 | Service URL | `http://localhost:32000` (placeholder overridden by plugin) | actual Railway upstream URL |
 | Path handling | POST to `/ai` or `/ai/sonnet` | POST/GET to `/mcp`, path preserved |
 | Upstream auth | Anthropic `x-api-key` injected by plugin | upstream handles its own auth |
-| App switches to Kong? | Yes, when `KONG_AI_GATEWAY_ENABLED=true` | No — Phase 508 |
+| Feature flag | `KONG_AI_GATEWAY_ENABLED` | `KONG_MCP_GATEWAY_ENABLED` |
 
-### Security model (Phase 507)
+### MCP Gateway security model
 
 ```
-Smoke test  ──[X-Kong-API-Key]──►  Kong /mcp (key-auth)  ──►  Railway MCP upstream
+App  ──[X-Kong-API-Key]──►  Kong /mcp (key-auth)  ──►  Railway MCP upstream
 ```
 
 - **key-auth plugin** validates `X-Kong-API-Key` from the caller
-- No upstream credential injection — the Railway MCP endpoint is already publicly accessible
+- No upstream credential injection — the Railway MCP endpoint is publicly accessible
 - `KONG_MCP_GATEWAY_API_KEY` is the app-facing key for this route (separate from the AI Gateway key)
 
-### MCP Gateway Kong setup (Konnect UI steps)
+### Konnect UI setup
 
-See [notebooks/507_kong_mcp_gateway.ipynb](../notebooks/507_kong_mcp_gateway.ipynb) for the full
-step-by-step guide.  Summary:
+See [notebooks/507_kong_mcp_gateway.ipynb](../notebooks/507_kong_mcp_gateway.ipynb) for the full step-by-step guide. Summary:
 
 1. **Gateway Service** — create a new service named `mcp-upstream-service`:
    - URL: `https://entity-risk-ai-production.up.railway.app/mcp`
@@ -161,8 +154,7 @@ step-by-step guide.  Summary:
 3. **key-auth plugin** — add to `mcp-route`:
    - Key names: `x-kong-api-key`, `X-Kong-API-Key`
    - Hide credentials: on
-4. **Consumer credential** — add a keyauth credential to the existing `entity-risk-ai-app` consumer
-   (or a new dedicated consumer) with the value of `KONG_MCP_GATEWAY_API_KEY`
+4. **Consumer credential** — add a keyauth credential to the existing `entity-risk-ai-app` consumer (or a new dedicated consumer) with the value of `KONG_MCP_GATEWAY_API_KEY`
 
 ### Required `Accept` header
 
@@ -184,12 +176,12 @@ Always include this header in curl, httpie, or `requests.post()` calls:
 | Name | Example | What it is |
 |---|---|---|
 | **Konnect API URL** | `https://au.api.konghq.com` | Used by decK/Konnect API to manage config. Set as `KONG_KONNECT_ADDR`. **Not a traffic endpoint.** |
-| **Serverless proxy URL** | `https://abc1234.au.kong.tech` | Where smoke tests send real MCP traffic. Set as `KONG_PROXY_URL`. |
+| **Serverless proxy URL** | `https://abc1234.au.kong.tech` | Where the app sends real MCP traffic. Set as `KONG_PROXY_URL`. |
 | **Upstream MCP URL** | `https://entity-risk-ai-production.up.railway.app/mcp` | The Railway server behind Kong. Set as `KONG_MCP_UPSTREAM_URL`. |
 
 ### Rollback
 
-Phase 507 rollback is non-destructive:
+MCP Gateway rollback is non-destructive:
 
 1. Set `KONG_MCP_GATEWAY_ENABLED=false` (already the default)
 2. Switch the UI backend selector back to Local or Remote MCP
@@ -198,28 +190,24 @@ Phase 507 rollback is non-destructive:
 
 ---
 
-## Phase 508 — App wiring
+## App wiring
 
-Phase 508 wires the Streamlit UI to the Kong MCP backend.  `KongMCPToolClient`
-(`src/clients/kong_mcp_tool_client.py`) handles all HTTP calls through Kong.
+The Streamlit UI is wired to the Kong MCP backend via `KongMCPToolClient` (`src/clients/kong_mcp_tool_client.py`).
 
 When the UI sidebar backend is set to **Kong MCP Gateway**:
 
 - Requests are sent to `KONG_PROXY_URL/mcp` with `X-Kong-API-Key` header
-- The key used depends on whether Phase 509 ACL is active:
+- The key used depends on whether Kong ACL is active:
   - ACL off → `KONG_MCP_GATEWAY_API_KEY` (shared `entity-risk-ai-app` consumer)
-  - ACL on  → per-role key (see Phase 509 below)
+  - ACL on  → per-role key (see Kong ACL Policy below)
 
-`KongMCPToolClient` is instantiated by `factory.py` at startup when
-`KONG_MCP_GATEWAY_ENABLED=true`.  Switching to a different backend in the UI
-replaces the active client without restarting the app.
+`KongMCPToolClient` is instantiated by `factory.py` at startup when `KONG_MCP_GATEWAY_ENABLED=true`. Switching to a different backend in the UI replaces the active client without restarting the app.
 
 ---
 
-## Phase 509 — Kong ACL policy
+## Kong ACL Policy
 
-Phase 509 adds per-role tool access enforcement via the `ai-mcp-proxy` plugin
-and Konnect consumer groups.
+Kong enforces per-role tool access via the `ai-mcp-proxy` plugin and Konnect consumer groups.
 
 ### Consumer model
 
@@ -237,24 +225,16 @@ Kong ACL is only enforced when **all three** conditions are true:
 2. `KONG_MCP_ACL_POLICY_ENABLED=true`
 3. UI backend = **Kong MCP Gateway**
 
-When any condition is false, `policy.py` enforces the same restrictions in-app
-(app-side fallback).  This keeps local and remote development working without
-a live Kong gateway.
+When any condition is false, `policy.py` enforces the same restrictions in-app (app-side fallback). This keeps local and remote development working without a live Kong gateway.
 
 ### ACL denial behaviour
 
-When Kong denies a tool call (HTTP 403 with ACL plugin response), the app
-propagates it as a `StepStatus.SKIPPED` step in the investigation trace.
-The investigation continues; only the denied step is skipped.
+When Kong denies a tool call (HTTP 403 from the ACL plugin), the app propagates it as a `StepStatus.SKIPPED` step in the investigation trace. The investigation continues; only the denied step is skipped.
 
 ### Smoke tests
 
-`kong/examples/phase509_jr_analyst_test.sh` and `phase509_sr_analyst_test.sh`
-test the ACL enforcement with curl.  Requires `KONG_PROXY_URL` and the
-appropriate per-role API key.
+`kong/examples/phase509_jr_analyst_test.sh` and `phase509_sr_analyst_test.sh` test ACL enforcement with curl. Requires `KONG_PROXY_URL` and the appropriate per-role API key.
 
-### Konnect setup (source of truth)
+### Konnect setup
 
-All consumer group config lives in Konnect Gateway Manager.  The `ai-mcp-proxy`
-plugin deny lists per group are set there.  Konnect UI is the only source of truth —
-there is no declarative YAML checked into this repo that represents the live state.
+All consumer group configuration lives in Konnect Gateway Manager. The `ai-mcp-proxy` plugin deny lists per group are set there. Konnect UI is the only source of truth — there is no declarative YAML checked into this repo that represents the live state.

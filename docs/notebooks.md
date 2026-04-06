@@ -1,6 +1,6 @@
 # Notebooks
 
-The `notebooks/` directory contains 20 Jupyter notebooks for exploring the system, developing new features, and debugging. They are the primary surface for interactive work with the codebase.
+The `notebooks/` directory contains Jupyter notebooks for exploring the system, developing new features, and debugging. They are the primary surface for interactive work with the codebase.
 
 ## Running
 
@@ -50,8 +50,8 @@ This lets notebooks import from `src/` regardless of where Jupyter was launched 
 | `303_llm_planner` | `InvestigationPlanner`: send a free-text query, inspect the JSON plan, validate against `VALID_MODES` / `VALID_AGENTS` / `VALID_TASKS`. |
 | `304_orchestrator` | End-to-end orchestrated investigation: plan → trace → validate → resolve → execute → stop-check → finalise. Shows `OrchestratorResult`. |
 | `401_step_result_contract_check` | Data contract validation: checks that step results from all agents conform to the expected `AgentResult` field shapes. |
-| `505_kong_konnect_bootstrap_and_connectivity` | Install decK, create Konnect PAT, set up Serverless gateway, validate connectivity — Kong phase 505. |
-| `506_kong_ai_gateway_anthropic_smoke` | Wire Anthropic calls through Kong AI Gateway. Covers both the generic `/ai` route (Haiku) and the planner-only `/ai/sonnet` route (Sonnet). Beginner-friendly tutorial with UI walkthrough, decK examples, live smoke tests, troubleshooting, and rollback steps — Kong phase 506. |
+| `505_kong_konnect_bootstrap_and_connectivity` | Install decK, create Konnect PAT, set up Serverless gateway, validate connectivity. |
+| `506_kong_ai_gateway_anthropic_smoke` | Wire Anthropic calls through Kong AI Gateway. Covers both the generic `/ai` route (Haiku) and the planner-only `/ai/sonnet` route (Sonnet). Beginner-friendly tutorial with UI walkthrough, decK examples, live smoke tests, troubleshooting, and rollback steps. |
 
 ## Tips
 
