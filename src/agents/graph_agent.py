@@ -145,6 +145,7 @@ class GraphAgent(BaseAgent):
                 findings={task: None},
                 trace=trace,
                 error=result.error,
+                acl_denied=result.acl_denied,
                 tools_used=[result.tool_name],
             )
 

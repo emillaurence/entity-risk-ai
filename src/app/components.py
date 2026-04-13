@@ -50,6 +50,7 @@ import streamlit as st
 import streamlit.components.v1 as _st_components
 
 import src.app.state as state
+from src.app.policy import get_policy_for_user
 
 if TYPE_CHECKING:
     from src.app.factory import AppComponents
@@ -242,11 +243,15 @@ _MODE_PLAN_FALLBACK: dict[str, str] = {
 
 # Risk level design tokens — (text_colour, bg_colour, border_colour)
 _RISK_COLORS: dict[str, tuple[str, str, str]] = {
-    "HIGH":    ("#B91C1C", "#FEF2F2", "#FECACA"),
-    "MEDIUM":  ("#92400E", "#FFFBEB", "#FDE68A"),
-    "LOW":     ("#14532D", "#F0FDF4", "#BBF7D0"),
-    "UNKNOWN": ("#374151", "#F9FAFB", "#E5E7EB"),
+    "HIGH":       ("#B91C1C", "#FEF2F2", "#FECACA"),
+    "MEDIUM":     ("#92400E", "#FFFBEB", "#FDE68A"),
+    "LOW":        ("#14532D", "#F0FDF4", "#BBF7D0"),
+    "UNKNOWN":    ("#374151", "#F9FAFB", "#E5E7EB"),
+    "RESTRICTED": ("#6B7280", "#F3F4F6", "#D1D5DB"),
 }
+
+# Marker string present in skip_reason when a step is denied by the role policy gate.
+_POLICY_SKIP_MARKER = "role does not permit"
 
 _RISK_ORDER: dict[str, int] = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
 
@@ -440,42 +445,27 @@ def _first_sentences(text: str, n: int = 1) -> str:
 
 
 
-def _get_summarize_findings(result: Any) -> dict | None:
-    """Return findings from the summarize_risk_for_company step, or None."""
-    for sr in result.step_results or []:
-        if sr.task == "summarize_risk_for_company" and sr.success and sr.findings:
-            return sr.findings
-    return None
-
-
 def _collect_risk_dims(result: Any) -> dict[str, str]:
     """
     Return {dim_key: risk_level} for all four risk dimensions.
 
-    Prefers summarize_risk_for_company (covers all four in one step).
-    Falls back to collecting from whichever individual risk tasks ran.
+    Collects from whichever individual risk tasks ran.
     Dimensions not assessed are marked "NOT RUN"; dimensions assessed
-    but with no graph data are marked "UNKNOWN".
+    but with no graph data are marked "UNKNOWN"; dimensions skipped due
+    to role restrictions are marked "RESTRICTED".
     """
     _TASK_TO_DIM = {task: dim for task, dim, _ in _RISK_DIM_TASKS}
-
-    # Prefer the summary step (all four dimensions present)
-    summarize_findings = _get_summarize_findings(result)
-    if summarize_findings:
-        return {
-            dim: (summarize_findings.get(task) or {}).get("risk_level", "UNKNOWN")
-            if isinstance(summarize_findings.get(task), dict) else "UNKNOWN"
-            for task, dim, _ in _RISK_DIM_TASKS
-        }
-
-    # Fall back: collect from whichever individual risk tasks ran
     dims = {dim: "NOT RUN" for _, dim, _ in _RISK_DIM_TASKS}
     for sr in result.step_results or []:
         dim = _TASK_TO_DIM.get(sr.task)
-        if dim and sr.success and sr.findings:
+        if dim is None:
+            continue
+        if sr.success and sr.findings:
             data = sr.findings.get(sr.task)
             if isinstance(data, dict):
                 dims[dim] = data.get("risk_level", "UNKNOWN")
+        elif sr.skipped and _POLICY_SKIP_MARKER in (sr.skip_reason or ""):
+            dims[dim] = "RESTRICTED"
     return dims
 
 
@@ -490,14 +480,7 @@ def _overall_risk_from_result(result: Any) -> str | None:
     for sr in (result.step_results or []):
         if not sr.success:
             continue
-        if sr.task == "summarize_risk_for_company":
-            for task in _RISK_TASKS:
-                data = sr.findings.get(task)
-                if isinstance(data, dict):
-                    lvl = data.get("risk_level", "")
-                    if _RISK_ORDER.get(lvl, -1) > _RISK_ORDER.get(best, -1):
-                        best = lvl
-        elif sr.task in _RISK_TASKS:
+        if sr.task in _RISK_TASKS:
             data = sr.findings.get(sr.task)
             if isinstance(data, dict):
                 lvl = data.get("risk_level", "")
@@ -761,10 +744,10 @@ def _extract_replay_entity(events: list, query: str) -> dict:
 _TOOL_TO_PLAN_STEP: dict[str, tuple[str, str]] = {
     "entity_lookup":               ("entity_lookup",              "graph-agent"),
     "expand_ownership":            ("expand_ownership",           "graph-agent"),
-    "ownership_complexity_check":  ("summarize_risk_for_company", "risk-agent"),
-    "control_signal_check":        ("summarize_risk_for_company", "risk-agent"),
-    "address_risk_check":          ("summarize_risk_for_company", "risk-agent"),
-    "industry_context_check":      ("summarize_risk_for_company", "risk-agent"),
+    "ownership_complexity_check":  ("ownership_complexity_check", "risk-agent"),
+    "control_signal_check":        ("control_signal_check",       "risk-agent"),
+    "address_risk_check":          ("address_risk_check",         "risk-agent"),
+    "industry_context_check":      ("industry_context_check",     "risk-agent"),
 }
 
 
@@ -797,13 +780,23 @@ _REPLAY_TOOL_DIM: dict[str, str] = {
 }
 
 
-def _render_replay_step_cards(events: list) -> None:
-    """Render replay audit trail as 3 grouped step cards matching the Investigate tab.
+def _render_replay_step_cards(events: list, artifact: dict | None = None) -> None:
+    """Render replay audit trail step cards identical to the Investigate tab.
 
-    Groups all tool_returned events into the same 3 logical plan steps used by
-    _replay_plan_steps (entity_lookup, expand_ownership, summarize_risk_for_company).
-    The "Assess risk signals" card shows a risk driver grid for the 4 sub-checks.
+    New traces (with artifact): uses persisted step data to call _render_step_card
+    directly — the same renderer used by the Investigate tab, with full status/skip info.
+
+    Legacy traces (no artifact): reconstructs individual cards from tool_returned events
+    using _TOOL_TO_PLAN_STEP for task/agent labels.
     """
+    # Fast-path: artifact contains full step data — delegate to _render_step_card
+    artifact_steps = (artifact or {}).get("step_results") or []
+    if artifact_steps and any("summary" in s for s in artifact_steps):
+        for i, s in enumerate(artifact_steps, 1):
+            _render_step_card(i, _NS(**s))
+        return
+
+    # Legacy fallback: reconstruct individual step cards from tool_returned events
     groups: dict[tuple, list] = {}
     order: list[tuple] = []
     for ev in events:
@@ -845,28 +838,10 @@ def _render_replay_step_cards(events: list) -> None:
                     f'padding:4px 0">{_esc(_first_sentences(summary, 1))}</div>',
                     unsafe_allow_html=True,
                 )
-            # Tools used pills — same as _render_step_card
             tool_names = [e.get("tool_name", "") for e in evs if e.get("tool_name")]
             tools_html = _tool_pills(tool_names)
             if tools_html:
                 st.markdown(tools_html, unsafe_allow_html=True)
-            # Risk breakdown grid for the "Assess risk signals" grouped step
-            risk_evs = [e for e in evs if e.get("tool_name") in _REPLAY_RISK_TOOLS]
-            if risk_evs:
-                dims: dict[str, str] = {}
-                for e in risk_evs:
-                    dim = _REPLAY_TOOL_DIM.get(e.get("tool_name", ""))
-                    if not dim:
-                        continue
-                    out_text = (e.get("output_summary") or "").upper()
-                    for lvl in ("HIGH", "MEDIUM", "LOW"):
-                        if f" {lvl}" in out_text or f":{lvl}" in out_text:
-                            dims[dim] = lvl
-                            break
-                if dims:
-                    _label_row("Risk Breakdown")
-                    _render_risk_drivers_grid(dims)
-            # "View step details" expander — mirrors _render_step_card
             with st.expander("View step details", expanded=False):
                 reasoning = _TASK_REASONING.get(task_key, "")
                 if reasoning:
@@ -882,7 +857,6 @@ def _render_replay_step_cards(events: list) -> None:
                         f'{_esc(summary)}</div>',
                         unsafe_allow_html=True,
                     )
-                # Findings from structured data_json (available in new traces)
                 for e in evs:
                     raw = e.get("data_json") or ""
                     if raw:
@@ -963,17 +937,19 @@ def _render_risk_drivers_grid(dims: "dict[str, str]") -> None:
         ("address",   "Address"),
         ("industry",  "Industry"),
     ]
+    _DIM_VALUE_DISPLAY = {"NOT RUN": "NOT RUN", "RESTRICTED": "RESTRICTED"}
     cols = st.columns(4)
     for col, (dim_key, label) in zip(cols, checks):
         risk = dims.get(dim_key) or "UNKNOWN"
         tc, bg, border = _RISK_COLORS.get(risk, _RISK_COLORS["UNKNOWN"])
+        display = _DIM_VALUE_DISPLAY.get(risk, risk)
         col.markdown(
             f'<div style="text-align:center;background:{bg};'
             f'border:1px solid {border};border-radius:8px;'
             f'padding:9px 4px;margin:4px 2px">'
             f'<div style="font-size:0.62em;color:#6B7280;text-transform:uppercase;'
             f'letter-spacing:0.05em;font-weight:700;margin-bottom:5px">{label}</div>'
-            f'<div style="font-size:0.82em;font-weight:800;color:{tc}">{_esc(risk)}</div>'
+            f'<div style="font-size:0.82em;font-weight:800;color:{tc}">{_esc(display)}</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -1228,6 +1204,27 @@ def _render_replay_plan(replay_data: dict) -> None:
                 unsafe_allow_html=True,
             )
 
+        # Session identity — collapsed by default; hidden when all fields are empty
+        # (older traces that pre-date this feature will have no identity fields).
+        _sid_rows = [
+            ("User",          replay_data.get("user_id") or ""),
+            ("Role",          replay_data.get("user_role") or ""),
+            ("Auth Provider", replay_data.get("auth_provider") or ""),
+            ("Session",       replay_data.get("session_id") or ""),
+            ("Gateway Mode",  replay_data.get("gateway_mode") or ""),
+        ]
+        _sid_populated = [r for r in _sid_rows if r[1]]
+        if _sid_populated:
+            with st.expander("🔑 Session Identity", expanded=False):
+                for _label, _value in _sid_populated:
+                    st.markdown(
+                        f'<div style="font-size:0.82em;color:#374151;padding:3px 0">'
+                        f'<b>{_esc(_label)}:</b>&nbsp;'
+                        f'<span style="font-family:monospace;color:#1F2937">'
+                        f'{_esc(_value)}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
         focus_text = plan_reason or _MODE_PLAN_FALLBACK.get(mode, "")
         if focus_text:
             st.markdown(
@@ -1270,6 +1267,53 @@ def _render_replay_plan(replay_data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _render_policy_skip_warning() -> None:
+    """Show a banner when plan steps were skipped due to role restrictions.
+
+    Reads the completed live steps and checks for policy-denied skip reasons.
+    Renders a single consolidated warning so the analyst understands that some
+    assessments were not run due to their role, not an error in the system.
+    Only shown after an investigation has produced results.
+    """
+    live_steps = state.get_live_steps()
+    result = state.get_result()
+    if not live_steps and result is None:
+        return
+
+    # Collect all policy-skipped task labels from live steps (progressive view)
+    # and from the finished result (final view).
+    _POLICY_SKIP_MARKER = "role does not permit"
+
+    skipped_tasks: list[str] = []
+
+    for step in live_steps:
+        reason = step.get("skip_reason") or ""
+        if _POLICY_SKIP_MARKER in reason:
+            task = step.get("task", "")
+            skipped_tasks.append(task)
+
+    if result is not None:
+        for sr in result.step_results:
+            if sr.skipped and _POLICY_SKIP_MARKER in (sr.skip_reason or ""):
+                if sr.task not in skipped_tasks:
+                    skipped_tasks.append(sr.task)
+
+    if not skipped_tasks:
+        return
+
+    _TASK_LABELS_LOCAL: dict[str, str] = {
+        "address_risk_check":    "address risk assessment",
+        "industry_context_check": "industry risk assessment",
+    }
+    labels = [
+        _TASK_LABELS_LOCAL.get(t, t.replace("_", " ")) for t in skipped_tasks
+    ]
+    joined = ", ".join(labels)
+    st.warning(
+        f"Some assessments were not run due to your role restrictions: "
+        f"**{joined}**. Contact a Senior Risk Analyst for a full assessment.",
+        icon="⚠️",
+    )
 
 
 def render_app_header() -> None:
@@ -1319,12 +1363,18 @@ def _extract_live_risk_dims() -> dict[str, str]:
 
     Returns dims dict suitable for ``_render_risk_drivers_grid``.
     Only reflects steps that have already completed during this run.
+    Dimensions skipped due to role restrictions are marked "RESTRICTED".
     """
     dims = {dim: "UNKNOWN" for _, dim, _ in _RISK_DIM_TASKS}
     for step_dict in state.get_live_steps():
         task = step_dict.get("task", "")
         for task_key, dim, _ in _RISK_DIM_TASKS:
-            if task == task_key:
+            if task != task_key:
+                continue
+            skip_reason = step_dict.get("skip_reason") or ""
+            if _POLICY_SKIP_MARKER in skip_reason:
+                dims[dim] = "RESTRICTED"
+            else:
                 findings = step_dict.get("findings") or {}
                 data = findings.get(task)
                 if isinstance(data, dict):
@@ -1833,8 +1883,17 @@ def _build_structured_assessment(result: Any) -> dict:
             primary_dim  = dim
 
     # Decision title
-    any_material = any(v in ("HIGH", "MEDIUM") for v in dims.values())
-    if key in ("LOW", "UNKNOWN") and not any_material:
+    any_material   = any(v in ("HIGH", "MEDIUM") for v in dims.values())
+    any_restricted = any(v == "RESTRICTED" for v in dims.values())
+    any_ran        = any(v not in ("NOT RUN", "RESTRICTED", "UNKNOWN") for v in dims.values())
+
+    if any_restricted and not any_ran:
+        key            = "RESTRICTED"
+        decision_title = "Assessment Unavailable — Role Restriction"
+    elif any_restricted:
+        level_word     = {"HIGH": "High Risk", "MEDIUM": "Moderate Risk", "LOW": "Low Risk"}.get(key, "Risk")
+        decision_title = f"{level_word} — Partial Assessment"
+    elif key in ("LOW", "UNKNOWN") and not any_material:
         decision_title = "Low Risk — No Material Risk Signals"
     elif primary_dim and key in ("HIGH", "MEDIUM", "LOW"):
         level_word     = {"HIGH": "High Risk", "MEDIUM": "Moderate Risk", "LOW": "Low Risk"}[key]
@@ -1983,8 +2042,17 @@ def _build_replay_assessment(replay_data: dict) -> dict:
             primary_dim  = dim
 
     # Decision title — same logic as _build_structured_assessment
-    any_material = any(v in ("HIGH", "MEDIUM") for v in dims.values())
-    if key in ("LOW", "UNKNOWN") and not any_material:
+    any_material   = any(v in ("HIGH", "MEDIUM") for v in dims.values())
+    any_restricted = any(v == "RESTRICTED" for v in dims.values())
+    any_ran        = any(v not in ("NOT RUN", "RESTRICTED", "UNKNOWN") for v in dims.values())
+
+    if any_restricted and not any_ran:
+        key            = "RESTRICTED"
+        decision_title = "Assessment Unavailable — Role Restriction"
+    elif any_restricted:
+        level_word     = {"HIGH": "High Risk", "MEDIUM": "Moderate Risk", "LOW": "Low Risk"}.get(key, "Risk")
+        decision_title = f"{level_word} — Partial Assessment"
+    elif key in ("LOW", "UNKNOWN") and not any_material:
         decision_title = "Low Risk — No Material Risk Signals"
     elif primary_dim and key in ("HIGH", "MEDIUM", "LOW"):
         level_word     = {"HIGH": "High Risk", "MEDIUM": "Moderate Risk", "LOW": "Low Risk"}[key]
@@ -2048,13 +2116,20 @@ def _build_investigation_artifact(result: Any, question: str) -> dict:
     plan_reason = plan.get("reason", "")
     investigation_type = _MODE_DISPLAY.get(plan.get("mode", ""), "")
 
-    # Step results summary (task, agent, status for each step)
+    # Step results — full data so the Replay audit trail can use _render_step_card directly
     step_summaries = [
         {
-            "task":    s.task,
-            "agent":   s.agent,
-            "status":  s.status,   # "success" | "failed" | "skipped"
-            "skipped": s.skipped,
+            "step_id":        s.step_id,
+            "task":           s.task,
+            "agent":          s.agent,
+            "status":         s.status,
+            "success":        s.success,
+            "skipped":        s.skipped,
+            "skip_reason":    s.skip_reason or "",
+            "summary":        s.summary or "",
+            "tools_executed": s.tools_executed or [],
+            "findings":       s.findings or {},
+            "error":          s.error or "",
         }
         for s in (result.step_results or [])
     ]
@@ -2241,9 +2316,9 @@ def _render_progress_section() -> None:
     """Thin progress bar at the top of the Investigate tab during a run.
 
     Maps the investigation lifecycle to 3 user-friendly phases:
-        Step 1/3 — Identifying entity
-        Step 2/3 — Mapping ownership
-        Step 3/3 — Assessing risk
+        Phase 1/3 — Identifying entity
+        Phase 2/3 — Mapping ownership
+        Phase 3/3 — Assessing risk
     Hidden when idle or done.
     """
     phase = state.get_live_phase()
@@ -2251,17 +2326,23 @@ def _render_progress_section() -> None:
         return
 
     live_cur     = state.get_live_current_step()
-    current_task = (live_cur or {}).get("task", "") if live_cur else ""
+    current_task = (live_cur or {}).get("task", "")
+    # Between steps (live_current_step cleared on step_complete), fall back to the last
+    # completed step so the phase label doesn't flicker to raw "Step N/6" counters.
+    if not current_task:
+        live_steps = state.get_live_steps()
+        if live_steps:
+            current_task = (live_steps[-1] or {}).get("task", "")
 
     if phase in ("planning", "resolving") or current_task in _PROGRESS_PHASE1:
         pct  = 0.12
-        text = "Step 1/3 — Identifying entity"
+        text = "Phase 1/3 — Identifying entity"
     elif current_task in _PROGRESS_PHASE2:
         pct  = 0.45
-        text = "Step 2/3 — Mapping ownership"
+        text = "Phase 2/3 — Mapping ownership"
     elif current_task in _PROGRESS_PHASE3:
         pct  = 0.78
-        text = "Step 3/3 — Assessing risk"
+        text = "Phase 3/3 — Assessing risk"
     else:
         # Fallback: use raw step counters if task doesn't map to a known phase
         num   = state.get_live_step_num()
@@ -2279,11 +2360,13 @@ def render_investigate_tab(components: "AppComponents") -> None:
     Layout
     ------
     [Progress bar]        (only during active investigation)
+    [Policy warning]      (only when steps were skipped due to role restrictions)
     [Col 1 — AI Assistant]  [Col 2 — Context Graph]  [Col 3 — Decision Insights]
                                                        └─ "How this decision was made"
                                                           (collapsed expander at bottom)
     """
     _render_progress_section()
+    _render_policy_skip_warning()
 
     # Compute once per render pass; passed into the two columns that need it
     # so _extract_live_risk_dims() is not called twice on the same rerun.
@@ -2308,10 +2391,12 @@ def _render_input_column(components: "AppComponents", live_dims: dict) -> None:
         "Investigate ownership, control, and risk signals for a UK company",
     )
 
+    if "_input_question" not in st.session_state:
+        st.session_state["_input_question"] = state.get_question()
+
     question = st.text_area(
         label="Question",
         label_visibility="collapsed",
-        value=state.get_question(),
         height=100,
         placeholder=(
             "e.g. Who owns Vodafone 2 and are there any ownership, "
@@ -2805,7 +2890,7 @@ def _render_insights_column(live_dims: dict) -> None:
 
         # A. Key Risk Drivers — directly below outcome
         dims = _collect_risk_dims(result)
-        if any(v in ("HIGH", "MEDIUM", "LOW") for v in dims.values()):
+        if any(v != "NOT RUN" for v in dims.values()):
             _label_row("Key Risk Drivers")
             _render_risk_drivers_grid(dims)
 
@@ -3027,7 +3112,22 @@ def render_replay_tab(components: "AppComponents") -> None:
 
     Layout mirrors the Investigate tab exactly:
     [Col 1 — Replay loader + Assessment]  [Col 2 — Context Graph]  [Col 3 — Assessment panel]
+
+    Defense-in-depth: even if this function is called for a role that should
+    not see the Replay tab (e.g. due to future routing changes), we block
+    rendering and show an access-denied message rather than leaking trace data.
     """
+    user = state.get_authenticated_user()
+    if user is not None:
+        policy = get_policy_for_user(user)
+        if not policy.can_replay:
+            st.error(
+                "Access denied. Your role does not have permission to access "
+                "the Replay / Audit tab.",
+                icon="🔒",
+            )
+            return
+
     col1, col2, col3 = st.columns([2, 2, 2])
 
     with col1:
@@ -3143,7 +3243,7 @@ def _render_replay_input_column(components: "AppComponents") -> None:
             # Legacy traces: reconstruct from event inference
             has_summary = bool(replay_data.get("final_summary"))
             has_dims    = any(
-                v in ("HIGH", "MEDIUM", "LOW")
+                v != "NOT RUN"
                 for v in _extract_replay_risk_dimensions(replay_data).values()
             )
             if has_summary or has_dims:
@@ -3335,7 +3435,7 @@ def _render_replay_insights_column() -> None:
     else:
         replay_dims = _extract_replay_risk_dimensions(replay_data)
 
-    if any(v in ("HIGH", "MEDIUM", "LOW") for v in replay_dims.values()):
+    if any(v != "NOT RUN" for v in replay_dims.values()):
         _label_row("Key Risk Drivers")
         _render_risk_drivers_grid(replay_dims)
 
@@ -3469,4 +3569,4 @@ def _render_replay_insights_column() -> None:
             "📋 Audit Trail",
             "Step-by-step record of what was done during this investigation",
         )
-        _render_replay_step_cards(events)
+        _render_replay_step_cards(events, artifact=artifact)

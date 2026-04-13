@@ -1,5 +1,98 @@
 # Company Ownership Risk Investigator
-A traceable multi-agent AI system for UK Companies House ownership and risk investigation. It combines a Neo4j graph database, three specialist AI agents, an LLM-based orchestrator, a Streamlit UI, and an MCP server that exposes all investigation tools to any MCP-compatible client.
+
+An AI-powered, multi-agent system for investigating UK Companies House ownership structures and risk signals. Kong Konnect Serverless Gateway serves as the control plane — routing LLM calls through the AI Gateway and tool execution through the MCP Gateway.
+
+## What this is
+
+entity-risk-ai combines:
+- A **Neo4j graph database** populated with Companies House UBO data (ingested via [erikbijl/neo4j-company-house-demo](https://github.com/erikbijl/neo4j-company-house-demo))
+- Three **specialist AI agents** (graph, risk, trace) orchestrated by an LLM planner
+- A **Streamlit UI** for interactive investigations with role-based access control
+- An **MCP server** that exposes all investigation tools to any MCP-compatible client
+- **Kong Konnect Serverless Gateway** as the control plane for LLM and tool-execution traffic
+
+## Architecture Overview
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Application layer                                          │
+│  Streamlit UI · InvestigationPlanner · Specialist Agents   │
+├────────────────────────────────────────────────────────────┤
+│  Gateway layer (Kong Konnect Serverless)                    │
+│  AI Gateway /ai · /ai/sonnet  │  MCP Gateway /mcp          │
+├────────────────────────────────────────────────────────────┤
+│  Execution layer                                            │
+│  Anthropic LLMs (Haiku / Sonnet)  │  MCP server (Railway)  │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Key Capabilities
+
+### AI Gateway
+
+Anthropic calls can be routed through Kong AI Gateway (`KONG_AI_GATEWAY_ENABLED=true`):
+
+| Route | Path | Model | Used by |
+|---|---|---|---|
+| Generic | `/ai` | Haiku | All agents |
+| Planner-only | `/ai/sonnet` | Sonnet | `InvestigationPlanner` only |
+
+```
+Kong mode:     Planner → Kong /ai/sonnet → api.anthropic.com (Sonnet)
+               Agents  → Kong /ai        → api.anthropic.com (Haiku)
+
+Direct mode (default):
+               Planner → api.anthropic.com (Sonnet)
+               Agents  → api.anthropic.com (Haiku)
+```
+
+The **`ai-proxy` plugin** handles upstream Anthropic auth injection. The app never holds the Anthropic API key in Kong mode. Model selection (Sonnet for the planner, Haiku for agents) applies in both modes.
+
+### MCP Gateway
+
+MCP tool calls can be routed through Kong (`KONG_MCP_GATEWAY_ENABLED=true`):
+
+```
+Kong MCP mode:   App ──[X-Kong-API-Key]──► Kong /mcp (key-auth) ──► Railway MCP upstream
+Direct mode:     App ──────────────────────────────────────────► REMOTE_MCP_URL
+```
+
+### MCP Backend Modes
+
+The Streamlit sidebar offers three backend options:
+
+| Backend | Client | Description |
+|---|---|---|
+| **Local MCP** | `MCPToolClient` | In-process — no server needed |
+| **Remote MCP** | `RemoteMCPToolClient` | HTTP to `REMOTE_MCP_URL` (Railway) |
+| **Kong MCP Gateway** | `KongMCPToolClient` | HTTP via Kong `/mcp` route |
+
+### Policy Enforcement
+
+Tool access is enforced at two levels, with automatic fallback:
+
+| Mode | Enforcer | Jr analyst | Sr analyst |
+|---|---|---|---|
+| Kong ACL active | Kong `ai-mcp-proxy` plugin | `address_risk_check`, `industry_context_check` denied | Full access |
+| Kong ACL inactive (default) | `policy.py` (in-app) | Same restrictions | Full access |
+
+Kong ACL is active when all three conditions hold: `KONG_MCP_GATEWAY_ENABLED=true`, `KONG_MCP_ACL_POLICY_ENABLED=true`, and the UI backend is **Kong MCP Gateway**. In all other modes, `policy.py` enforces identical restrictions so local and remote development behaves consistently.
+
+Kong ACL denials are propagated back as `SKIPPED` steps in the investigation trace — the investigation continues with remaining steps.
+
+---
+
+## Configuration Model
+
+**Konnect Gateway Manager UI is the source of truth for all live Kong configuration.** Repo docs and examples are reference and bootstrap aids only. Use `deck gateway dump` to snapshot the live state locally (the output is gitignored — never commit).
+
+All Kong variables are optional and guarded by feature flags. Defaults leave the app in direct mode, behaving identically to a deployment without Kong.
+
+See [kong/README.md](kong/README.md) for setup instructions, decK usage, and the three-URL model.
+
+---
 
 ## Setup
 
@@ -11,7 +104,7 @@ pip install -r requirements.txt
 **Configure environment**
 ```bash
 cp .env.example .env
-# Edit .env — fill in Neo4j and Anthropic credentials
+# Fill in Neo4j and Anthropic credentials; Kong variables are optional
 ```
 
 **Run the Streamlit app**
@@ -23,6 +116,75 @@ streamlit run app.py
 ```bash
 jupyter notebook notebooks/
 ```
+
+---
+
+## Authentication and Roles
+
+The app uses a mock login gate. Two demo users are pre-configured:
+
+| Username | Password | Role |
+|---|---|---|
+| `jr_analyst` | `demo123` | `jr_risk_analyst` |
+| `sr_analyst` | `demo123` | `sr_risk_analyst` |
+
+Sign in at the login screen. The sidebar shows the active user and role. A **Sign out** button is available at the bottom of the sidebar.
+
+**Dev bypass** — set `DEV_BYPASS_AUTH=true` in `.env` to enable a bypass button on the login screen that logs in as an `sr_risk_analyst` without a password. Never active by default.
+
+---
+
+## Authorization Model
+
+Authorization is enforced in-app by `src/app/policy.py`.
+
+| Capability | Jr Risk Analyst | Sr Risk Analyst |
+|---|---|---|
+| Investigate tab | ✓ | ✓ |
+| Replay / Audit tab | ✗ | ✓ |
+| View technical evidence | ✓ | ✓ |
+| `address_risk_check` MCP tool | ✗ | ✓ |
+| `industry_context_check` MCP tool | ✗ | ✓ |
+| All other MCP tools | ✓ | ✓ |
+
+Policy is centralized in `RolePolicy` / `get_policy_for_user()` in `src/app/policy.py`. No role decisions are made outside that module.
+
+---
+
+## Kong Configuration
+
+### Environment variables
+
+All Kong variables are defined in `.env.example`. None are required unless you enable Kong mode.
+
+| Variable | Purpose |
+|---|---|
+| `KONG_KONNECT_ADDR` | Konnect API URL (e.g. `https://au.api.konghq.com`) — used by decK, not for traffic |
+| `KONG_KONNECT_TOKEN` | Konnect Personal Access Token |
+| `KONG_KONNECT_CONTROL_PLANE_NAME` | Control plane name in Konnect |
+| `KONG_PROXY_URL` | **Serverless proxy URL** (e.g. `https://abc.au.kong.tech`) — where the app sends traffic |
+| `KONG_AI_GATEWAY_ENABLED` | `true` to route AI calls through Kong |
+| `KONG_AI_GATEWAY_ROUTE_PATH` | Generic AI route path (default: `/ai`) |
+| `KONG_AI_GATEWAY_SONNET_ROUTE_PATH` | Planner-only Sonnet route path (default: `/ai/sonnet`) |
+| `KONG_AI_GATEWAY_API_KEY` | Key sent as `X-Kong-API-Key` to Kong |
+| `PLANNER_MODEL` | Model used by `InvestigationPlanner` (defaults to `ANTHROPIC_MODEL_SONNET`) |
+| `KONG_MCP_GATEWAY_ENABLED` | `true` to route MCP calls through Kong |
+| `KONG_MCP_GATEWAY_ROUTE_PATH` | Kong MCP route path (default: `/mcp`) |
+| `KONG_MCP_GATEWAY_API_KEY` | Shared key for `entity-risk-ai-app` Kong consumer |
+| `KONG_MCP_UPSTREAM_URL` | Railway MCP URL behind Kong |
+| `KONG_MCP_ACL_POLICY_ENABLED` | `true` to enable Kong ACL enforcement per consumer group |
+| `KONG_MCP_ACL_JR_API_KEY` | Key for `jr-analyst-app` consumer (restricted tools) |
+| `KONG_MCP_ACL_SR_API_KEY` | Key for `sr-analyst-app` consumer (full access) |
+| `ENABLE_LIVE_KONG_NOTEBOOK_TESTS` | `true` to run notebook cells that hit real Konnect/proxy |
+
+> **Important:** `KONG_PROXY_URL` must be the Serverless **proxy URL** shown in Konnect Gateway Manager
+> (e.g. `https://abc.au.kong.tech`), **not** the Konnect API URL (`https://au.api.konghq.com`).
+
+### Kong config assets
+
+No declarative config file is checked into this repo — the live configuration lives in Konnect (Konnect Gateway Manager is the source of truth). Use `deck gateway dump` to capture the current state locally (the output file is gitignored). See [kong/README.md](kong/README.md) for decK usage instructions and ACL setup.
+
+---
 
 ## Agents
 
@@ -37,6 +199,8 @@ Three specialist agents handle all investigation work:
 An `InvestigationPlanner` (LLM-based) generates a step-by-step execution plan from a free-text query. The `Orchestrator` runs the plan, resolves entity names, dispatches steps to the right agent, evaluates stop conditions after each risk signal, and persists a full audit trail in Neo4j.
 
 Every agent call and AI enrichment is logged as a structured `TraceEvent` in Neo4j, linked to the business nodes it touched. Traces can be retrieved, summarised, or deleted without affecting the business graph.
+
+---
 
 ## MCP Server
 
@@ -94,6 +258,8 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
+---
+
 ## Notebooks
 
 Notebooks live in `notebooks/` and are the primary surface for exploration and development. Each notebook adds `sys.path.insert(0, "..")` in its first cell so `src` imports work from the `notebooks/` directory. See [docs/notebooks.md](docs/notebooks.md) for details.
@@ -120,6 +286,14 @@ Notebooks live in `notebooks/` and are the primary surface for exploration and d
 | `303_llm_planner` | InvestigationPlanner — LLM-based plan generation |
 | `304_orchestrator` | Multi-agent orchestrator — end-to-end investigation |
 | `401_step_result_contract_check` | Data contract validation for step results |
+| `501_mock_login_smoke` | Mock login gate, session-state helpers, dev bypass |
+| `502_role_policy_smoke` | Role policy, Jr/Sr capability checks, MCP tool allowlists |
+| `503_trace_context_smoke` | User/session context propagation into trace metadata |
+| `504_phase1_hardening_smoke` | Consistency and hardening assertions across all layers |
+| `505_kong_konnect_bootstrap_and_connectivity` | Konnect bootstrap: install decK, create PAT, validate connectivity |
+| `506_kong_ai_gateway_anthropic_smoke` | Kong AI Gateway: `/ai` (Haiku) and `/ai/sonnet` (Sonnet) routes, smoke tests, rollback |
+
+---
 
 ## Project Structure
 
@@ -129,7 +303,11 @@ entity-risk-ai/
 ├── Dockerfile                    # MCP server container
 ├── requirements.txt
 ├── .env.example
-├── notebooks/                    # 20 Jupyter notebooks (exploration + development)
+├── kong/                         # Kong Gateway docs, examples, decK usage
+│   ├── README.md                 # Three-URL model, security model, ACL setup
+│   ├── examples/                 # ACL smoke-test scripts (Jr/Sr analyst)
+│   └── declarative/              # Gitignored live dumps (never committed)
+├── notebooks/                    # Jupyter notebooks (exploration + development)
 ├── docs/                         # Architecture, tool reference, notebook guide
 └── src/
     ├── config.py                 # Neo4jSettings, AnthropicSettings
@@ -142,7 +320,8 @@ entity-risk-ai/
     │   ├── ai_client.py          # AIClient ABC
     │   ├── anthropic_client.py   # Haiku / Sonnet implementation
     │   ├── mcp_tool_client.py    # In-process MCP tool calls
-    │   └── remote_mcp_tool_client.py  # HTTP MCP client (Railway / hosted)
+    │   ├── remote_mcp_tool_client.py  # HTTP MCP client (Railway / hosted)
+    │   └── kong_mcp_tool_client.py    # HTTP MCP client routed via Kong
     ├── tools/
     │   ├── graph_tools.py        # Deterministic graph queries → ToolResult
     │   ├── risk_tools.py         # Risk signal heuristics → ToolResult
@@ -161,6 +340,8 @@ entity-risk-ai/
     │   ├── planner.py            # InvestigationPlanner — LLM plan generation
     │   └── orchestrator.py       # Orchestrator — 7-stage multi-agent execution
     └── app/
+        ├── auth.py               # Mock auth, AuthenticatedUser
+        ├── policy.py             # Role-based authorization, RolePolicy
         ├── factory.py            # AppComponents wiring (@st.cache_resource)
         ├── layout.py             # Main Streamlit layout
         ├── state.py              # Session state management

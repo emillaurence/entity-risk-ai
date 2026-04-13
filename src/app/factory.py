@@ -8,9 +8,18 @@ Streamlit shuts down the resource cache.
 
 Component graph
 ---------------
-AnthropicSettings ──► AnthropicClient (ai_client)
+AnthropicSettings + KongAIGatewaySettings ──► AnthropicClient (ai_client)
+  When KONG_AI_GATEWAY_ENABLED=true, ai_client routes through Kong proxy.
+  Otherwise direct Anthropic SDK is used (default).
 Neo4jSettings ──► Neo4jRepository ──► TraceRepository ──► TraceService
-MCPToolClient (in-process) OR RemoteMCPToolClient (HTTP, keyed by use_remote_mcp)
+MCP client — one of three modes (keyed by mcp_mode):
+  "local"  → MCPToolClient (in-process)
+  "remote" → RemoteMCPToolClient (HTTP, REMOTE_MCP_URL)
+  "kong"   → KongMCPToolClient (HTTP via Kong proxy, KONG_MCP_GATEWAY_ENABLED=true required)
+             When KONG_MCP_ACL_POLICY_ENABLED=true, the client uses the role-specific
+             API key (KONG_MCP_ACL_JR_API_KEY / KONG_MCP_ACL_SR_API_KEY) so Kong can
+             attribute the request to the correct consumer group.  Falls back to the
+             shared KONG_MCP_GATEWAY_API_KEY when role-specific keys are not set.
 ai_client + mcp_client + trace_service ──► GraphAgent, RiskAgent, TraceAgent
 ai_client ──► InvestigationPlanner
 planner + mcp_client + agents + trace_service + trace_repo ──► Orchestrator
@@ -27,9 +36,17 @@ from src.agents.graph_agent import GraphAgent
 from src.agents.risk_agent import RiskAgent
 from src.agents.trace_agent import TraceAgent
 from src.clients.anthropic_client import AnthropicClient
+from src.clients.kong_mcp_tool_client import KongMCPToolClient
 from src.clients.mcp_tool_client import MCPToolClient
 from src.clients.remote_mcp_tool_client import RemoteMCPToolClient
-from src.config import get_anthropic_settings, get_neo4j_settings, get_remote_mcp_url
+from src.config import (
+    get_anthropic_settings,
+    get_kong_ai_gateway_settings,
+    get_kong_mcp_gateway_settings,
+    get_neo4j_settings,
+    get_remote_mcp_url,
+    kong_acl_enforcement_active,
+)
 from src.orchestration.orchestrator import Orchestrator
 from src.orchestration.planner import InvestigationPlanner
 from src.storage.neo4j_repository import Neo4jRepository
@@ -49,7 +66,7 @@ class AppComponents:
     repo: Neo4jRepository
     trace_repo: TraceRepository
     trace_service: TraceService
-    mcp_client: MCPToolClient | RemoteMCPToolClient
+    mcp_client: MCPToolClient | RemoteMCPToolClient | KongMCPToolClient
     graph_agent: GraphAgent
     risk_agent: RiskAgent
     trace_agent: TraceAgent
@@ -58,30 +75,82 @@ class AppComponents:
 
 
 @st.cache_resource
-def create_app_components(use_remote_mcp: bool = False) -> AppComponents:
+def create_app_components(mcp_mode: str = "local", role: str = "") -> AppComponents:
     """Instantiate and wire all system components.
 
-    Called once per Streamlit server process; result is cached by
+    Called once per unique ``(mcp_mode, role)`` pair; result is cached by
     ``@st.cache_resource``.  Raises ``EnvironmentError`` (from config) if any
     required environment variable is missing.
+
+    Args:
+        mcp_mode: One of ``"local"``, ``"remote"``, or ``"kong"``.
+                  ``"kong"`` requires ``KONG_MCP_GATEWAY_ENABLED=true``.
+        role:     Signed-in user's role (e.g. ``"jr_risk_analyst"``).
+                  Used to select the correct Kong API key when
+                  ``KONG_MCP_ACL_POLICY_ENABLED=true``.  Empty string falls
+                  back to the shared ``KONG_MCP_GATEWAY_API_KEY``.
     """
     # Config ----------------------------------------------------------------
     neo4j_settings = get_neo4j_settings()
     anthropic_settings = get_anthropic_settings()
+    kong_ai_settings = get_kong_ai_gateway_settings()
 
     _log = logging.getLogger(__name__)
     _log.info(
-        "App components initialising: neo4j=%s db=%s model=%s",
+        "App components initialising: neo4j=%s db=%s model=%s planner_model=%s kong_ai=%s mcp_mode=%s role=%s",
         neo4j_settings.uri,
         neo4j_settings.database,
         anthropic_settings.model_haiku,
+        anthropic_settings.planner_model,
+        "enabled" if kong_ai_settings.enabled else "disabled",
+        mcp_mode,
+        role or "(none)",
     )
 
     # Clients ---------------------------------------------------------------
-    ai_client = AnthropicClient(anthropic_settings)
-    if use_remote_mcp:
+    # Main AI client — Haiku default, generic /ai Kong route.
+    # Pass kong_ai_settings so AnthropicClient can route through Kong when
+    # KONG_AI_GATEWAY_ENABLED=true.  When disabled (default), direct Anthropic
+    # SDK is used — no behaviour change.
+    ai_client = AnthropicClient(anthropic_settings, kong_settings=kong_ai_settings)
+
+    # Planner AI client — Sonnet default, dedicated /ai/sonnet Kong route.
+    # The planner performs the most reasoning-intensive task (free-text → structured
+    # JSON plan) and benefits most from Sonnet.  Routing is isolated here so no
+    # other call site needs to know about the planner's model choice.
+    # When Kong is disabled, this falls back to direct Anthropic with Sonnet.
+    planner_ai_client = AnthropicClient(
+        anthropic_settings,
+        kong_settings=kong_ai_settings.for_planner(),
+        default_model=anthropic_settings.planner_model,
+    )
+
+    # MCP client — selected by mcp_mode (local | remote | kong) ------------
+    mcp_client: MCPToolClient | RemoteMCPToolClient | KongMCPToolClient
+    if mcp_mode == "kong":
+        kong_mcp_settings = get_kong_mcp_gateway_settings()
+        if not kong_mcp_settings.enabled:
+            raise EnvironmentError(
+                "mcp_mode='kong' requested but KONG_MCP_GATEWAY_ENABLED is not true. "
+                "Set KONG_MCP_GATEWAY_ENABLED=true in .env to use Kong MCP Gateway."
+            )
+        # Phase 509 — when ACL is active, use the role-specific API key so Kong
+        # can attribute the request to the correct consumer group.  Falls back to
+        # the shared key when ACL is disabled or no role-specific key is set.
+        if kong_acl_enforcement_active(mcp_mode, kong_mcp_settings) and role:
+            resolved_key = kong_mcp_settings.resolve_api_key(role)
+            from dataclasses import replace as _replace
+            kong_mcp_settings = _replace(kong_mcp_settings, api_key=resolved_key)
+            _log.info(
+                "Kong MCP ACL: resolved API key for role=%s (has_role_key=%s)",
+                role,
+                resolved_key != get_kong_mcp_gateway_settings().api_key,
+            )
+        mcp_client = KongMCPToolClient(kong_mcp_settings)
+        # Logging happens inside KongMCPToolClient.__init__
+    elif mcp_mode == "remote":
         remote_url = get_remote_mcp_url()
-        mcp_client: MCPToolClient | RemoteMCPToolClient = RemoteMCPToolClient(remote_url)
+        mcp_client = RemoteMCPToolClient(remote_url)
         _log.info("MCP backend: remote (%s)", remote_url)
     else:
         mcp_client = MCPToolClient()
@@ -100,7 +169,7 @@ def create_app_components(use_remote_mcp: bool = False) -> AppComponents:
     trace_agent = TraceAgent(mcp_client, trace_service, ai_client)
 
     # Orchestration ---------------------------------------------------------
-    planner = InvestigationPlanner(ai_client)
+    planner = InvestigationPlanner(planner_ai_client)
     orchestrator = Orchestrator(
         planner,
         mcp_client,

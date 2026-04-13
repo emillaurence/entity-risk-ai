@@ -39,6 +39,7 @@ import streamlit as st
 
 import src.app.state as state
 from src.app.app_logger import get_app_logger, log_event
+from src.app.auth import authenticate, dev_bypass_user, is_dev_bypass_enabled
 from src.app.components import (
     render_app_header,
     render_investigate_tab,
@@ -46,18 +47,31 @@ from src.app.components import (
     render_status_banner,
 )
 from src.app.factory import AppComponents, create_app_components
+from src.app.policy import get_kong_consumer_group, get_policy_for_user
 from src.app.styles import inject_styles
+from src.config import get_kong_mcp_gateway_settings, kong_acl_enforcement_active
+from src.domain.models import UserContext
 
 _log = get_app_logger()
 
 
-def _start_investigation(components: AppComponents, question: str) -> None:
+def _start_investigation(
+    components: AppComponents,
+    question: str,
+    allowed_tools: "frozenset[str] | None" = None,
+    user_context: "UserContext | None" = None,
+) -> None:
     """Reset live state, start the orchestrator in a background thread, and
     seed the run queue so the UI picks up progress events on each rerun.
 
     Creates an ``entity_confirm_queue`` so the orchestrator thread can block
     on entity selection when multiple candidates are returned.  Any prior
     confirmation queue is signalled with ``None`` first to unblock stale threads.
+
+    Args:
+        allowed_tools: Optional MCP tool allowlist from the current user's
+                       RolePolicy.  Passed through to ``Orchestrator.run()``
+                       so disallowed tool steps are skipped safely.
     """
     # Unblock any previously blocking orchestrator thread
     old_cq: "_queue.Queue | None" = st.session_state.get("entity_confirm_queue")
@@ -84,8 +98,10 @@ def _start_investigation(components: AppComponents, question: str) -> None:
         try:
             result = components.orchestrator.run(
                 question,
+                user_context=user_context,
                 on_progress=on_progress,
                 confirmation_queue=confirm_q,
+                allowed_tools=allowed_tools,
             )
             q.put({"event": "done", "data": {"result": result}})
         except Exception as exc:  # noqa: BLE001
@@ -146,23 +162,69 @@ def _polling_fragment() -> None:
     # No full rebuild; next fragment tick in 250 ms.
 
 
+def _render_login() -> None:
+    """Render the pre-app login gate.
+
+    Shows a username / password form.  On success, calls ``state.login()``
+    and triggers a full rerun so ``render_layout`` picks up the auth state.
+
+    A dev bypass button is shown when ``DEV_BYPASS_AUTH=true`` is set.
+    """
+    _, col, _ = st.columns([1, 1, 1])
+    with col:
+        st.markdown("## Entity Risk Investigation")
+        st.markdown("Sign in to continue.")
+
+        error = state.get_auth_error()
+        if error:
+            st.error(error)
+
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="e.g. jr_analyst")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign in", use_container_width=True)
+
+        if submitted:
+            user = authenticate(username.strip(), password)
+            if user:
+                state.login(user)
+                st.rerun()
+            else:
+                state.set_auth_error("Invalid username or password.")
+                st.rerun()
+
+        if is_dev_bypass_enabled():
+            st.divider()
+            st.caption("Dev bypass enabled (`DEV_BYPASS_AUTH=true`)")
+            if st.button("Enter as dev user (bypass)", use_container_width=True):
+                state.login(dev_bypass_user())
+                state.set_auth_dev_bypass(True)
+                st.rerun()
+
+
 def render_layout() -> None:
     """Render the full page.
 
     Entry point called by ``app.py``.  Call order:
       1. inject_styles         — global CSS (idempotent across reruns)
       2. state.init            — seed session_state defaults on first load
-      3. log startup           — once per browser session
-      4. create_app_components — cached across reruns via @st.cache_resource
-      5. render header + error banner — above the tabs
-      6. render two tabs        — Investigate | Replay / Audit
+      3. auth gate             — returns early if not authenticated
+      4. log startup           — once per browser session
+      5. create_app_components — cached across reruns via @st.cache_resource
+      6. render header + error banner — above the tabs
+      7. render two tabs        — Investigate | Replay / Audit
          (progress bar rendered inside the Investigate tab)
-      7. handle triggers        — consumed AFTER widgets render
-      8. _polling_fragment      — fragment-scoped poller; triggers full reruns
+      8. handle triggers        — consumed AFTER widgets render
+      9. _polling_fragment      — fragment-scoped poller; triggers full reruns
                                   only when new events arrive
     """
     inject_styles()
     state.init()
+
+    # ── Auth gate ────────────────────────────────────────────────────────
+    if not state.is_authenticated():
+        _render_login()
+        return
 
     if not st.session_state.get("_app_started"):
         log_event("app_start")
@@ -170,36 +232,85 @@ def render_layout() -> None:
 
     # ── Sidebar ─────────────────────────────────────────────────────────
     remote_url_configured = bool(os.getenv("REMOTE_MCP_URL"))
+    kong_mcp_enabled = os.getenv("KONG_MCP_GATEWAY_ENABLED", "").strip().lower() == "true"
+    kong_acl_flag = os.getenv("KONG_MCP_ACL_POLICY_ENABLED", "").strip().lower() == "true"
+
+    _mcp_options = ["local", "remote"]
+    if kong_mcp_enabled:
+        _mcp_options.append("kong")
+
+    # Default to Kong when the flag is enabled; otherwise default to local.
+    # Streamlit only uses `index` on first render (before the key exists in
+    # session_state), so explicit user selections within a session are preserved.
+    _default_index = _mcp_options.index("kong") if kong_mcp_enabled else 0
+
+    def _mcp_label(x: str) -> str:
+        if x == "local":
+            return "Local (in-process)"
+        if x == "remote":
+            return "Remote MCP Server"
+        return "Kong MCP Gateway"
+
     with st.sidebar:
         st.markdown("### Settings")
         mcp_mode = st.radio(
             "Tool backend",
-            options=["local", "remote"],
-            format_func=lambda x: "Local (in-process)" if x == "local" else "Remote MCP Server",
-            index=0,
+            options=_mcp_options,
+            format_func=_mcp_label,
+            index=_default_index,
             key="mcp_mode",
             help=(
-                "Switch between the in-process tool layer and the hosted "
-                "Railway MCP server. Set REMOTE_MCP_URL in .env to enable."
+                "Switch between the in-process tool layer, the hosted "
+                "Railway MCP server, or Kong MCP Gateway. "
+                "Set REMOTE_MCP_URL in .env to enable remote mode. "
+                "Set KONG_MCP_GATEWAY_ENABLED=true to enable Kong MCP mode."
             ),
-            disabled=not remote_url_configured,
+            disabled=not remote_url_configured and not kong_mcp_enabled,
         )
-        if not remote_url_configured:
-            st.caption("Set REMOTE_MCP_URL in .env to enable remote mode.")
+        if not remote_url_configured and not kong_mcp_enabled:
+            st.caption("Set REMOTE_MCP_URL or KONG_MCP_GATEWAY_ENABLED in .env to enable remote mode.")
 
-    components = create_app_components(use_remote_mcp=(mcp_mode == "remote"))
+        # Phase 509 — show ACL enforcement status when Kong MCP is active
+        if mcp_mode == "kong" and kong_mcp_enabled and kong_acl_flag:
+            st.caption("🔒 Kong ACL policy ACTIVE — tool access enforced at gateway")
+        elif mcp_mode == "kong" and kong_mcp_enabled:
+            st.caption("🔓 Kong transport (ACL disabled — app policy applies)")
+
+        st.divider()
+        user = state.get_authenticated_user()
+        if user:
+            st.caption(f"Signed in as **{user.user_id}**")
+            st.caption(f"Role: `{user.role}`")
+        if st.button("Sign out", key="btn_logout", use_container_width=True):
+            state.logout()
+            st.rerun()
+
+    components = create_app_components(mcp_mode=mcp_mode, role=user.role if user else "")
+
+    # ── Derive policy for current user ─────────────────────────────────
+    _policy = get_policy_for_user(user) if user else None
 
     # ── Render page ────────────────────────────────────────────────────
     render_app_header()
     render_status_banner()  # error-only; hidden when idle
 
-    tab_investigate, tab_replay = st.tabs(["🔍 Investigate", "📼 Replay / Audit"])
+    # Build tab list based on what the current role can access.
+    # Jr analysts see Investigate only; Sr analysts see both tabs.
+    _tab_labels = ["🔍 Investigate"]
+    _show_replay = _policy is not None and _policy.can_replay
+    if _show_replay:
+        _tab_labels.append("📼 Replay / Audit")
+
+    _tabs = st.tabs(_tab_labels)
+    tab_investigate = _tabs[0]
+    tab_replay = _tabs[1] if _show_replay else None
 
     with tab_investigate:
         render_investigate_tab(components)
 
-    with tab_replay:
-        render_replay_tab(components)
+    if tab_replay is not None:
+        with tab_replay:
+            render_replay_tab(components)
 
     # ── Handle triggers AFTER all widgets are rendered ─────────────────
     # Triggers are set by widgets during this rerun; checking them here
@@ -208,32 +319,41 @@ def render_layout() -> None:
     # triggers from either tab are reliably visible here.
 
     if st.session_state.pop("_trigger_replay", False):
-        replay_id = state.get_replay_trace_id()
-        if replay_id:
-            log_event("replay_started", trace_id=replay_id)
-            state.set_replay_status("loading")
-            try:
-                replay_data = components.trace_repo.load_trace(replay_id)
-                state.set_replay_data(replay_data)
-                state.set_replay_status("loaded")
-                log_event(
-                    "replay_completed",
-                    trace_id=replay_id,
-                    mode=replay_data.get("mode"),
-                    event_count=len(replay_data.get("events") or []),
-                )
-            except KeyError:
-                state.set_replay_status("error")
-                state.set_replay_error(
-                    f"Trace '{replay_id}' was not found in the database."
-                )
-                log_event("replay_failed", trace_id=replay_id, error="not_found")
-            except Exception as exc:
-                _log.error("Replay failed for trace %s: %s", replay_id, exc)
-                state.set_replay_status("error")
-                state.set_replay_error(f"Failed to load trace: {exc}")
-                log_event("replay_failed", trace_id=replay_id, error=str(exc))
-            st.rerun()
+        # Hard block: enforce replay access even if the session key was set
+        # through a crafted path (e.g. direct URL param manipulation).
+        if not _show_replay:
+            _log.warning(
+                "Replay attempt blocked for role '%s'",
+                user.role if user else "unknown",
+            )
+            state.reset_replay_state()
+        else:
+            replay_id = state.get_replay_trace_id()
+            if replay_id:
+                log_event("replay_started", trace_id=replay_id)
+                state.set_replay_status("loading")
+                try:
+                    replay_data = components.trace_repo.load_trace(replay_id)
+                    state.set_replay_data(replay_data)
+                    state.set_replay_status("loaded")
+                    log_event(
+                        "replay_completed",
+                        trace_id=replay_id,
+                        mode=replay_data.get("mode"),
+                        event_count=len(replay_data.get("events") or []),
+                    )
+                except KeyError:
+                    state.set_replay_status("error")
+                    state.set_replay_error(
+                        f"Trace '{replay_id}' was not found in the database."
+                    )
+                    log_event("replay_failed", trace_id=replay_id, error="not_found")
+                except Exception as exc:
+                    _log.error("Replay failed for trace %s: %s", replay_id, exc)
+                    state.set_replay_status("error")
+                    state.set_replay_error(f"Failed to load trace: {exc}")
+                    log_event("replay_failed", trace_id=replay_id, error=str(exc))
+                st.rerun()
 
     if st.session_state.pop("_clear_replay", False):
         state.reset_replay_state()
@@ -242,7 +362,42 @@ def render_layout() -> None:
     if st.session_state.pop("_trigger_run", False):
         question = state.get_question()
         if question:
-            _start_investigation(components, question)
+            # ── Phase 509: Kong ACL enforcement switch ──────────────────────
+            # Determine whether Kong gateway is enforcing tool access control.
+            # When active: pass allowed_tools=None so the app does NOT filter
+            # tools — Kong enforces at the gateway level instead.
+            # When inactive: use the app-side policy allowlist as before.
+            _kong_mcp_settings = get_kong_mcp_gateway_settings()
+            _kong_acl_active = kong_acl_enforcement_active(mcp_mode, _kong_mcp_settings)
+
+            if _kong_acl_active:
+                _allowed = None  # Kong enforces — do NOT filter in app
+                _consumer_group = get_kong_consumer_group(user.role) if user else None
+                _log.info(
+                    "Kong MCP ACL policy ACTIVE — role=%s consumer_group=%s endpoint=%s",
+                    user.role if user else "unknown",
+                    _consumer_group or "unmapped",
+                    _kong_mcp_settings.gateway_url,
+                )
+            else:
+                _allowed = _policy.allowed_mcp_tools if _policy is not None else None
+
+            # Build a richer UserContext from the authenticated session so
+            # the orchestrator can persist full identity into the trace.
+            # Future Kong: replace auth_provider / metadata with JWT claims.
+            _user_ctx: UserContext | None = None
+            if user is not None:
+                _user_ctx = UserContext(
+                    user_id=user.user_id,
+                    session_id=user.session_id,
+                    metadata={
+                        "role":           user.role,
+                        "auth_provider":  user.auth_provider,
+                        "gateway_mode":   mcp_mode,
+                        "kong_acl_active": _kong_acl_active,
+                    },
+                )
+            _start_investigation(components, question, allowed_tools=_allowed, user_context=_user_ctx)
             st.rerun()  # immediately show "Planning…" state
 
     # ── Fragment-scoped poller ─────────────────────────────────────────

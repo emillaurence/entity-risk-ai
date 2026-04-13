@@ -28,7 +28,8 @@ entity-risk-ai is a layered multi-agent system for investigating UK Companies Ho
 │  TraceService                                                   │
 ├─────────────────────────────────────────────────────────────────┤
 │  Layer 2 — Clients                                              │
-│  AnthropicClient  │  MCPToolClient / RemoteMCPToolClient        │
+│  AnthropicClient  │  MCPToolClient / RemoteMCPToolClient /      │
+│                      KongMCPToolClient                          │
 ├─────────────────────────────────────────────────────────────────┤
 │  Layer 1 — Storage                                              │
 │  Neo4jRepository  │  TraceRepository                           │
@@ -157,9 +158,15 @@ The MCP server supports two transports, selected at startup:
 | **stdio** | `mcp dev src/mcp/server.py` or `python -m src.mcp.server` (no PORT) | Claude Desktop, MCP Inspector, local development |
 | **streamable-http** | `PORT=8000 python -m src.mcp.server` | Docker, Railway, remote Claude Code integration |
 
-The Streamlit app has a corresponding toggle:
-- **Local MCP** — `MCPToolClient` calls tools in-process (no server needed)
-- **Remote MCP** — `RemoteMCPToolClient` sends HTTP requests to `REMOTE_MCP_URL`
+The Streamlit app has three MCP backend options (sidebar toggle):
+
+| Backend | Client class | When active |
+|---|---|---|
+| **Local MCP** | `MCPToolClient` | In-process — calls tools directly; no server needed |
+| **Remote MCP** | `RemoteMCPToolClient` | HTTP requests to `REMOTE_MCP_URL` (Railway) |
+| **Kong MCP Gateway** | `KongMCPToolClient` | HTTP via Kong route; requires `KONG_MCP_GATEWAY_ENABLED=true` |
+
+`KongMCPToolClient` adds an `X-Kong-API-Key` header and targets `KONG_PROXY_URL/mcp`. When Kong ACL is active, the key is resolved per role (`jr_risk_analyst` → `KONG_MCP_ACL_JR_API_KEY`, `sr_risk_analyst` → `KONG_MCP_ACL_SR_API_KEY`).
 
 ---
 
@@ -173,3 +180,125 @@ The Streamlit app has a corresponding toggle:
 All AI calls are optional. If `ANTHROPIC_API_KEY` is not set, agents fall back to deterministic template summaries and the planner raises an error (AI is required for planning).
 
 Token spend is tracked per call in `AnthropicClient.last_usage` and surfaced as a `TraceEvent` payload in the audit trail.
+
+---
+
+## Kong AI Gateway
+
+`AnthropicClient` supports an optional Kong routing mode activated by `KONG_AI_GATEWAY_ENABLED=true`.
+
+### Routes
+
+Two routes sit under a single `anthropic-ai` Service in Konnect:
+
+| Route | Path | Model | Used by |
+|---|---|---|---|
+| `ai-route` | `/ai` | `claude-haiku-4-5-20251001` | All agents (GraphAgent, RiskAgent, TraceAgent) |
+| `ai-sonnet-route` | `/ai/sonnet` | `claude-sonnet-4-6` | `InvestigationPlanner` only |
+
+### Traffic flow
+
+```
+Kong mode (KONG_AI_GATEWAY_ENABLED=true):
+
+  Planner  ──[X-Kong-API-Key]──► POST KONG_PROXY_URL/ai/sonnet ─► api.anthropic.com (Sonnet)
+  Agents   ──[X-Kong-API-Key]──► POST KONG_PROXY_URL/ai        ─► api.anthropic.com (Haiku)
+
+Direct mode (default, KONG_AI_GATEWAY_ENABLED=false):
+  All      ──[x-api-key]──────────────────────────────────────────► api.anthropic.com
+  (Planner uses Sonnet, agents use Haiku — model selection is unchanged)
+```
+
+### How it fits the layer diagram
+
+```
+Layer 2 — Clients
+  AnthropicClient(kong_settings, default_model)
+    ├── kong_settings.enabled=False  → _call_direct()   (Anthropic SDK, unchanged)
+    └── kong_settings.enabled=True   → _call_via_kong() (requests, X-Kong-API-Key)
+
+factory.py creates two AnthropicClient instances:
+  ai_client         default_model=haiku   route=/ai          → agents
+  planner_ai_client default_model=sonnet  route=/ai/sonnet   → InvestigationPlanner
+```
+
+`factory.py` reads `get_kong_ai_gateway_settings()` at startup. `KongAIGatewaySettings.for_planner()`
+returns a copy with `route_path=sonnet_route_path` used to construct `planner_ai_client`.
+All callers above Layer 2 are unaffected — the interface is identical in both modes.
+
+### Security model
+
+| Role | Credential | Where configured |
+|---|---|---|
+| App → Kong | `X-Kong-API-Key` | `KONG_AI_GATEWAY_API_KEY` in `.env` |
+| Kong → Anthropic | `x-api-key` injected by **ai-proxy** plugin | Konnect ai-proxy `auth.header_value` |
+| Rate limiting `/ai` | 20 req/min (default) | Konnect rate-limiting plugin on `ai-route` |
+| Rate limiting `/ai/sonnet` | 10 req/min (default) | Konnect rate-limiting plugin on `ai-sonnet-route` |
+
+The same consumer credential (`KONG_AI_GATEWAY_API_KEY`) is used for both routes.
+
+The **`ai-proxy` plugin** is the Kong AI Gateway feature. It handles provider routing,
+upstream auth injection, and Anthropic versioning. It is not the same as:
+- `request-transformer` (generic header edits — not AI Gateway)
+- `ai-request-transformer` (uses an LLM to rewrite request content — unrelated)
+
+### Three URLs
+
+| Name | Example | Set as |
+|---|---|---|
+| Konnect API (admin) | `https://au.api.konghq.com` | `KONG_KONNECT_ADDR` |
+| Serverless proxy (traffic) | `https://abc.au.kong.tech` | `KONG_PROXY_URL` |
+| Anthropic upstream | `https://api.anthropic.com` | Kong Service URL in Konnect |
+
+`KONG_PROXY_URL` must be the **Serverless proxy URL** (from Konnect Gateway Manager),
+not the Konnect API/admin URL.
+
+### Default-safe behaviour
+
+- When `KONG_AI_GATEWAY_ENABLED=false` (default), the app calls Anthropic directly.
+  The planner still uses Sonnet via direct Anthropic SDK; agents still use Haiku.
+- The MCP backend is unaffected by `KONG_AI_GATEWAY_ENABLED` — it is controlled separately.
+
+### Rollback
+
+Set `KONG_AI_GATEWAY_ENABLED=false` in `.env` and restart the app.  No code changes required.
+
+---
+
+## Kong MCP Gateway
+
+### Transport path
+
+```
+Kong MCP mode (KONG_MCP_GATEWAY_ENABLED=true, UI = "Kong MCP Gateway"):
+
+  App ──[X-Kong-API-Key]──► Kong Serverless /mcp (key-auth) ──► Railway MCP upstream
+
+Direct remote mode (default):
+  App ──────────────────────────────────────────────────────► REMOTE_MCP_URL
+```
+
+`KongMCPToolClient` (`src/clients/kong_mcp_tool_client.py`) implements this path. It is instantiated by `factory.py` when `KONG_MCP_GATEWAY_ENABLED=true` and selected when the UI backend is set to "Kong MCP Gateway".
+
+### ACL enforcement
+
+When `KONG_MCP_ACL_POLICY_ENABLED=true`, Kong enforces per-role tool access using the `ai-mcp-proxy` plugin and consumer groups:
+
+```
+jr-analyst-app consumer (KONG_MCP_ACL_JR_API_KEY)
+  → jr-analyst consumer group
+  → address_risk_check, industry_context_check: DENIED by Kong ACL
+  → all other tools: allowed
+
+sr-analyst-app consumer (KONG_MCP_ACL_SR_API_KEY)
+  → sr-analyst consumer group
+  → all tools: allowed
+```
+
+`kong_acl_enforcement_active(mcp_mode, settings)` in `src/config.py` returns `True` only when all three conditions hold: `enabled`, `acl_policy_enabled`, and `mcp_mode == "kong"`. Kong ACL denials are surfaced as `StepStatus.SKIPPED` in the investigation trace.
+
+**App-side fallback:** when Kong ACL is not active, `policy.py` enforces identical restrictions in-app so local and remote development behave consistently.
+
+### Source of truth
+
+Konnect Gateway Manager UI is the live source of truth for all Kong configuration. Repo docs and examples are reference/bootstrap aids. Use `deck gateway dump` to snapshot the live state locally (output is gitignored — never commit).

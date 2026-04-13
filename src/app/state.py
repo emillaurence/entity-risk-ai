@@ -13,6 +13,13 @@ trace_id            Neo4j trace_id of the current/last investigation.
 replay_trace_id     trace_id entered by the user for replay/audit view.
 execution_status    Dict with running/message/step describing live progress.
 
+Auth keys
+---------
+auth_user           AuthenticatedUser | None — current session user.
+auth_authenticated  bool — True once the user has successfully logged in.
+auth_error          str | None — last login error message.
+auth_dev_bypass     bool — True when the session was opened via dev bypass.
+
 Live / progressive rendering keys
 ----------------------------------
 live_phase          "idle"|"planning"|"resolving"|"executing"|"done"
@@ -34,11 +41,18 @@ from typing import TYPE_CHECKING, Any
 import streamlit as st
 
 if TYPE_CHECKING:
+    from src.app.auth import AuthenticatedUser
     from src.orchestration.orchestrator import OrchestratorResult
 
 # ---------------------------------------------------------------------------
 # Private key constants
 # ---------------------------------------------------------------------------
+
+# Auth
+_KEY_AUTH_USER          = "auth_user"
+_KEY_AUTH_AUTHENTICATED = "auth_authenticated"
+_KEY_AUTH_ERROR         = "auth_error"
+_KEY_AUTH_DEV_BYPASS    = "auth_dev_bypass"
 
 _KEY_QUESTION        = "question"
 _KEY_RESULT          = "orchestrator_result"
@@ -66,6 +80,10 @@ _KEY_REPLAY_STATUS = "replay_status"  # "idle" | "loading" | "loaded" | "error"
 _KEY_REPLAY_ERROR  = "replay_error"   # str | None
 
 _DEFAULTS: dict[str, Any] = {
+    _KEY_AUTH_USER:          None,
+    _KEY_AUTH_AUTHENTICATED: False,
+    _KEY_AUTH_ERROR:         None,
+    _KEY_AUTH_DEV_BYPASS:    False,
     _KEY_QUESTION:        "",
     _KEY_RESULT:          None,
     _KEY_TRACE_ID:        None,
@@ -102,6 +120,49 @@ def init() -> None:
     for key, default in _DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = default
+
+
+# ---------------------------------------------------------------------------
+# Auth state
+# ---------------------------------------------------------------------------
+
+
+def is_authenticated() -> bool:
+    """Return True when a user is logged in for this session."""
+    return bool(st.session_state.get(_KEY_AUTH_AUTHENTICATED, False))
+
+
+def get_authenticated_user() -> "AuthenticatedUser | None":
+    """Return the current AuthenticatedUser, or None."""
+    return st.session_state.get(_KEY_AUTH_USER)
+
+
+def login(user: "AuthenticatedUser") -> None:
+    """Store the authenticated user and mark the session as authenticated."""
+    st.session_state[_KEY_AUTH_USER]          = user
+    st.session_state[_KEY_AUTH_AUTHENTICATED] = True
+    st.session_state[_KEY_AUTH_ERROR]         = None
+
+
+def logout() -> None:
+    """Clear all session state, returning the session to the unauthenticated gate."""
+    for key, default in _DEFAULTS.items():
+        st.session_state[key] = default.copy() if isinstance(default, (dict, list)) else default
+
+
+def get_auth_error() -> str | None:
+    """Return the most recent auth error message, or None."""
+    return st.session_state.get(_KEY_AUTH_ERROR)
+
+
+def set_auth_error(msg: str | None) -> None:
+    """Store an auth error message (pass None to clear)."""
+    st.session_state[_KEY_AUTH_ERROR] = msg
+
+
+def set_auth_dev_bypass(value: bool) -> None:
+    """Mark (or unmark) the session as opened via the dev bypass."""
+    st.session_state[_KEY_AUTH_DEV_BYPASS] = value
 
 
 # ---------------------------------------------------------------------------

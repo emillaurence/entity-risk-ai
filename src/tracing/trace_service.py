@@ -56,6 +56,10 @@ class TraceService:
             entity_name=request.entity_name,
             user_id=user_context.user_id,
             mode=user_context.metadata.get("mode", "interactive"),
+            user_role=user_context.metadata.get("role", ""),
+            auth_provider=user_context.metadata.get("auth_provider", ""),
+            session_id=user_context.session_id,
+            gateway_mode=user_context.metadata.get("gateway_mode", ""),
         )
         # save_trace generates a UUID if request_id is empty; updates in place.
         trace.request_id = self._repo.save_trace(trace)

@@ -27,7 +27,6 @@ Known agents and tasks
     control_signal_check         nature-of-control types
     address_risk_check           address co-location risk
     industry_context_check       SIC-based industry risk
-    summarize_risk_for_company   full 4-signal risk synthesis
 
   trace-agent:
     retrieve_trace               load a full trace by its ID
@@ -79,7 +78,6 @@ VALID_TASKS: frozenset[str] = frozenset({
     "control_signal_check",
     "address_risk_check",
     "industry_context_check",
-    "summarize_risk_for_company",
     # trace-agent
     "retrieve_trace",
     "find_traces_by_entity",
@@ -96,7 +94,6 @@ _AGENT_TASKS: dict[str, frozenset[str]] = {
     "risk-agent": frozenset({
         "ownership_complexity_check", "control_signal_check",
         "address_risk_check", "industry_context_check",
-        "summarize_risk_for_company",
     }),
     "trace-agent": frozenset({
         "retrieve_trace", "find_traces_by_entity", "retrieve_and_summarize_trace",
@@ -220,9 +217,6 @@ AVAILABLE AGENTS AND TASKS — use only these exact values:
                                  parameters: {"company_name": str}
     industry_context_check       SIC-based industry risk
                                  parameters: {"company_name": str}
-    summarize_risk_for_company   full 4-signal risk synthesis (covers all four
-                                 dimensions above in one call)
-                                 parameters: {"company_name": str}
 
   trace-agent
     retrieve_trace               load a full investigation trace by its ID
@@ -241,20 +235,20 @@ PLANNING RULES:
 2. Ownership queries: add graph-agent expand_ownership after entity_lookup.
    Default max_depth to 20 unless the query specifies otherwise.
 3. Generic risk queries (no specific dimension named — e.g. "is it risky?",
-   "risk assessment", "any red flags?"): add risk-agent
-   summarize_risk_for_company. This covers all four dimensions in one step —
-   do NOT add individual risk checks as well.
+   "risk assessment", "any red flags?"): add all four individual risk checks:
+   ownership_complexity_check, control_signal_check, address_risk_check, and
+   industry_context_check. Do not skip any dimension unless the user explicitly
+   excludes it. If role restrictions are specified in the prompt, omit denied
+   tasks.
 4. Specific risk dimension queries: when the query names one or more
-   dimensions explicitly, add only the matching individual tasks (NOT
-   summarize_risk_for_company):
+   dimensions explicitly, add only the matching individual tasks:
      "address" / "co-location"           → address_risk_check
      "control" / "controllers"            → control_signal_check
      "ownership complexity" / "structure" → ownership_complexity_check
      "industry" / "SIC" / "sector"        → industry_context_check
-   Add one step per named dimension. If all four are named, use
-   summarize_risk_for_company instead.
+   Add one step per named dimension.
 5. Combined ownership + generic risk: include both expand_ownership AND
-   summarize_risk_for_company as separate steps.
+   all four risk check steps.
 6. Profile queries: add graph-agent company_profile after entity_lookup.
 7. Address queries (factual — "where is it registered?"): add graph-agent
    shared_address_check after entity_lookup.
@@ -278,7 +272,7 @@ Query: "who owns ACME Holdings?"
 {"mode":"investigate","reason":"Ownership query for a company. Resolving canonical name first, then walking the full ownership chain.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":20}}],"stop_conditions":[]}
 
 Query: "who owns ACME Holdings and is it risky?"
-{"mode":"investigate","reason":"Combined ownership and risk query. Walking the ownership chain, then synthesising all four risk signals.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":20}},{"step_id":"step_3","agent":"risk-agent","task":"summarize_risk_for_company","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}
+{"mode":"investigate","reason":"Combined ownership and risk query. Walking the ownership chain, then running all four risk signal checks.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":20}},{"step_id":"step_3","agent":"risk-agent","task":"ownership_complexity_check","parameters":{"company_name":"ACME Holdings"}},{"step_id":"step_4","agent":"risk-agent","task":"control_signal_check","parameters":{"company_name":"ACME Holdings"}},{"step_id":"step_5","agent":"risk-agent","task":"address_risk_check","parameters":{"company_name":"ACME Holdings"}},{"step_id":"step_6","agent":"risk-agent","task":"industry_context_check","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}
 
 Query: "who owns ACME Holdings and is it risky address and control?"
 {"mode":"investigate","reason":"Combined ownership query with specific risk dimensions: address and control only.","entities":[{"name":"ACME Holdings","type":"Company"}],"plan":[{"step_id":"step_1","agent":"graph-agent","task":"entity_lookup","parameters":{"name":"ACME Holdings"}},{"step_id":"step_2","agent":"graph-agent","task":"expand_ownership","parameters":{"company_name":"ACME Holdings","max_depth":5}},{"step_id":"step_3","agent":"risk-agent","task":"address_risk_check","parameters":{"company_name":"ACME Holdings"}},{"step_id":"step_4","agent":"risk-agent","task":"control_signal_check","parameters":{"company_name":"ACME Holdings"}}],"stop_conditions":[]}
@@ -312,12 +306,22 @@ class InvestigationPlanner:
     def __init__(self, ai_client: AIClient) -> None:
         self._ai_client = ai_client
 
-    def plan(self, query: str) -> PlannerResult:
+    def plan(
+        self,
+        query: str,
+        allowed_tools: "frozenset[str] | None" = None,
+    ) -> PlannerResult:
         """
         Parse a natural-language investigation query into a structured plan.
 
         Args:
-            query: Free-text query from a user or upstream system.
+            query:         Free-text query from a user or upstream system.
+            allowed_tools: Optional frozenset of task names the current user
+                           is permitted to invoke.  Reserved for future use —
+                           the planner generates the unconstrained plan so that
+                           restricted steps are visible to the analyst as skipped.
+                           The orchestrator's policy gate enforces restrictions
+                           at execution time.
 
         Returns:
             PlannerResult with mode, entities, plan steps, and reasoning.
@@ -327,9 +331,14 @@ class InvestigationPlanner:
                         unparseable output.
             RuntimeError: Propagated from generate_json() on API errors.
         """
+        user_prompt = query.strip()
+        # Role restrictions are enforced at execution time by the orchestrator's
+        # policy gate — the planner generates the full optimal plan so that skipped
+        # steps are visible to the analyst.
+
         raw: dict[str, Any] = self._ai_client.generate_json(
             system_prompt=_SYSTEM_PROMPT,
-            user_prompt=query.strip(),
+            user_prompt=user_prompt,
             max_tokens=600,
         )
         result = _parse(raw)
