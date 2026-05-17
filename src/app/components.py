@@ -2476,10 +2476,23 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
     5. done / success   → decision-first assessment card
     6. done / failed    → error card
     """
-    _section_header("📊 Risk Assessment")
-
     live_phase = state.get_live_phase()
     result     = state.get_result()
+
+    # Mount the voice alert expander inline with the section title when audio
+    # has been synthesised for the current trace.  Falls back to a plain
+    # full-width header in every other stage so the layout stays clean.
+    trace_id  = (result.trace_id if result is not None and result.success else "") or ""
+    has_audio = bool(trace_id and st.session_state.get(f"_voice_alert_audio_{trace_id}"))
+
+    if has_audio:
+        hc, rc = st.columns([0.62, 0.38])
+        with hc:
+            _section_header("📊 Risk Assessment")
+        with rc:
+            render_voice_alert(trace_id)
+    else:
+        _section_header("📊 Risk Assessment")
 
     # ── Stages 1–4: no result yet ─────────────────────────────────────
     if result is None:
@@ -2544,6 +2557,114 @@ def _render_live_risk_assessment(live_dims: dict) -> None:
                 f'{pills_html}</div>',
                 unsafe_allow_html=True,
             )
+
+
+
+# ---------------------------------------------------------------------------
+# Voice alert (ElevenLabs)
+# ---------------------------------------------------------------------------
+
+# Risk-level openers used by ``build_voice_alert_script`` — lead with the
+# signal so the synthesised voice carries urgency in the first beat.
+_VOICE_ALERT_OPENERS: dict[str, str] = {
+    "HIGH":    "High risk flagged.",
+    "MEDIUM":  "Elevated risk identified.",
+    "LOW":     "Risk profile clear.",
+    "UNKNOWN": "Risk assessment complete.",
+}
+
+
+def build_voice_alert_script(result: Any) -> str:
+    """Build the narrated script for a voice alert from an OrchestratorResult.
+
+    Pulls the canonical entity name, overall risk, and primary driver from
+    ``_build_structured_assessment(result)`` and combines them with the
+    canned recommendation for that risk level.  Output is deterministic and
+    LLM-free.
+
+    Structure (risk signal leads, action closes):
+
+        "{opener}. {entity}. {label}: {driver_text}. Action: {recommendation}."
+
+    The script is sanitised — markdown, em dashes, and stray punctuation are
+    removed so the synthesised speech sounds natural — and trimmed to roughly
+    50 words.  Returns an empty string only if the result has no usable data.
+    """
+    # Canonical name: first resolved entity, fall back to query
+    canonical_name = ""
+    for _, data in (result.resolved_entities or {}).items():
+        if data:
+            canonical_name = data.get("canonical_name", "") or ""
+            if canonical_name:
+                break
+    if not canonical_name:
+        canonical_name = (result.query or "").strip() or "the entity"
+
+    assessment           = _build_structured_assessment(result)
+    overall_risk         = assessment.get("overall_risk", "UNKNOWN")
+    primary_driver_label = (assessment.get("primary_driver_label") or "").strip()
+    primary_driver_text  = (assessment.get("primary_driver_text")  or "").strip()
+    recommendation       = _RISK_RECOMMENDATIONS.get(overall_risk, "").strip()
+    opener               = _VOICE_ALERT_OPENERS.get(overall_risk, _VOICE_ALERT_OPENERS["UNKNOWN"])
+
+    pieces: list[str] = [opener, f"{canonical_name}."]
+    if primary_driver_label and primary_driver_text:
+        pieces.append(f"{primary_driver_label}: {primary_driver_text}.")
+    elif primary_driver_text:
+        pieces.append(f"{primary_driver_text}.")
+
+    if recommendation:
+        pieces.append(f"Action: {recommendation}.")
+
+    script = " ".join(p for p in pieces if p)
+
+    # Strip markdown / control characters and collapse whitespace.
+    script = _re.sub(r"[*_`#>]", "", script)
+    script = script.replace("—", ",").replace("–", ",")
+    script = _re.sub(r"\s+", " ", script).strip()
+
+    # Cap at ~50 words.
+    words = script.split()
+    if len(words) > 50:
+        script = " ".join(words[:50]).rstrip(",.;: ") + "."
+
+    return script
+
+
+def render_voice_alert(trace_id: str) -> None:
+    """Render the voice alert as a collapsible expander row.
+
+    Reads ``_voice_alert_audio_<trace_id>`` and ``_voice_alert_script_<trace_id>``
+    from ``st.session_state``.  If the audio is not present (feature disabled
+    or threshold not met), the function renders nothing.
+
+    The expander is collapsed by default; the audio element mounts regardless
+    so ``autoplay=True`` still triggers playback when ``VOICE_ALERT_AUTOPLAY``
+    is enabled (default).
+
+    Called from ``_render_input_column`` after the entity chip row in the
+    Investigate tab.
+    """
+    if not trace_id:
+        return
+
+    audio_bytes = st.session_state.get(f"_voice_alert_audio_{trace_id}")
+    if not audio_bytes:
+        return
+
+    from src.config import get_elevenlabs_settings
+
+    script_text = st.session_state.get(f"_voice_alert_script_{trace_id}", "")
+    autoplay    = get_elevenlabs_settings().autoplay
+
+    with st.expander("🔊 Voice alert", expanded=False):
+        if script_text:
+            st.markdown(
+                f'<div style="font-size:0.82em;font-style:italic;color:#374151;'
+                f'line-height:1.5;margin-bottom:6px">{_esc(script_text)}</div>',
+                unsafe_allow_html=True,
+            )
+        st.audio(audio_bytes, format="audio/mp3", autoplay=autoplay)
 
 
 def _render_shared_graph_panel(payload: Any, session_node_key: str) -> None:

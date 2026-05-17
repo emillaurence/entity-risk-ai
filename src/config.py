@@ -404,6 +404,84 @@ def kong_acl_enforcement_active(
     return settings.enabled and settings.acl_policy_enabled and mcp_mode == "kong"
 
 
+# ---------------------------------------------------------------------------
+# ElevenLabs voice alerts (optional)
+# ---------------------------------------------------------------------------
+#
+# The Streamlit app dispatches a synthesised voice alert when an investigation
+# completes and the overall risk meets ``min_risk``.  The feature is silently
+# disabled when ``ELEVENLABS_API_KEY`` is not set (``enabled=False``).
+#
+#   ELEVENLABS_API_KEY    — secret used as the ``xi-api-key`` header
+#   ELEVENLABS_VOICE_ID   — voice to synthesise with (default Rachel)
+#   VOICE_ALERT_MIN_RISK  — "HIGH" or "MEDIUM" (default "HIGH")
+#
+# Calls go directly to api.elevenlabs.io — there is no Kong route for the
+# voice path, so no Kong vars are involved here.
+
+
+_ELEVENLABS_VOICE_ID_DEFAULT = "21m00Tcm4TlvDq8ikWAM"  # Rachel
+_VOICE_ALERT_MIN_RISK_DEFAULT = "HIGH"
+_VOICE_ALERT_VALID_RISKS = ("HIGH", "MEDIUM")
+_VOICE_ALERT_TRUTHY = ("true", "1", "yes", "on")
+
+
+@dataclass
+class ElevenLabsSettings:
+    """Optional ElevenLabs configuration for voice alerts.
+
+    All fields default to safe values.  When ``enabled`` is False (the default,
+    i.e. no API key set) the voice alert path is skipped entirely.
+    """
+
+    api_key: str
+    voice_id: str
+    min_risk: str   # "HIGH" or "MEDIUM"; uppercased and validated
+    enabled: bool   # True when api_key is non-empty
+    autoplay: bool  # True when the audio element should auto-play on render
+
+    def masked(self) -> dict:
+        """Return a safe repr with the API key redacted."""
+        key_preview = f"{self.api_key[:8]}…***" if self.api_key else ""
+        return {
+            "enabled":  self.enabled,
+            "api_key":  key_preview,
+            "voice_id": self.voice_id,
+            "min_risk": self.min_risk,
+            "autoplay": self.autoplay,
+        }
+
+
+def get_elevenlabs_settings() -> ElevenLabsSettings:
+    """Return ElevenLabs settings from environment variables.
+
+    All fields are optional.  When ``ELEVENLABS_API_KEY`` is not set, returns
+    ``enabled=False`` and no exception is raised — the voice alert feature is
+    silently disabled.
+
+    ``VOICE_ALERT_MIN_RISK`` is uppercased and validated against ("HIGH",
+    "MEDIUM").  Any other value falls back to the default ("HIGH").
+
+    ``VOICE_ALERT_AUTOPLAY`` accepts "true"/"1"/"yes"/"on" (case-insensitive)
+    as truthy.  Defaults to True when unset; any other value is False.
+    """
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+
+    raw_min_risk = os.getenv("VOICE_ALERT_MIN_RISK", _VOICE_ALERT_MIN_RISK_DEFAULT).strip().upper()
+    min_risk = raw_min_risk if raw_min_risk in _VOICE_ALERT_VALID_RISKS else _VOICE_ALERT_MIN_RISK_DEFAULT
+
+    raw_autoplay = os.getenv("VOICE_ALERT_AUTOPLAY")
+    autoplay = True if raw_autoplay is None else raw_autoplay.strip().lower() in _VOICE_ALERT_TRUTHY
+
+    return ElevenLabsSettings(
+        api_key=api_key,
+        voice_id=os.getenv("ELEVENLABS_VOICE_ID", _ELEVENLABS_VOICE_ID_DEFAULT).strip() or _ELEVENLABS_VOICE_ID_DEFAULT,
+        min_risk=min_risk,
+        enabled=bool(api_key),
+        autoplay=autoplay,
+    )
+
+
 def get_anthropic_settings() -> AnthropicSettings:
     missing = [key for key in _ANTHROPIC_REQUIRED if not os.getenv(key)]
     if missing:

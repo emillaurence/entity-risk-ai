@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import queue as _queue
 import threading
+from typing import Any
 
 import streamlit as st
 
@@ -41,6 +42,8 @@ import src.app.state as state
 from src.app.app_logger import get_app_logger, log_event
 from src.app.auth import authenticate, dev_bypass_user, is_dev_bypass_enabled
 from src.app.components import (
+    _build_structured_assessment,
+    build_voice_alert_script,
     render_app_header,
     render_investigate_tab,
     render_replay_tab,
@@ -49,8 +52,13 @@ from src.app.components import (
 from src.app.factory import AppComponents, create_app_components
 from src.app.policy import get_kong_consumer_group, get_policy_for_user
 from src.app.styles import inject_styles
-from src.config import get_kong_mcp_gateway_settings, kong_acl_enforcement_active
-from src.domain.models import UserContext
+from src.clients.elevenlabs_client import ElevenLabsClient
+from src.config import (
+    get_elevenlabs_settings,
+    get_kong_mcp_gateway_settings,
+    kong_acl_enforcement_active,
+)
+from src.domain.models import EventType, TraceEvent, UserContext
 
 _log = get_app_logger()
 
@@ -114,6 +122,140 @@ def _start_investigation(
 
 
 
+def _voice_alert_threshold_met(overall_risk: str, min_risk: str) -> bool:
+    """Return True when ``overall_risk`` meets or exceeds ``min_risk``.
+
+    Threshold rules:
+        min_risk == "HIGH"   → fire only on HIGH
+        min_risk == "MEDIUM" → fire on MEDIUM or HIGH
+    """
+    if overall_risk == "HIGH":
+        return True
+    return min_risk == "MEDIUM" and overall_risk == "MEDIUM"
+
+
+def _maybe_dispatch_voice_alert(result: Any) -> None:
+    """Synthesise and store a voice alert when the risk threshold is met.
+
+    Runs at the "done" transition inside ``_polling_fragment``.  Skips
+    silently when ElevenLabs is disabled, when the threshold is not met,
+    when the alert has already been fired for this trace, or when the
+    synthesis or trace write fails.  Never raises.
+
+    The MP3 bytes are stashed in ``st.session_state`` under
+    ``_voice_alert_audio_<trace_id>`` so ``render_voice_alert`` can pick
+    them up on the next full rerun.
+    """
+    if result is None or not getattr(result, "success", False):
+        return
+
+    trace_id = getattr(result, "trace_id", "") or ""
+    if not trace_id:
+        return
+
+    fired_key  = f"_voice_alert_fired_{trace_id}"
+    if st.session_state.get(fired_key):
+        return
+
+    try:
+        settings = get_elevenlabs_settings()
+        if not settings.enabled:
+            return
+
+        assessment   = _build_structured_assessment(result)
+        overall_risk = assessment.get("overall_risk", "UNKNOWN")
+        if not _voice_alert_threshold_met(overall_risk, settings.min_risk):
+            return
+
+        script_text = build_voice_alert_script(result)
+        if not script_text:
+            return
+
+        client      = ElevenLabsClient(settings)
+        audio_bytes = client.synthesize(script_text)
+
+        st.session_state[f"_voice_alert_audio_{trace_id}"]  = audio_bytes
+        st.session_state[f"_voice_alert_script_{trace_id}"] = script_text
+        st.session_state[fired_key] = True
+
+        log_event(
+            "voice_alert_dispatched",
+            trace_id=trace_id,
+            risk_level=overall_risk,
+            voice_id=settings.voice_id,
+            audio_bytes=len(audio_bytes),
+        )
+
+        _write_voice_alert_trace_event(
+            trace_id=trace_id,
+            voice_id=settings.voice_id,
+            overall_risk=overall_risk,
+            script_text=script_text,
+        )
+    except Exception as exc:  # noqa: BLE001 — never surface to the analyst UI
+        _log.warning("Voice alert dispatch failed: %s", exc)
+
+
+def _write_voice_alert_trace_event(
+    *,
+    trace_id: str,
+    voice_id: str,
+    overall_risk: str,
+    script_text: str,
+) -> None:
+    """Append a TraceEvent recording that a voice alert was dispatched.
+
+    Uses ``components.trace_repo.append_event`` directly so we can write
+    without needing the in-memory ``InvestigationTrace`` object (which is
+    no longer held by the orchestrator at this point).  Any failure is
+    logged and swallowed — a trace write failure must never block the
+    alert path.
+    """
+    try:
+        mcp_mode = st.session_state.get("_voice_alert_mcp_mode", "local")
+        role     = st.session_state.get("_voice_alert_role", "")
+        components = create_app_components(mcp_mode=mcp_mode, role=role)
+
+        event = TraceEvent(
+            event_type=EventType.INVESTIGATION_COMPLETE,
+            message="voice_alert — dispatched",
+            step_id=None,
+            payload={
+                "agent_name":     "voice-alert",
+                "tool_name":      "voice_alert",
+                "input_summary":  "HIGH risk threshold met — voice alert dispatched",
+                "output_summary": script_text,
+                "decision":       "",
+                "why":            "",
+                "data_json": _voice_alert_data_json(
+                    voice_id=voice_id,
+                    overall_risk=overall_risk,
+                    script_text=script_text,
+                ),
+            },
+        )
+        components.trace_repo.append_event(trace_id, event)
+    except Exception as exc:  # noqa: BLE001 — never surface to the analyst UI
+        _log.warning("Voice alert trace write failed: %s", exc)
+
+
+def _voice_alert_data_json(
+    *,
+    voice_id: str,
+    overall_risk: str,
+    script_text: str,
+) -> str:
+    """Serialise the voice alert payload for the TraceEvent.data_json column."""
+    import json as _json
+    return _json.dumps(
+        {
+            "voice_id":   voice_id,
+            "risk_level": overall_risk,
+            "script":     script_text,
+        }
+    )
+
+
 @st.fragment(run_every=0.25)
 def _polling_fragment() -> None:
     """Fragment-scoped poller — runs every 250 ms without rebuilding the page.
@@ -128,7 +270,8 @@ def _polling_fragment() -> None:
     if phase == "idle":
         return
 
-    # "done" transition: log completion, flip to idle, trigger one final
+    # "done" transition: log completion, dispatch voice alert if the
+    # configured risk threshold was met, flip to idle, trigger one final
     # full rebuild so the results columns render with the finished state.
     if phase == "done":
         result = state.get_result()
@@ -140,6 +283,7 @@ def _polling_fragment() -> None:
                 mode=result.mode,
                 steps=len(result.step_results),
             )
+            _maybe_dispatch_voice_alert(result)
         state.set_live_phase("idle")
         state.clear_status()
         st.rerun()
@@ -239,10 +383,10 @@ def render_layout() -> None:
     if kong_mcp_enabled:
         _mcp_options.append("kong")
 
-    # Default to Kong when the flag is enabled; otherwise default to local.
-    # Streamlit only uses `index` on first render (before the key exists in
-    # session_state), so explicit user selections within a session are preserved.
-    _default_index = _mcp_options.index("kong") if kong_mcp_enabled else 0
+    # Default to Local (in-process). Streamlit only uses `index` on first render
+    # (before the key exists in session_state), so explicit user selections
+    # within a session are preserved.
+    _default_index = 0
 
     def _mcp_label(x: str) -> str:
         if x == "local":
@@ -286,6 +430,11 @@ def render_layout() -> None:
             st.rerun()
 
     components = create_app_components(mcp_mode=mcp_mode, role=user.role if user else "")
+
+    # Stash mcp_mode / role so the polling fragment can rebuild AppComponents
+    # for the voice alert trace-write path without re-reading the sidebar.
+    st.session_state["_voice_alert_mcp_mode"] = mcp_mode
+    st.session_state["_voice_alert_role"]     = user.role if user else ""
 
     # ── Derive policy for current user ─────────────────────────────────
     _policy = get_policy_for_user(user) if user else None
